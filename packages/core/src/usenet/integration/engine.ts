@@ -5,6 +5,7 @@ import {
   EngineOptions,
   ProviderConfig,
 } from '../index.js';
+import { resolveEngineResourcePlan } from '../resource-plan.js';
 import {
   PERFORMANCE_PROFILES,
   type PerformanceProfile,
@@ -25,6 +26,35 @@ export interface UsenetStreamConfigSummary {
   prefetchSegments: number;
 }
 
+/** Runtime-setting subset consumed when constructing {@link EngineOptions}. */
+export type UsenetEngineRuntimeSettings = Pick<
+  (typeof appConfig)['usenet'],
+  | 'performanceProfile'
+  | 'maxConcurrentDownloads'
+  | 'prefetchSegments'
+  | 'streamingMode'
+  | 'streamingPriority'
+  | 'segmentMemoryCacheBytes'
+  | 'segmentSpoolingMemoryBudgetBytes'
+  | 'segmentSpoolingStreamBufferBytes'
+  | 'segmentSpoolingSpoolBytes'
+  | 'segmentSpoolingMinFreeDiskBytes'
+  | 'segmentDiskCacheBytes'
+  | 'segmentTimeout'
+  | 'segmentStallTimeout'
+  | 'dialTimeout'
+  | 'idleConnection'
+  | 'streamIdleTimeout'
+  | 'circuitBreakerThreshold'
+  | 'circuitBreakerCooldown'
+  | 'lazyRarResolution'
+  | 'strictArchiveMembership'
+  | 'verifyMode'
+  | 'verifyBudgetMs'
+  | 'censusShadowConcurrency'
+  | 'censusMaxLifetime'
+>;
+
 /**
  * Build the engine {@link EngineOptions} for a given provider set from the
  * DB-backed settings store. Duration settings are stored in seconds
@@ -35,11 +65,16 @@ export interface UsenetStreamConfigSummary {
  * `providers` scopes the auto-computed download budget (`maxConcurrentDownloads`
  * auto = Σ provider connections × pipeline depth), so passing a single provider
  * yields an isolated config; used by the per-provider speed test.
+ * `runtimeSettings` and `cacheFolder` are injectable deterministic inputs for
+ * unit tests; production callers omit them and therefore always read the
+ * current `appConfig.usenet` snapshot and shared cache root.
  */
 export function buildUsenetEngineOptions(
-  providers: ProviderConfig[]
+  providers: ProviderConfig[],
+  runtimeSettings: UsenetEngineRuntimeSettings = appConfig.usenet,
+  cacheFolder: () => string = getCacheFolder
 ): Partial<EngineOptions> {
-  const u = appConfig.usenet;
+  const u = runtimeSettings;
   const depthOf = (p: ProviderConfig): number =>
     Math.max(1, p.pipelineDepth ?? 1);
   const sumPipelineSlots = providers.reduce(
@@ -49,7 +84,7 @@ export function buildUsenetEngineOptions(
   // A performance profile bundles the speed/resource knobs; `custom` falls back
   // to the individual fields. Resolved at call-time so a profile switch in the
   // dashboard takes effect on the next stream without a restart.
-  const profile = u.performanceProfile as PerformanceProfile;
+  const profile: PerformanceProfile = u.performanceProfile;
   const preset =
     profile !== 'custom' ? PERFORMANCE_PROFILES[profile] : undefined;
   const prefetchSegments = preset?.prefetchSegments ?? u.prefetchSegments;
@@ -65,11 +100,17 @@ export function buildUsenetEngineOptions(
     maxDownloadSetting > 0 ? maxDownloadSetting : Math.max(1, sumPipelineSlots);
   // All disk-backed caches share the `<data>/cache` root; the engine adds its
   // own per-provider-set namespace subdirectory under it.
-  const diskCachePath = diskCacheBytes > 0 ? getCacheFolder() : undefined;
-  return {
+  const diskCachePath = diskCacheBytes > 0 ? cacheFolder() : undefined;
+  const options: EngineOptions = {
     maxConcurrentDownloads,
     prefetchSegments,
+    streamingMode: u.streamingMode,
     streamingPriority: u.streamingPriority,
+    segmentMemoryCacheBytes: u.segmentMemoryCacheBytes,
+    segmentSpoolingMemoryBudgetBytes: u.segmentSpoolingMemoryBudgetBytes,
+    segmentSpoolingStreamBufferBytes: u.segmentSpoolingStreamBufferBytes,
+    segmentSpoolingSpoolBytes: u.segmentSpoolingSpoolBytes,
+    segmentSpoolingMinFreeDiskBytes: u.segmentSpoolingMinFreeDiskBytes,
     segmentDiskCacheBytes: diskCacheBytes,
     segmentDiskCachePath: diskCachePath,
     segmentTimeoutMs: u.segmentTimeout * 1000,
@@ -86,6 +127,12 @@ export function buildUsenetEngineOptions(
     censusShadowConcurrency: u.censusShadowConcurrency,
     censusMaxLifetimeMs: u.censusMaxLifetime * 1000,
   };
+  // Cross-field checks live in the pure resource-plan layer. This rejects an
+  // invalid spooling selection before an engine/resource owner is constructed,
+  // while the resolver deliberately ignores dormant spooling fields in the
+  // compatible buffering mode.
+  resolveEngineResourcePlan(options);
+  return options;
 }
 
 /**

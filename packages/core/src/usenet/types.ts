@@ -4,6 +4,9 @@
  */
 import { createHmac } from 'node:crypto';
 
+/** How decoded Usenet segments are transported toward the player. */
+export type UsenetStreamingMode = 'segment_buffering' | 'segment_spooling';
+
 /** A single NNTP provider/account configuration. */
 export interface ProviderConfig {
   /** Stable id (e.g. slug of host or a uuid) used for stats + dashboard. */
@@ -53,10 +56,40 @@ export interface EngineOptions {
    */
   prefetchSegments: number;
   /**
+   * Segment transport strategy. `segment_buffering` is the compatible
+   * RAM-oriented path; `segment_spooling` selects the bounded spool resource
+   * plan. This is independent of the performance profile.
+   */
+  streamingMode: UsenetStreamingMode;
+  /**
    * Share (0..1) of the global download budget reserved for High-priority
    * playback so background work (health/inspect/seek) never starves it.
    */
   streamingPriority: number;
+  /**
+   * In-RAM decoded-segment arena budget in bytes. `0` means mode-dependent
+   * automatic sizing; it does not disable the arena.
+   */
+  segmentMemoryCacheBytes: number;
+  /**
+   * Global hard byte budget for transient buffers and queues owned by segment
+   * spooling. Ignored by the segment-buffering resource plan.
+   */
+  segmentSpoolingMemoryBudgetBytes: number;
+  /**
+   * Maximum byte share reserved for one active HTTP stream in segment
+   * spooling mode. Ignored by the segment-buffering resource plan.
+   */
+  segmentSpoolingStreamBufferBytes: number;
+  /**
+   * Global hard byte budget for transient segment spool files. This is
+   * separate from the persistent decoded-segment disk cache.
+   */
+  segmentSpoolingSpoolBytes: number;
+  /**
+   * Free-space safety margin, in bytes, to retain on the spool filesystem.
+   */
+  segmentSpoolingMinFreeDiskBytes: number;
   /** On-disk decoded-segment cache size in bytes. `0` disables the disk cache. */
   segmentDiskCacheBytes: number;
   /** Absolute base directory for the on-disk segment cache. */
@@ -138,10 +171,19 @@ export interface EngineOptions {
   strictArchiveMembership: boolean;
 }
 
+const DECIMAL_MEGABYTE_BYTES = 1_000_000;
+const DECIMAL_GIGABYTE_BYTES = 1_000_000_000;
+
 export const DEFAULT_ENGINE_OPTIONS: EngineOptions = {
   maxConcurrentDownloads: 60,
   prefetchSegments: 32,
+  streamingMode: 'segment_buffering',
   streamingPriority: 0.8,
+  segmentMemoryCacheBytes: 0,
+  segmentSpoolingMemoryBudgetBytes: 128 * DECIMAL_MEGABYTE_BYTES,
+  segmentSpoolingStreamBufferBytes: 8 * DECIMAL_MEGABYTE_BYTES,
+  segmentSpoolingSpoolBytes: 2 * DECIMAL_GIGABYTE_BYTES,
+  segmentSpoolingMinFreeDiskBytes: 512 * DECIMAL_MEGABYTE_BYTES,
   segmentDiskCacheBytes: 2 * 1024 * 1024 * 1024,
   segmentTimeoutMs: 30_000,
   segmentStallTimeoutMs: 30_000,

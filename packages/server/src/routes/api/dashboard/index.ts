@@ -15,6 +15,10 @@ import {
   closeDb,
   stopAnalytics,
   formatZodError,
+  importUsenetEnvironmentSettings,
+  importUsenetSettings,
+  isUsenetEngineSettingKey,
+  resetUsenetSettings,
   type AnalyticsRange,
   type LogRecord,
   type LogQuery,
@@ -302,7 +306,16 @@ router.post('/settings/reset', async (req, res) => {
   const skipped: { key: string; reason: string }[] = [];
   let requiresRestart = false;
 
+  const usenetKeys = keys.filter(isUsenetEngineSettingKey);
+  if (usenetKeys.length > 0) {
+    const result = await resetUsenetSettings(usenetKeys, username);
+    reset.push(...result.reset);
+    skipped.push(...result.skipped);
+    requiresRestart ||= result.requiresRestart;
+  }
+
   for (const key of keys) {
+    if (isUsenetEngineSettingKey(key)) continue;
     const m = meta.get(key);
     if (!m) {
       skipped.push({ key, reason: 'unknown' });
@@ -339,11 +352,9 @@ router.post('/settings/reset', async (req, res) => {
   );
 });
 
-// Copy env-overridden values into the
-// DB so they persist after the env vars are removed. Skips values equal to
-// the schema default. Bypasses settingsStore.set
-// (which throws when env is set) by writing through SettingsRepository
-// directly.
+// Copy env-overridden values into the DB so they persist after the env vars
+// are removed. Usenet engine values use their validated atomic batch; other
+// sections retain the existing direct repository import semantics.
 router.post('/settings/import/env', async (req, res) => {
   const username =
     (req as { user?: { username?: string } }).user?.username ?? 'admin';
@@ -356,7 +367,13 @@ router.post('/settings/import/env', async (req, res) => {
   const skippedAsDefault: string[] = [];
   const failed: { key: string; reason: string }[] = [];
 
+  const usenetResult = await importUsenetEnvironmentSettings(username);
+  imported.push(...usenetResult.imported);
+  skippedAsDefault.push(...usenetResult.skippedAsDefault);
+  failed.push(...usenetResult.failed);
+
   for (const m of candidates) {
+    if (isUsenetEngineSettingKey(m.key)) continue;
     let value: unknown;
     try {
       value = settingsStore.getEffectiveValue(m.key);
@@ -384,7 +401,9 @@ router.post('/settings/import/env', async (req, res) => {
 
   // Reload once so the in-memory snapshot/version reflect all the new rows
   // (effective values won't change while env still overrides, but storedKeys does).
-  if (imported.length) await settingsStore.reload();
+  if (imported.some((key) => !isUsenetEngineSettingKey(key))) {
+    await settingsStore.reload();
+  }
 
   logger.info(
     {
@@ -408,9 +427,10 @@ router.post('/settings/import/env', async (req, res) => {
   );
 });
 
-// accept the same JSON shape produced by
-// `/settings/export` and persist each entry through the regular validated
-// write path. Masked secrets (value === null for keys listed in
+// Accept the same JSON shape produced by `/settings/export`. Usenet engine
+// entries are validated and committed as one candidate; all other entries
+// retain the regular validated write path. Masked secrets (value === null for
+// keys listed in
 // maskedSecretKeys) are filtered client-side; anything else that arrives
 // as null but isn't a nullable schema will fail validation and be reported.
 router.post('/settings/import/json', async (req, res) => {
@@ -439,9 +459,22 @@ router.post('/settings/import/json', async (req, res) => {
   const failed: { key: string; reason: string }[] = [];
   let requiresRestart = false;
 
-  for (const [key, value] of Object.entries(
-    body.settings as Record<string, unknown>
-  )) {
+  const importedSettings = body.settings as Record<string, unknown>;
+  const usenetPatch = Object.fromEntries(
+    Object.entries(importedSettings).filter(([key]) =>
+      isUsenetEngineSettingKey(key)
+    )
+  );
+  if (Object.keys(usenetPatch).length > 0) {
+    const result = await importUsenetSettings(usenetPatch, username);
+    imported.push(...result.imported);
+    skipped.push(...result.skipped);
+    failed.push(...result.failed);
+    requiresRestart ||= result.requiresRestart;
+  }
+
+  for (const [key, value] of Object.entries(importedSettings)) {
+    if (isUsenetEngineSettingKey(key)) continue;
     const m = meta.get(key);
     if (!m) {
       skipped.push({ key, reason: 'unknown' });

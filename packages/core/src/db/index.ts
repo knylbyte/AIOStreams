@@ -8,6 +8,8 @@ export {
 export {
   SettingsRepository,
   type SettingRow,
+  type SettingBatchSet,
+  type SettingsBatch,
 } from './repositories/settings.js';
 export {
   UsenetLibraryRepository,

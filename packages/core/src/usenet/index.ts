@@ -70,6 +70,10 @@ import {
   ProviderMetricDelta,
   ProviderStatsSnapshot,
 } from './stats/types.js';
+import {
+  resolveEngineResourcePlan,
+  type EngineResourcePlan,
+} from './resource-plan.js';
 
 const logger = createLogger('usenet/engine');
 
@@ -97,27 +101,6 @@ const ARCHIVE_OPEN_CONCURRENCY = 16;
 const ARCHIVE_INSPECT_TIMEOUT_MS = 120_000;
 
 /**
- * Pinned segment-arena budget bounds. Slot demand tracks concurrent decodes
- * (pins on already-resident entries consume no new slots), so the budget
- * scales with the connection budget, floored to cover the archive re-touch
- * set and capped because a large pinned live-set has its own major-GC
- * marking cost.
- */
-const SEGMENT_ARENA_MIN_BYTES = 64 * 1024 * 1024;
-const SEGMENT_ARENA_MAX_BYTES = 160 * 1024 * 1024;
-const SEGMENT_ARENA_PER_DOWNLOAD_BYTES = 1.5 * 1024 * 1024;
-
-function segmentArenaBytes(maxConcurrentDownloads: number): number {
-  return Math.min(
-    SEGMENT_ARENA_MAX_BYTES,
-    Math.max(
-      SEGMENT_ARENA_MIN_BYTES,
-      Math.floor(maxConcurrentDownloads * SEGMENT_ARENA_PER_DOWNLOAD_BYTES)
-    )
-  );
-}
-
-/**
  * Archive read-window granularity. Each window is one `readAtInto` through
  * the inner-stream / CBC / volume-set / file-stream chain, so the per-window
  * fixed costs amortize over this size.
@@ -125,6 +108,7 @@ function segmentArenaBytes(maxConcurrentDownloads: number): number {
 const ARCHIVE_WINDOW_BYTES = 1 << 20;
 
 export * from './types.js';
+export * from './resource-plan.js';
 export * from './holes.js';
 export {
   MatroskaHoleFillTransform,
@@ -194,6 +178,8 @@ export class UsenetEngine {
   private cache: SegmentCache;
   private stats: StatsAccumulator;
   readonly options: EngineOptions;
+  /** Immutable engine-wide limits derived from {@link options}. */
+  readonly resourcePlan: EngineResourcePlan;
   private purgeTimer?: NodeJS.Timeout;
   /** Engine-lifetime per-provider STAT trust (census calibration results). */
   private statTrust = new StatTrustCache();
@@ -219,6 +205,7 @@ export class UsenetEngine {
     options: Partial<EngineOptions> = {}
   ) {
     this.options = { ...DEFAULT_ENGINE_OPTIONS, ...options };
+    this.resourcePlan = resolveEngineResourcePlan(this.options);
     this.censusGate = new PrioritySemaphore(
       Math.min(
         CENSUS_CONCURRENCY,
@@ -238,7 +225,7 @@ export class UsenetEngine {
     // byte-identical across providers), so the cache is provider-independent and
     // uses one stable namespace; the registry guarantees a single writer.
     this.cache = new SegmentCache({
-      arenaBytes: segmentArenaBytes(this.options.maxConcurrentDownloads),
+      arenaBytes: this.resourcePlan.arenaBytes,
       diskBytes: this.options.segmentDiskCachePath
         ? this.options.segmentDiskCacheBytes
         : 0,

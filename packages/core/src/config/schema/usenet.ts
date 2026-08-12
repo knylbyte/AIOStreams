@@ -121,6 +121,20 @@ export const usenetSchema = {
     secret: false,
     ui: HIDDEN,
   },
+  streamingMode: {
+    schema: z.enum(['segment_buffering', 'segment_spooling']),
+    default: 'segment_buffering',
+    label: 'Streaming mode',
+    description:
+      'How decoded Usenet segments are transported to the player. ' +
+      '**segment_buffering** uses the existing compatible, RAM-oriented ' +
+      'data path. **segment_spooling** uses bounded memory and a transient ' +
+      'disk spool. This setting is independent of the performance profile.',
+    env: 'USENET_STREAMING_MODE',
+    requiresRestart: true,
+    secret: false,
+    ui: HIDDEN,
+  },
   maxConcurrentDownloads: {
     schema: nonNegativeInt,
     default: 0,
@@ -175,6 +189,67 @@ export const usenetSchema = {
     requiresRestart: false,
     secret: false,
     ui: { kind: 'number' as const, min: 0.5, max: 1, hidden: true, step: 0.01 },
+  },
+  segmentMemoryCacheBytes: {
+    schema: byteSize,
+    default: 0,
+    label: 'Segment memory cache size',
+    description:
+      'The memory budget for the decoded-segment arena. **0** (the default) ' +
+      'sizes it automatically for the selected streaming mode; it does not ' +
+      'disable the arena.',
+    env: 'USENET_SEGMENT_MEMORY_CACHE_BYTES',
+    requiresRestart: true,
+    secret: false,
+    ui: HIDDEN,
+  },
+  segmentSpoolingMemoryBudgetBytes: {
+    schema: byteSize,
+    default: 128 * MB,
+    label: 'Segment spooling memory budget',
+    description:
+      'The global hard memory budget for transient buffers and queues owned ' +
+      'by segment spooling. It is used only in **segment_spooling** mode.',
+    env: 'USENET_SEGMENT_SPOOLING_MEMORY_BUDGET_BYTES',
+    requiresRestart: true,
+    secret: false,
+    ui: HIDDEN,
+  },
+  segmentSpoolingStreamBufferBytes: {
+    schema: byteSize,
+    default: 8 * MB,
+    label: 'Segment spooling stream buffer',
+    description:
+      'The maximum buffer share reserved for each active HTTP stream in ' +
+      '**segment_spooling** mode.',
+    env: 'USENET_SEGMENT_SPOOLING_STREAM_BUFFER_BYTES',
+    requiresRestart: true,
+    secret: false,
+    ui: HIDDEN,
+  },
+  segmentSpoolingSpoolBytes: {
+    schema: byteSize,
+    default: 2 * GB,
+    label: 'Segment spooling spool size',
+    description:
+      'The global hard disk budget for transient segment spool files. This ' +
+      'is separate from the persistent segment disk cache.',
+    env: 'USENET_SEGMENT_SPOOLING_SPOOL_BYTES',
+    requiresRestart: true,
+    secret: false,
+    ui: HIDDEN,
+  },
+  segmentSpoolingMinFreeDiskBytes: {
+    schema: byteSize,
+    default: 512 * MB,
+    label: 'Segment spooling minimum free disk space',
+    description:
+      'The free-space safety margin retained on the spool filesystem in ' +
+      '**segment_spooling** mode.',
+    env: 'USENET_SEGMENT_SPOOLING_MIN_FREE_DISK_BYTES',
+    requiresRestart: true,
+    secret: false,
+    ui: HIDDEN,
   },
   segmentDiskCacheBytes: {
     schema: byteSize,

@@ -161,6 +161,24 @@ export type SettingsChangeListener<TSections extends SectionSchemas> = (
   event: SettingsChangeEvent<TSections>
 ) => void | Promise<void>;
 
+export interface SettingsStoreBatchSet {
+  readonly key: string;
+  readonly value: unknown;
+}
+
+export interface SettingsStoreBatch {
+  readonly sets?: readonly SettingsStoreBatchSet[];
+  readonly deletes?: readonly string[];
+}
+
+export interface SettingsStoreBatchOptions {
+  /** Version of the effective snapshot used to build and validate the batch. */
+  readonly expectedVersion: number;
+  readonly updatedBy?: string;
+  /** Used only when copying current environment-owned values into the DB. */
+  readonly allowEnvironmentOverrides?: boolean;
+}
+
 export class SettingsStore<TSections extends SectionSchemas> {
   private snapshot: Snapshot<TSections>;
   private version = 0;
@@ -241,6 +259,11 @@ export class SettingsStore<TSections extends SectionSchemas> {
   async reload(options: { emit?: boolean } = {}): Promise<Set<string>> {
     const emit = options.emit !== false;
     const previous = this.snapshot;
+    // Read the version first. If a writer commits between these two reads, a
+    // later CAS against this older version fails and the candidate is rebuilt;
+    // reading it after the rows could incorrectly pair stale rows with a newer
+    // version and allow that stale candidate to commit.
+    const version = await SettingsRepository.getVersion();
     const rows = await SettingsRepository.getAll();
 
     // Parse raw row values, then fold renamed (aliased) keys onto their current
@@ -285,7 +308,7 @@ export class SettingsStore<TSections extends SectionSchemas> {
     this.storedKeys = new Set(stored.keys());
     this.snapshot = this.buildSnapshot(stored);
     this.initialisedFlag = true;
-    this.version = await SettingsRepository.getVersion();
+    this.version = version;
     if (!emit) return new Set();
     const changed = this.diffKeys(previous, this.snapshot);
     if (changed.size > 0) {
@@ -374,6 +397,62 @@ export class SettingsStore<TSections extends SectionSchemas> {
     }
     await SettingsRepository.delete(key);
     await this.reload();
+  }
+
+  /**
+   * Validate, encode and persist several settings as one version-guarded DB
+   * transaction. A successful non-empty batch reloads exactly once; a lost
+   * compare-and-swap returns `false` and leaves the in-memory snapshot alone.
+   */
+  async applyBatch(
+    batch: SettingsStoreBatch,
+    options: SettingsStoreBatchOptions
+  ): Promise<boolean> {
+    const sets = batch.sets ?? [];
+    const deletes = batch.deletes ?? [];
+    if (sets.length === 0 && deletes.length === 0) return true;
+
+    const seen = new Set<string>();
+    const encodedSets: { key: string; value: unknown }[] = [];
+    for (const item of sets) {
+      if (seen.has(item.key)) {
+        throw new Error(`Duplicate setting in batch: ${item.key}`);
+      }
+      seen.add(item.key);
+      const entry = this.requireField(item.key);
+      const override = resolveEnvOverride(entry.field.env);
+      if (override && !options.allowEnvironmentOverrides) {
+        throw new Error(
+          `Setting ${item.key} is overridden by ${override.name}`
+        );
+      }
+      const parsed = entry.field.schema.parse(item.value) as ConfigValue;
+      encodedSets.push({
+        key: item.key,
+        value: this.encodeForStorage(item.key, parsed),
+      });
+    }
+    for (const key of deletes) {
+      if (seen.has(key)) {
+        throw new Error(`Duplicate setting in batch: ${key}`);
+      }
+      seen.add(key);
+      const entry = this.requireField(key);
+      const override = resolveEnvOverride(entry.field.env);
+      if (override && !options.allowEnvironmentOverrides) {
+        throw new Error(`Setting ${key} is overridden by ${override.name}`);
+      }
+    }
+
+    const applied = await SettingsRepository.applyBatch({
+      sets: encodedSets,
+      deletes,
+      expectedVersion: options.expectedVersion,
+      updatedBy: options.updatedBy,
+    });
+    if (!applied) return false;
+    await this.reload();
+    return true;
   }
 
   getEffectiveValue(key: string): ConfigValue {
