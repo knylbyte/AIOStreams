@@ -20,6 +20,8 @@ type ByteBudgetErrorCode =
   | 'BYTE_BUDGET_INVALID_BYTES'
   | 'BYTE_BUDGET_REQUEST_TOO_LARGE'
   | 'BYTE_BUDGET_INVALID_PRIORITY'
+  | 'BYTE_BUDGET_INVALID_MAX_WAITERS'
+  | 'BYTE_BUDGET_QUEUE_FULL'
   | 'BYTE_BUDGET_CLOSED';
 
 /** Typed input or lifecycle failure raised by {@link ByteBudget}. */
@@ -44,6 +46,12 @@ interface QueuedWaiter {
 }
 
 const MAX_CONTENDED_HIGH_GRANTS = 3;
+/**
+ * Four pending operations per maximum planned open spool file (256) leaves
+ * headroom for readers, writers, and downloads while bounding retained
+ * callbacks and AbortSignal listeners.
+ */
+const DEFAULT_MAX_WAITERS = 1024;
 
 function isPositiveSafeInteger(value: number): boolean {
   return Number.isSafeInteger(value) && value > 0;
@@ -66,14 +74,19 @@ function abortReason(signal: AbortSignal): Error {
  * - `usedBytes` is a safe integer in `[0, maxBytes]`.
  * - every granted lease is counted exactly once until its idempotent release.
  * - each priority queue is FIFO and contains only live pending acquires.
+ * - the combined queues contain at most the configured `maxWaiters`.
  *
  * High priority is favoured under sustained contention, but cannot starve Low:
- * after three contended High grants, the head Low waiter owns the next turn.
- * If that request does not yet fit, capacity is reserved for it rather than
- * bypassing it. The same head-of-line reservation preserves FIFO within each
- * priority for differently sized requests.
+ * before a Low turn is owed, a fitting High head wins, or a fitting Low head
+ * uses capacity that an oversized High head cannot currently use. After three
+ * contended High grants, the Low head owns the next turn; if it does not fit,
+ * capacity is reserved instead of allowing High to bypass it. Only the two
+ * queue heads are considered, preserving FIFO within each priority.
+ * Pending acquires are bounded by `maxWaiters`, which defaults to 1024.
  */
 export class ByteBudget {
+  private readonly maxBytes: number;
+  private readonly maxWaiters: number;
   private usedBytes = 0;
   private peakBytes = 0;
   private readonly highWaiters: QueuedWaiter[] = [];
@@ -81,14 +94,28 @@ export class ByteBudget {
   private contendedHighGrants = 0;
   private closedError: Error | undefined;
 
-  constructor(private readonly maxBytes: number) {
+  constructor(
+    maxBytes: number,
+    options: {
+      readonly maxWaiters?: number;
+    } = {}
+  ) {
     if (!isPositiveSafeInteger(maxBytes)) {
       throw new ByteBudgetError(
         'BYTE_BUDGET_INVALID_BYTES',
         'Byte budget maxBytes must be a finite, safe, positive integer'
       );
     }
-    this.assertAccountingInvariant();
+    const maxWaiters = options.maxWaiters ?? DEFAULT_MAX_WAITERS;
+    if (!isPositiveSafeInteger(maxWaiters)) {
+      throw new ByteBudgetError(
+        'BYTE_BUDGET_INVALID_MAX_WAITERS',
+        'Byte budget maxWaiters must be a finite, safe, positive integer'
+      );
+    }
+    this.maxBytes = maxBytes;
+    this.maxWaiters = maxWaiters;
+    this.assertInvariants();
   }
 
   /**
@@ -119,6 +146,14 @@ export class ByteBudget {
     if (this.waitingCount === 0 && bytes <= this.maxBytes - this.usedBytes) {
       return Promise.resolve(this.grant(bytes));
     }
+    if (this.waitingCount >= this.maxWaiters) {
+      return Promise.reject(
+        new ByteBudgetError(
+          'BYTE_BUDGET_QUEUE_FULL',
+          `Byte budget waiter queue reached its ${this.maxWaiters}-request limit`
+        )
+      );
+    }
 
     return new Promise<ByteLease>((resolve, reject) => {
       const waiter: QueuedWaiter = {
@@ -141,6 +176,7 @@ export class ByteBudget {
       }
 
       this.queueFor(priority).push(waiter);
+      this.assertInvariants();
       this.drain();
     });
   }
@@ -183,7 +219,7 @@ export class ByteBudget {
     this.closedError = error;
     this.rejectQueue(this.highWaiters, error);
     this.rejectQueue(this.lowWaiters, error);
-    this.assertAccountingInvariant();
+    this.assertInvariants();
   }
 
   private get waitingCount(): number {
@@ -233,6 +269,7 @@ export class ByteBudget {
     const index = queue.indexOf(waiter);
     if (index < 0) return false;
     queue.splice(index, 1);
+    this.assertInvariants();
     return true;
   }
 
@@ -256,14 +293,13 @@ export class ByteBudget {
     while (!this.closedError && this.waitingCount > 0) {
       const bothPrioritiesWaiting =
         this.highWaiters.length > 0 && this.lowWaiters.length > 0;
-      const queue = this.pickQueue(bothPrioritiesWaiting);
+      const availableBytes = this.maxBytes - this.usedBytes;
+      const queue = this.pickQueue(availableBytes);
       const waiter = queue?.[0];
       if (!waiter) return;
 
-      const availableBytes = this.maxBytes - this.usedBytes;
-      if (waiter.bytes > availableBytes) return;
-
       queue.shift();
+      this.assertInvariants();
       this.removeAbortListener(waiter);
       if (bothPrioritiesWaiting && waiter.priority === CommandPriority.High) {
         this.contendedHighGrants++;
@@ -274,19 +310,24 @@ export class ByteBudget {
     }
   }
 
-  private pickQueue(
-    bothPrioritiesWaiting: boolean
-  ): QueuedWaiter[] | undefined {
-    if (!bothPrioritiesWaiting) {
-      return this.highWaiters.length > 0
-        ? this.highWaiters
-        : this.lowWaiters.length > 0
-          ? this.lowWaiters
-          : undefined;
+  /** Selects only between queue heads; `undefined` reserves current capacity. */
+  private pickQueue(availableBytes: number): QueuedWaiter[] | undefined {
+    const highHead = this.highWaiters[0];
+    const lowHead = this.lowWaiters[0];
+
+    if (!highHead) {
+      return lowHead && lowHead.bytes <= availableBytes
+        ? this.lowWaiters
+        : undefined;
     }
-    return this.contendedHighGrants >= MAX_CONTENDED_HIGH_GRANTS
-      ? this.lowWaiters
-      : this.highWaiters;
+    if (!lowHead) {
+      return highHead.bytes <= availableBytes ? this.highWaiters : undefined;
+    }
+    if (this.contendedHighGrants >= MAX_CONTENDED_HIGH_GRANTS) {
+      return lowHead.bytes <= availableBytes ? this.lowWaiters : undefined;
+    }
+    if (highHead.bytes <= availableBytes) return this.highWaiters;
+    return lowHead.bytes <= availableBytes ? this.lowWaiters : undefined;
   }
 
   private grant(bytes: number): ByteLease {
@@ -296,7 +337,7 @@ export class ByteBudget {
     );
     this.usedBytes += bytes;
     this.peakBytes = Math.max(this.peakBytes, this.usedBytes);
-    this.assertAccountingInvariant();
+    this.assertInvariants();
 
     let released = false;
     return {
@@ -315,11 +356,11 @@ export class ByteBudget {
       'byte-budget release cannot exceed accounted usage'
     );
     this.usedBytes -= bytes;
-    this.assertAccountingInvariant();
+    this.assertInvariants();
     this.drain();
   }
 
-  private assertAccountingInvariant(): void {
+  private assertInvariants(): void {
     assert(
       Number.isSafeInteger(this.usedBytes),
       'byte-budget usedBytes must remain a safe integer'
@@ -328,6 +369,10 @@ export class ByteBudget {
     assert(
       this.usedBytes <= this.maxBytes,
       'byte-budget usedBytes cannot exceed maxBytes'
+    );
+    assert(
+      this.waitingCount <= this.maxWaiters,
+      'byte-budget waiter count cannot exceed maxWaiters'
     );
   }
 }

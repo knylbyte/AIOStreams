@@ -119,6 +119,111 @@ test('reserves every fourth contended grant for Low to prevent starvation', asyn
   lastHigh.release();
 });
 
+test('grants a fitting Low head when the preferred High head cannot fit', async () => {
+  const budget = new ByteBudget(10);
+  const owner = await budget.acquire(8);
+  const order: string[] = [];
+  const highPromise = budget
+    .acquire(3, { priority: CommandPriority.High })
+    .then((lease) => {
+      order.push('high');
+      return lease;
+    });
+
+  assert.equal(budget.stats().waiting, 1);
+  const low = await budget.acquire(2, { priority: CommandPriority.Low });
+  order.push('low');
+  assert.deepEqual(order, ['low']);
+  assert.deepEqual(budget.stats(), {
+    maxBytes: 10,
+    usedBytes: 10,
+    waiting: 1,
+    peakBytes: 10,
+  });
+
+  low.release();
+  assert.equal(budget.stats().waiting, 1);
+  owner.release();
+  const high = await highPromise;
+  assert.deepEqual(order, ['low', 'high']);
+  assert(budget.stats().usedBytes <= budget.stats().maxBytes);
+  high.release();
+});
+
+test('keeps the Low turn reserved after three contended High grants', async () => {
+  const budget = new ByteBudget(10);
+  const owner = await budget.acquire(8);
+  const order: string[] = [];
+  const lowPromise = budget
+    .acquire(3, { priority: CommandPriority.Low })
+    .then((lease) => {
+      order.push('low');
+      return lease;
+    });
+  const highPromises = ['high-1', 'high-2', 'high-3', 'high-4'].map((name) =>
+    budget.acquire(2, { priority: CommandPriority.High }).then((lease) => {
+      order.push(name);
+      return lease;
+    })
+  );
+
+  for (let index = 0; index < 3; index++) {
+    const lease = await highPromises[index];
+    assert.equal(order[index], `high-${index + 1}`);
+    lease.release();
+  }
+
+  assert.deepEqual(order, ['high-1', 'high-2', 'high-3']);
+  assert.deepEqual(budget.stats(), {
+    maxBytes: 10,
+    usedBytes: 8,
+    waiting: 2,
+    peakBytes: 10,
+  });
+
+  owner.release();
+  const [low, lastHigh] = await Promise.all([lowPromise, highPromises[3]]);
+  assert.deepEqual(order, ['high-1', 'high-2', 'high-3', 'low', 'high-4']);
+  assert(budget.stats().usedBytes <= budget.stats().maxBytes);
+  low.release();
+  lastHigh.release();
+});
+
+test('cross-priority fallback never bypasses a same-priority head', async () => {
+  const budget = new ByteBudget(10);
+  const owner = await budget.acquire(8);
+  const order: string[] = [];
+  const firstHighPromise = budget
+    .acquire(3, { priority: CommandPriority.High })
+    .then((lease) => {
+      order.push('high-1');
+      return lease;
+    });
+  const secondHighPromise = budget
+    .acquire(2, { priority: CommandPriority.High })
+    .then((lease) => {
+      order.push('high-2');
+      return lease;
+    });
+
+  const low = await budget.acquire(2, { priority: CommandPriority.Low });
+  order.push('low');
+  assert.deepEqual(order, ['low']);
+  assert.equal(budget.stats().waiting, 2);
+
+  low.release();
+  assert.deepEqual(order, ['low']);
+  assert.equal(budget.stats().waiting, 2);
+  owner.release();
+  const [firstHigh, secondHigh] = await Promise.all([
+    firstHighPromise,
+    secondHighPromise,
+  ]);
+  assert.deepEqual(order, ['low', 'high-1', 'high-2']);
+  firstHigh.release();
+  secondHigh.release();
+});
+
 test('rejects an already-aborted acquire without adding a waiter', async () => {
   const budget = new ByteBudget(1);
   const controller = new AbortController();
@@ -161,6 +266,87 @@ test('grant removes the queued waiter abort listener', async () => {
   lease.release();
 });
 
+test('rejects beyond the configured waiter limit without adding a listener', async () => {
+  const budget = new ByteBudget(1, { maxWaiters: 2 });
+  const owner = await budget.acquire(1);
+  const firstController = new AbortController();
+  const secondController = new AbortController();
+  const overflowController = new AbortController();
+  const first = budget.acquire(1, { signal: firstController.signal });
+  const second = budget.acquire(1, { signal: secondController.signal });
+
+  assert.equal(budget.stats().waiting, 2);
+  await assert.rejects(
+    budget.acquire(1, { signal: overflowController.signal }),
+    (error) => isBudgetError(error, 'BYTE_BUDGET_QUEUE_FULL')
+  );
+  assert.equal(budget.stats().waiting, 2);
+  assert.equal(getEventListeners(overflowController.signal, 'abort').length, 0);
+
+  const settledPromise = Promise.allSettled([first, second]);
+  budget.close(new Error('test cleanup'));
+  await settledPromise;
+  owner.release();
+});
+
+test('an aborted waiter frees its bounded queue slot', async () => {
+  const budget = new ByteBudget(1, { maxWaiters: 1 });
+  const owner = await budget.acquire(1);
+  const abortedController = new AbortController();
+  const aborted = budget.acquire(1, { signal: abortedController.signal });
+
+  assert.equal(budget.stats().waiting, 1);
+  abortedController.abort();
+  await assert.rejects(aborted, { name: 'AbortError' });
+  assert.equal(budget.stats().waiting, 0);
+  assert.equal(getEventListeners(abortedController.signal, 'abort').length, 0);
+
+  const replacementController = new AbortController();
+  const replacementPromise = budget.acquire(1, {
+    signal: replacementController.signal,
+  });
+  assert.equal(budget.stats().waiting, 1);
+  owner.release();
+  const replacement = await replacementPromise;
+  assert.equal(budget.stats().waiting, 0);
+  assert.equal(
+    getEventListeners(replacementController.signal, 'abort').length,
+    0
+  );
+  replacement.release();
+});
+
+test('grant and close drain bounded queue slots and abort listeners', async () => {
+  const budget = new ByteBudget(1, { maxWaiters: 2 });
+  const owner = await budget.acquire(1);
+  const firstController = new AbortController();
+  const secondController = new AbortController();
+  const firstPromise = budget.acquire(1, {
+    signal: firstController.signal,
+  });
+  const secondPromise = budget.acquire(1, {
+    signal: secondController.signal,
+  });
+
+  assert.equal(budget.stats().waiting, 2);
+  owner.release();
+  const first = await firstPromise;
+  assert.equal(budget.stats().waiting, 1);
+  assert.equal(getEventListeners(firstController.signal, 'abort').length, 0);
+  assert.equal(getEventListeners(secondController.signal, 'abort').length, 1);
+
+  const closeError = new Error('test close');
+  const secondRejection = assert.rejects(
+    secondPromise,
+    (error) => error === closeError
+  );
+  budget.close(closeError);
+  await secondRejection;
+  assert.equal(budget.stats().waiting, 0);
+  assert.equal(getEventListeners(secondController.signal, 'abort').length, 0);
+  first.release();
+});
+
 test('close rejects all waiters, removes listeners, and preserves active accounting', async () => {
   const budget = new ByteBudget(2);
   const owner = await budget.acquire(2);
@@ -196,6 +382,26 @@ test('close rejects all waiters, removes listeners, and preserves active account
   budget.close(new Error('ignored second close'));
   owner.release();
   assert.equal(budget.stats().usedBytes, 0);
+});
+
+test('default close uses the typed closed error for pending and later acquires', async () => {
+  const budget = new ByteBudget(1);
+  const owner = await budget.acquire(1);
+  const pending = budget.acquire(1);
+  const pendingRejection = assert.rejects(pending, (error) =>
+    isBudgetError(error, 'BYTE_BUDGET_CLOSED')
+  );
+
+  budget.close();
+  await pendingRejection;
+  await assert.rejects(budget.acquire(1), (error) =>
+    isBudgetError(error, 'BYTE_BUDGET_CLOSED')
+  );
+  assert.throws(
+    () => budget.tryAcquire(1),
+    (error) => isBudgetError(error, 'BYTE_BUDGET_CLOSED')
+  );
+  owner.release();
 });
 
 test('rejects oversized requests immediately with a typed error', async () => {
@@ -234,7 +440,31 @@ test('accepts only finite, safe, positive integer byte counts', async () => {
     await assert.rejects(budget.acquire(value), (error) =>
       isBudgetError(error, 'BYTE_BUDGET_INVALID_BYTES')
     );
+    assert.throws(
+      () => budget.tryAcquire(value),
+      (error) => isBudgetError(error, 'BYTE_BUDGET_INVALID_BYTES')
+    );
+    assert.throws(
+      () => new ByteBudget(10, { maxWaiters: value }),
+      (error) => isBudgetError(error, 'BYTE_BUDGET_INVALID_MAX_WAITERS')
+    );
   }
+});
+
+test('rejects an invalid runtime priority with a typed error', async () => {
+  const budget = new ByteBudget(1);
+  const options: { priority?: CommandPriority } = {};
+  Object.defineProperty(options, 'priority', { value: 99, enumerable: true });
+
+  await assert.rejects(budget.acquire(1, options), (error) =>
+    isBudgetError(error, 'BYTE_BUDGET_INVALID_PRIORITY')
+  );
+  assert.deepEqual(budget.stats(), {
+    maxBytes: 1,
+    usedBytes: 0,
+    waiting: 0,
+    peakBytes: 0,
+  });
 });
 
 test('release is idempotent and peakBytes remains the historical maximum', async () => {
