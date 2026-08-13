@@ -36,6 +36,8 @@ import type {
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
 const LIVENESS_MARKER = '.alive';
+const LIVENESS_LOCK_DIRECTORY = '.liveness-locks';
+const LIVENESS_LOCK_SUFFIX = '.lock';
 const HASHED_NAMESPACE = /^[a-f0-9]{64}$/;
 const HASHED_ARTIFACT = /^[a-f0-9]{64}\.(?:partial|ready)$/;
 
@@ -61,6 +63,10 @@ interface PendingArtifactCleanup {
   readonly partialPath: string;
   readonly readyPath: string;
   readonly reservation: SpoolBudgetLease;
+}
+
+interface NamespaceControlLease {
+  release(): Promise<void>;
 }
 
 function hashId(kind: string, value: string): string {
@@ -219,6 +225,7 @@ export class SpoolManager {
   readonly processRoot: string;
   readonly engineRoot: string;
 
+  private readonly livenessLockRoot: string;
   private readonly plan: SegmentSpoolingPlan;
   private readonly fileSystem: SpoolFileSystem;
   private readonly clock: SpoolClock;
@@ -236,7 +243,7 @@ export class SpoolManager {
   private readonly pendingArtifactCleanups = new Set<PendingArtifactCleanup>();
   private readonly closeController = new AbortController();
   private globalInitialization: Promise<void> | undefined;
-  private namespaceEnsuring: Promise<void> | undefined;
+  private namespaceEnsuring: Promise<boolean> | undefined;
   private heartbeatTask: SpoolScheduledTask | undefined;
   private heartbeatInFlight: Promise<void> | undefined;
   private closePromise: Promise<void> | undefined;
@@ -289,6 +296,7 @@ export class SpoolManager {
     const processName = hashId('process', this.idGenerator());
     const engineName = hashId('engine', options.engineId);
     this.spoolRoot = path.join(cacheRoot, 'usenet-spool');
+    this.livenessLockRoot = path.join(this.spoolRoot, LIVENESS_LOCK_DIRECTORY);
     this.processRoot = path.join(this.spoolRoot, processName);
     this.engineRoot = path.join(this.processRoot, engineName);
     this.budget = new SpoolBudget({
@@ -311,7 +319,9 @@ export class SpoolManager {
   async initialize(): Promise<void> {
     if (this.closed) throw this.closedError();
     await this.ensureGlobalInitialization();
-    await this.ensureOwnNamespace();
+    if (!(await this.ensureOwnNamespace())) {
+      throw this.namespaceControlContentionError();
+    }
     if (this.closed) throw this.closedError();
     this.scheduleHeartbeat();
   }
@@ -379,7 +389,9 @@ export class SpoolManager {
           artifact = await GrowingSpoolArtifact.create(artifactOptions);
         } catch (error) {
           if (!isMissingSpoolError(error)) throw error;
-          await this.ensureOwnNamespace();
+          if (!(await this.ensureOwnNamespace())) {
+            throw this.namespaceControlContentionError();
+          }
           artifact = await GrowingSpoolArtifact.create(artifactOptions);
         }
         if (this.closed) {
@@ -454,13 +466,14 @@ export class SpoolManager {
         mode: DIRECTORY_MODE,
       });
       await this.assertSafeDirectory(this.spoolRoot);
+      await this.ensureLivenessLockRoot();
       await this.cleanupOrphans();
     } catch (error) {
       throw classifySpoolFileError(error, 'initializing spool storage');
     }
   }
 
-  private ensureOwnNamespace(): Promise<void> {
+  private ensureOwnNamespace(): Promise<boolean> {
     if (this.closed) return Promise.reject(this.closedError());
     if (this.namespaceEnsuring) return this.namespaceEnsuring;
     const operation = this.ensureOwnNamespaceOnce();
@@ -474,7 +487,11 @@ export class SpoolManager {
     return operation;
   }
 
-  private async ensureOwnNamespaceOnce(): Promise<void> {
+  private async ensureOwnNamespaceOnce(): Promise<boolean> {
+    const control = await this.tryAcquireNamespaceControl(
+      path.basename(this.processRoot)
+    );
+    if (!control) return false;
     try {
       await this.fileSystem.mkdir(this.spoolRoot, {
         recursive: true,
@@ -493,8 +510,11 @@ export class SpoolManager {
       });
       await this.assertSafeDirectory(this.engineRoot);
       await this.refreshLivenessMarker();
+      return true;
     } catch (error) {
       throw classifySpoolFileError(error, 'recovering the spool namespace');
+    } finally {
+      await control.release();
     }
   }
 
@@ -518,25 +538,23 @@ export class SpoolManager {
     for (const entry of entries) {
       if (entry === ownName || !HASHED_NAMESPACE.test(entry)) continue;
       const candidate = path.join(this.spoolRoot, entry);
-      let stats;
-      try {
-        stats = await this.fileSystem.lstat(candidate);
-      } catch (error) {
-        if (isMissingSpoolError(error)) continue;
-        throw error;
-      }
-      if (
-        stats.isSymbolicLink() ||
-        !stats.isDirectory() ||
-        !(await this.isSafelyExpiredNamespace(
-          candidate,
-          stats.mtimeMs,
-          oldestAllowed
-        ))
-      ) {
+      if (!(await this.isSafelyExpiredNamespace(candidate, oldestAllowed))) {
         continue;
       }
-      await this.fileSystem.rm(candidate, { recursive: true, force: true });
+
+      // The first scan is only a cheap eligibility hint. Successful `wx`
+      // acquisition is the cross-process linearization point; the second scan
+      // is authoritative and deletion remains fenced until `rm` completes.
+      const control = await this.tryAcquireNamespaceControl(entry);
+      if (!control) continue;
+      try {
+        if (!(await this.isSafelyExpiredNamespace(candidate, oldestAllowed))) {
+          continue;
+        }
+        await this.fileSystem.rm(candidate, { recursive: true, force: true });
+      } finally {
+        await control.release();
+      }
     }
   }
 
@@ -547,9 +565,19 @@ export class SpoolManager {
    */
   private async isSafelyExpiredNamespace(
     processRoot: string,
-    processMtimeMs: number,
     oldestAllowed: number
   ): Promise<boolean> {
+    let processStats;
+    try {
+      processStats = await this.fileSystem.lstat(processRoot);
+    } catch (error) {
+      if (isMissingSpoolError(error)) return false;
+      throw error;
+    }
+    if (processStats.isSymbolicLink() || !processStats.isDirectory()) {
+      return false;
+    }
+    const processMtimeMs = processStats.mtimeMs;
     if (!this.isPastOrphanTtl(processMtimeMs, oldestAllowed)) return false;
     let entries: readonly string[];
     try {
@@ -644,11 +672,27 @@ export class SpoolManager {
     await Promise.allSettled(lifecycleOperations);
     await this.waitForCreations();
 
+    let namespaceControl: NamespaceControlLease | undefined;
+    let firstError: Error | undefined;
+    if (this.processNamespaceOwned) {
+      try {
+        namespaceControl = await this.tryAcquireNamespaceControl(
+          path.basename(this.processRoot)
+        );
+        if (!namespaceControl) {
+          firstError = this.namespaceControlContentionError();
+        }
+      } catch (error) {
+        firstError = error instanceof Error ? error : new Error(String(error));
+      }
+    }
+
     const trackedArtifacts = [...this.artifactReservations];
     const results = await Promise.allSettled(
-      trackedArtifacts.map(([artifact]) => artifact.dispose())
+      namespaceControl
+        ? trackedArtifacts.map(([artifact]) => artifact.dispose())
+        : []
     );
-    let firstError: Error | undefined;
     for (const result of results) {
       if (result.status === 'rejected' && !firstError) {
         firstError =
@@ -658,7 +702,7 @@ export class SpoolManager {
       }
     }
     let namespaceRemoved = !this.processNamespaceOwned;
-    if (this.processNamespaceOwned) {
+    if (this.processNamespaceOwned && namespaceControl) {
       try {
         await this.fileSystem.rm(this.processRoot, {
           recursive: true,
@@ -673,6 +717,16 @@ export class SpoolManager {
             error,
             'removing the process spool namespace'
           );
+        }
+      }
+    }
+    if (namespaceControl) {
+      try {
+        await namespaceControl.release();
+      } catch (error) {
+        if (!firstError) {
+          firstError =
+            error instanceof Error ? error : new Error(String(error));
         }
       }
     }
@@ -717,6 +771,82 @@ export class SpoolManager {
       );
     }
     await this.fileSystem.utimes(markerPath, now, now);
+  }
+
+  /**
+   * Try to acquire the stable cross-process fence for one hashed namespace.
+   * The lock lives outside the recursively deleted namespace so its atomic
+   * `wx` claim remains visible until destructive cleanup has fully finished.
+   * Existing or crash-left locks are never stolen: callers conservatively
+   * receive `undefined` without polling or retrying.
+   */
+  private async tryAcquireNamespaceControl(
+    namespaceName: string
+  ): Promise<NamespaceControlLease | undefined> {
+    if (!HASHED_NAMESPACE.test(namespaceName)) {
+      throw new UsenetSpoolError(
+        'USENET_SPOOL_INVALID_ARGUMENT',
+        'Spool namespace control requires a hashed identifier'
+      );
+    }
+    await this.ensureLivenessLockRoot();
+    const lockPath = path.join(
+      this.livenessLockRoot,
+      `${namespaceName}${LIVENESS_LOCK_SUFFIX}`
+    );
+    let handle: SpoolFileHandle;
+    try {
+      handle = await this.fileSystem.open(lockPath, 'wx', FILE_MODE);
+    } catch (error) {
+      if (isExistingSpoolError(error)) return undefined;
+      throw classifySpoolFileError(error, 'acquiring spool namespace control');
+    }
+
+    try {
+      const stats = await this.fileSystem.lstat(lockPath);
+      if (stats.isSymbolicLink() || !stats.isFile()) {
+        throw new UsenetSpoolError(
+          'USENET_SPOOL_UNAVAILABLE',
+          'Spool namespace control is not a safe file'
+        );
+      }
+    } catch (error) {
+      await Promise.allSettled([handle.close()]);
+      throw classifySpoolFileError(error, 'validating spool namespace control');
+    }
+
+    let releasePromise: Promise<void> | undefined;
+    return {
+      release: () => {
+        releasePromise ??= this.releaseNamespaceControl(handle, lockPath);
+        return releasePromise;
+      },
+    };
+  }
+
+  private async releaseNamespaceControl(
+    handle: SpoolFileHandle,
+    lockPath: string
+  ): Promise<void> {
+    try {
+      await handle.close();
+    } catch (error) {
+      throw classifySpoolFileError(error, 'closing spool namespace control');
+    }
+    try {
+      await this.fileSystem.rm(lockPath, { force: false });
+    } catch (error) {
+      if (isMissingSpoolError(error)) return;
+      throw classifySpoolFileError(error, 'releasing spool namespace control');
+    }
+  }
+
+  private async ensureLivenessLockRoot(): Promise<void> {
+    await this.fileSystem.mkdir(this.livenessLockRoot, {
+      recursive: true,
+      mode: DIRECTORY_MODE,
+    });
+    await this.assertSafeDirectory(this.livenessLockRoot);
   }
 
   private scheduleHeartbeat(): void {
@@ -813,6 +943,13 @@ export class SpoolManager {
     return new UsenetSpoolError(
       'USENET_SPOOL_CLOSED',
       'Spool manager is closed'
+    );
+  }
+
+  private namespaceControlContentionError(): UsenetSpoolError {
+    return new UsenetSpoolError(
+      'USENET_SPOOL_UNAVAILABLE',
+      'Spool namespace is fenced by another process'
     );
   }
 }

@@ -3,6 +3,7 @@ import { getEventListeners } from 'node:events';
 import {
   open,
   mkdir,
+  lstat,
   mkdtemp,
   readdir,
   rename,
@@ -22,6 +23,7 @@ import { SpoolManager, type SpoolManagerOptions } from './manager.js';
 import type {
   SpoolFileHandle,
   SpoolFileSystem,
+  SpoolPathStats,
   SpoolScheduledTask,
   SpoolScheduler,
 } from './types.js';
@@ -194,6 +196,83 @@ async function filesBelow(directory: string): Promise<string[]> {
     else files.push(child);
   }
   return files;
+}
+
+async function openSpoolFile(
+  filePath: string,
+  flags: string,
+  mode: number | undefined,
+  onClose: () => void = () => undefined
+): Promise<SpoolFileHandle> {
+  const handle = await open(filePath, flags, mode);
+  let closed = false;
+  return {
+    read: async (buffer, offset, length, position) => {
+      const result = await handle.read(buffer, offset, length, position);
+      return { bytesRead: result.bytesRead };
+    },
+    write: async (buffer, offset, length, position) => {
+      const result = await handle.write(buffer, offset, length, position);
+      return { bytesWritten: result.bytesWritten };
+    },
+    close: async () => {
+      await handle.close();
+      if (!closed) {
+        closed = true;
+        onClose();
+      }
+    },
+  };
+}
+
+async function spoolLstat(target: string): Promise<SpoolPathStats> {
+  const stats = await lstat(target);
+  return {
+    mtimeMs: stats.mtimeMs,
+    isDirectory: () => stats.isDirectory(),
+    isFile: () => stats.isFile(),
+    isSymbolicLink: () => stats.isSymbolicLink(),
+  };
+}
+
+interface ForeignNamespaceFixture {
+  readonly processRoot: string;
+  readonly markerPath: string;
+  readonly engineRoot: string;
+  readonly artifactPath: string;
+  readonly lockRoot: string;
+  readonly lockPath: string;
+}
+
+async function createForeignNamespace(
+  cacheRoot: string,
+  namespaceName: string,
+  now: number
+): Promise<ForeignNamespaceFixture> {
+  const spoolRoot = path.join(cacheRoot, 'usenet-spool');
+  const processRoot = path.join(spoolRoot, namespaceName);
+  const markerPath = path.join(processRoot, '.alive');
+  const engineRoot = path.join(processRoot, '1'.repeat(64));
+  const artifactPath = path.join(engineRoot, `${'2'.repeat(64)}.ready`);
+  const lockRoot = path.join(spoolRoot, '.liveness-locks');
+  const lockPath = path.join(lockRoot, `${namespaceName}.lock`);
+  await mkdir(engineRoot, { recursive: true, mode: 0o700 });
+  for (const filePath of [markerPath, artifactPath]) {
+    const handle = await open(filePath, 'w', 0o600);
+    await handle.close();
+  }
+  const old = new Date(now - 5000);
+  for (const target of [markerPath, artifactPath, engineRoot, processRoot]) {
+    await utimes(target, old, old);
+  }
+  return {
+    processRoot,
+    markerPath,
+    engineRoot,
+    artifactPath,
+    lockRoot,
+    lockPath,
+  };
 }
 
 function controlledWriterFileSystem(
@@ -559,7 +638,9 @@ test('dispose serializes with an in-flight completion rename', async (context) =
       events.push('rename-end');
     },
     rm: async (target, options) => {
-      events.push('remove');
+      if (target.endsWith('.partial') || target.endsWith('.ready')) {
+        events.push('remove');
+      }
       await rm(target, options);
     },
   };
@@ -869,6 +950,382 @@ test('fresh heartbeat protects a live idle manager from orphan cleanup', async (
   assert.equal(schedulerB.pendingCount, 0);
 });
 
+test('heartbeat wins after an initially stale marker snapshot', async () => {
+  const cacheRoot = await mkdtemp(
+    path.join(tmpdir(), 'aiostreams-fence-race-')
+  );
+  let now = Date.now();
+  const plan = testPlan({ orphanTtlMs: 900 });
+  const schedulerA = new ControlledScheduler();
+  const schedulerB = new ControlledScheduler();
+  const managerA = new SpoolManager({
+    plan,
+    engineId: 'fence-race-a',
+    cacheRoot,
+    clock: () => now,
+    idGenerator: () => 'fence-race-process-a',
+    scheduler: schedulerA.schedule,
+  });
+  const memory = new ByteBudget(8);
+  const artifact = await managerA.createArtifact({
+    sessionId: 'fence-race-session',
+    segmentId: 'segment',
+    initialReservationBytes: 8,
+  });
+  await writeText(artifact, memory, 'data');
+  await artifact.complete();
+  const promotion = artifact.acquirePromotion();
+  const markerPath = path.join(managerA.processRoot, '.alive');
+  const initialMarkerRead = Promise.withResolvers<void>();
+  const continueInitialScan = Promise.withResolvers<void>();
+  let markerReads = 0;
+  const managerB = new SpoolManager({
+    plan,
+    engineId: 'fence-race-b',
+    cacheRoot,
+    clock: () => now,
+    idGenerator: () => 'fence-race-process-b',
+    scheduler: schedulerB.schedule,
+    fileSystem: {
+      lstat: async (target) => {
+        const snapshot = await spoolLstat(target);
+        if (target === markerPath && markerReads++ === 0) {
+          initialMarkerRead.resolve();
+          await continueInitialScan.promise;
+        }
+        return snapshot;
+      },
+    },
+  });
+
+  try {
+    const old = new Date(now - 5000);
+    for (const target of [
+      markerPath,
+      promotion.path,
+      managerA.engineRoot,
+      managerA.processRoot,
+    ]) {
+      await utimes(target, old, old);
+    }
+    now += 2000;
+
+    const initializationB = managerB.initialize();
+    await initialMarkerRead.promise;
+    await schedulerA.runNext();
+    continueInitialScan.resolve();
+    await initializationB;
+
+    assert.equal(markerReads, 2);
+    assert.equal(await exists(managerA.processRoot), true);
+    assert.equal(await exists(promotion.path), true);
+    assert.equal(
+      (await collect(artifact.createReadStream())).toString(),
+      'data'
+    );
+    const lockPath = path.join(
+      managerA.spoolRoot,
+      '.liveness-locks',
+      `${path.basename(managerA.processRoot)}.lock`
+    );
+    assert.equal(await exists(lockPath), false);
+
+    promotion.release();
+    await artifact.dispose();
+    assert.equal(managerA.stats().budget.reservedBytes, 0);
+    assert.equal(managerA.stats().files.openFiles, 0);
+    assert.equal(managerA.stats().artifacts, 0);
+  } finally {
+    continueInitialScan.resolve();
+    promotion.release();
+    await Promise.allSettled([
+      artifact.dispose(),
+      managerB.close(),
+      managerA.close(),
+    ]);
+    await rm(cacheRoot, { recursive: true, force: true });
+  }
+});
+
+test('cleaner fence blocks heartbeat and stale manager recovers afterward', async () => {
+  const cacheRoot = await mkdtemp(
+    path.join(tmpdir(), 'aiostreams-cleaner-wins-')
+  );
+  let now = Date.now();
+  const plan = testPlan({ orphanTtlMs: 900 });
+  const schedulerA = new ControlledScheduler();
+  const schedulerB = new ControlledScheduler();
+  const managerA = new SpoolManager({
+    plan,
+    engineId: 'cleaner-wins-a',
+    cacheRoot,
+    clock: () => now,
+    idGenerator: () => 'cleaner-wins-process-a',
+    scheduler: schedulerA.schedule,
+  });
+  await managerA.initialize();
+  const markerPath = path.join(managerA.processRoot, '.alive');
+  const lockPath = path.join(
+    managerA.spoolRoot,
+    '.liveness-locks',
+    `${path.basename(managerA.processRoot)}.lock`
+  );
+  const cleanerHasFence = Promise.withResolvers<void>();
+  const continueCleaner = Promise.withResolvers<void>();
+  let openControlHandles = 0;
+  let namespaceDeletes = 0;
+  const managerB = new SpoolManager({
+    plan,
+    engineId: 'cleaner-wins-b',
+    cacheRoot,
+    clock: () => now,
+    idGenerator: () => 'cleaner-wins-process-b',
+    scheduler: schedulerB.schedule,
+    fileSystem: {
+      open: async (filePath, flags, mode) => {
+        openControlHandles++;
+        const handle = await openSpoolFile(filePath, flags, mode, () => {
+          openControlHandles--;
+        });
+        if (filePath === lockPath && flags === 'wx') {
+          cleanerHasFence.resolve();
+          await continueCleaner.promise;
+        }
+        return handle;
+      },
+      rm: async (target, options) => {
+        if (target === managerA.processRoot) namespaceDeletes++;
+        await rm(target, options);
+      },
+    },
+  });
+
+  try {
+    const old = new Date(now - 5000);
+    for (const target of [
+      markerPath,
+      managerA.engineRoot,
+      managerA.processRoot,
+    ]) {
+      await utimes(target, old, old);
+    }
+    now += 2000;
+
+    const initializationB = managerB.initialize();
+    await cleanerHasFence.promise;
+    assert.match(path.basename(lockPath), /^[a-f0-9]{64}\.lock$/);
+    if (process.platform !== 'win32') {
+      assert.equal((await stat(lockPath)).mode & 0o777, 0o600);
+      assert.equal((await stat(path.dirname(lockPath))).mode & 0o777, 0o700);
+    }
+    await schedulerA.runNext();
+    assert.equal(schedulerA.pendingCount, 1);
+    assert.equal(await exists(managerA.processRoot), true);
+    await assert.rejects(
+      managerA.createArtifact({
+        sessionId: 'fenced-activity',
+        segmentId: 'segment',
+        initialReservationBytes: 8,
+      }),
+      (error) => isSpoolError(error, 'USENET_SPOOL_UNAVAILABLE')
+    );
+    assert.equal(managerA.stats().budget.reservedBytes, 0);
+    assert.equal(managerA.stats().files.openFiles, 0);
+
+    continueCleaner.resolve();
+    await initializationB;
+    assert.equal(namespaceDeletes, 1);
+    assert.equal(await exists(managerA.processRoot), false);
+    assert.equal(await exists(lockPath), false);
+    assert.equal(openControlHandles, 0);
+
+    const memory = new ByteBudget(8);
+    const artifact = await managerA.createArtifact({
+      sessionId: 'post-fence-recovery',
+      segmentId: 'segment',
+      initialReservationBytes: 8,
+    });
+    await writeText(artifact, memory, 'data');
+    await artifact.complete();
+    assert.equal(
+      (await collect(artifact.createReadStream())).toString(),
+      'data'
+    );
+    await artifact.dispose();
+    assert.equal(managerA.stats().budget.reservedBytes, 0);
+    assert.equal(managerA.stats().files.openFiles, 0);
+  } finally {
+    continueCleaner.resolve();
+    await Promise.allSettled([managerB.close(), managerA.close()]);
+    assert.equal(openControlHandles, 0);
+    await rm(cacheRoot, { recursive: true, force: true });
+  }
+});
+
+test('fresh marker revalidation under the cleaner fence prevents deletion', async () => {
+  const cacheRoot = await mkdtemp(
+    path.join(tmpdir(), 'aiostreams-fence-recheck-')
+  );
+  const now = Date.now();
+  const fixture = await createForeignNamespace(cacheRoot, 'a'.repeat(64), now);
+  let cleanerClaims = 0;
+  const manager = new SpoolManager({
+    plan: testPlan({ orphanTtlMs: 1000 }),
+    engineId: 'fence-recheck',
+    cacheRoot,
+    clock: () => now,
+    idGenerator: () => 'fence-recheck-process',
+    fileSystem: {
+      open: async (filePath, flags, mode) => {
+        const handle = await openSpoolFile(filePath, flags, mode);
+        if (filePath === fixture.lockPath && flags === 'wx') {
+          cleanerClaims++;
+          await utimes(fixture.markerPath, new Date(now), new Date(now));
+        }
+        return handle;
+      },
+    },
+  });
+  const secondManager = new SpoolManager({
+    plan: testPlan({ orphanTtlMs: 1000 }),
+    engineId: 'fence-recheck-second',
+    cacheRoot,
+    clock: () => now,
+    idGenerator: () => 'fence-recheck-second-process',
+  });
+
+  try {
+    await manager.initialize();
+    assert.equal(cleanerClaims, 1);
+    assert.equal(await exists(fixture.processRoot), true);
+    assert.equal(await exists(fixture.artifactPath), true);
+    assert.equal(await exists(fixture.lockPath), false);
+
+    await secondManager.initialize();
+    assert.equal(await exists(fixture.processRoot), true);
+    assert.equal(await exists(fixture.artifactPath), true);
+    assert.equal(await exists(fixture.lockPath), false);
+  } finally {
+    await Promise.allSettled([manager.close(), secondManager.close()]);
+    await rm(cacheRoot, { recursive: true, force: true });
+  }
+});
+
+test('unsafe or inaccessible namespace controls fail safe without deletion', async () => {
+  const cacheRoot = await mkdtemp(
+    path.join(tmpdir(), 'aiostreams-fence-safety-')
+  );
+  const now = Date.now();
+  const protectedFixture = await createForeignNamespace(
+    cacheRoot,
+    'a'.repeat(64),
+    now
+  );
+  const unknownFixture = await createForeignNamespace(
+    cacheRoot,
+    'b'.repeat(64),
+    now
+  );
+  const unknownControl = path.join(
+    unknownFixture.processRoot,
+    '.unexpected-control'
+  );
+  const unknownHandle = await open(unknownControl, 'w', 0o600);
+  await unknownHandle.close();
+  await utimes(
+    unknownFixture.processRoot,
+    new Date(now - 5000),
+    new Date(now - 5000)
+  );
+  const scheduler = new ControlledScheduler();
+  let deniedClaims = 0;
+  const deniedManager = new SpoolManager({
+    plan: testPlan({ orphanTtlMs: 1000 }),
+    engineId: 'fence-denied',
+    cacheRoot,
+    clock: () => now,
+    idGenerator: () => 'fence-denied-process',
+    scheduler: scheduler.schedule,
+    fileSystem: {
+      open: async (filePath, flags, mode) => {
+        if (filePath === protectedFixture.lockPath && flags === 'wx') {
+          deniedClaims++;
+          const error = new Error('synthetic namespace-control denial');
+          Object.defineProperty(error, 'code', { value: 'EACCES' });
+          throw error;
+        }
+        return openSpoolFile(filePath, flags, mode);
+      },
+    },
+  });
+
+  try {
+    await assert.rejects(deniedManager.initialize(), (error) =>
+      isSpoolError(error, 'USENET_SPOOL_UNAVAILABLE')
+    );
+    assert.equal(deniedClaims, 1);
+    assert.equal(await exists(protectedFixture.processRoot), true);
+    assert.equal(await exists(protectedFixture.artifactPath), true);
+    assert.equal(await exists(unknownFixture.processRoot), true);
+    assert.equal(scheduler.pendingCount, 0);
+
+    await mkdir(protectedFixture.lockRoot, {
+      recursive: true,
+      mode: 0o700,
+    });
+    const staleLock = await open(protectedFixture.lockPath, 'wx', 0o600);
+    await staleLock.close();
+    const staleLockManager = new SpoolManager({
+      plan: testPlan({ orphanTtlMs: 1000 }),
+      engineId: 'fence-stale-lock',
+      cacheRoot,
+      clock: () => now,
+      idGenerator: () => 'fence-stale-lock-process',
+    });
+    try {
+      await staleLockManager.initialize();
+      assert.equal(await exists(protectedFixture.processRoot), true);
+      assert.equal(await exists(protectedFixture.artifactPath), true);
+      assert.equal(await exists(unknownFixture.processRoot), true);
+      assert.equal(staleLockManager.stats().files.openFiles, 0);
+    } finally {
+      await staleLockManager.close();
+    }
+    await rm(protectedFixture.lockPath, { force: false });
+
+    if (process.platform !== 'win32') {
+      const symlinkTarget = path.join(cacheRoot, 'lock-symlink-target');
+      const targetHandle = await open(symlinkTarget, 'w', 0o600);
+      await targetHandle.close();
+      await symlink(symlinkTarget, protectedFixture.lockPath);
+      const conservativeManager = new SpoolManager({
+        plan: testPlan({ orphanTtlMs: 1000 }),
+        engineId: 'fence-symlink',
+        cacheRoot,
+        clock: () => now,
+        idGenerator: () => 'fence-symlink-process',
+      });
+      try {
+        await conservativeManager.initialize();
+        assert.equal(await exists(protectedFixture.processRoot), true);
+        assert.equal(await exists(protectedFixture.artifactPath), true);
+        assert.equal(await exists(unknownFixture.processRoot), true);
+        assert.equal(
+          (await lstat(protectedFixture.lockPath)).isSymbolicLink(),
+          true
+        );
+        assert.equal(conservativeManager.stats().files.openFiles, 0);
+      } finally {
+        await conservativeManager.close();
+      }
+    }
+  } finally {
+    await Promise.allSettled([deniedManager.close()]);
+    assert.equal(scheduler.pendingCount, 0);
+    await rm(cacheRoot, { recursive: true, force: true });
+  }
+});
+
 test('recovers an externally removed namespace with at most one open retry', async (context) => {
   let artifactOpenCalls = 0;
   const fileSystem: Partial<SpoolFileSystem> = {
@@ -919,11 +1376,25 @@ test('recovers an externally removed namespace with at most one open retry', asy
   assert.deepEqual(await filesBelow(cacheRoot), []);
 });
 
-test('close cancels heartbeat and waits for an in-flight refresh', async (context) => {
+test('close waits for a fenced heartbeat while a cleaner contends', async () => {
+  const cacheRoot = await mkdtemp(
+    path.join(tmpdir(), 'aiostreams-close-fence-')
+  );
   const heartbeatStarted = Promise.withResolvers<void>();
   const continueHeartbeat = Promise.withResolvers<void>();
+  let now = Date.now();
   let touchCalls = 0;
+  let openControlHandles = 0;
   const fileSystem: Partial<SpoolFileSystem> = {
+    open: async (filePath, flags, mode) => {
+      let counted = false;
+      const handle = await openSpoolFile(filePath, flags, mode, () => {
+        if (counted) openControlHandles--;
+      });
+      counted = true;
+      openControlHandles++;
+      return handle;
+    },
     utimes: async (target, atimeMs, mtimeMs) => {
       touchCalls++;
       if (touchCalls === 2) {
@@ -933,31 +1404,74 @@ test('close cancels heartbeat and waits for an in-flight refresh', async (contex
       await utimes(target, new Date(atimeMs), new Date(mtimeMs));
     },
   };
-  const scheduler = new ControlledScheduler();
-  const { manager, cacheRoot } = await testManager(context, {
+  const plan = testPlan({ orphanTtlMs: 900 });
+  const schedulerA = new ControlledScheduler();
+  const schedulerB = new ControlledScheduler();
+  const managerA = new SpoolManager({
+    plan,
+    engineId: 'close-fence-a',
+    cacheRoot,
     fileSystem,
-    scheduler: scheduler.schedule,
+    clock: () => now,
+    idGenerator: () => 'close-fence-process-a',
+    scheduler: schedulerA.schedule,
   });
-  await manager.initialize();
-  assert.equal(scheduler.pendingCount, 1);
-  const heartbeat = scheduler.runNext();
-  await heartbeatStarted.promise;
+  const managerB = new SpoolManager({
+    plan,
+    engineId: 'close-fence-b',
+    cacheRoot,
+    clock: () => now,
+    idGenerator: () => 'close-fence-process-b',
+    scheduler: schedulerB.schedule,
+  });
 
-  let closed = false;
-  const closing = manager.close().then(() => {
-    closed = true;
-  });
-  assert.equal(scheduler.pendingCount, 0);
-  await Promise.resolve();
-  assert.equal(closed, false);
-  continueHeartbeat.resolve();
-  await heartbeat;
-  await closing;
-  await manager.close();
-  assert.equal(touchCalls, 2);
-  assert.equal(scheduler.pendingCount, 0);
-  assert.equal(manager.stats().files.openFiles, 0);
-  assert.deepEqual(await filesBelow(cacheRoot), []);
+  try {
+    await managerA.initialize();
+    assert.equal(openControlHandles, 0);
+    const old = new Date(now - 5000);
+    for (const target of [
+      path.join(managerA.processRoot, '.alive'),
+      managerA.engineRoot,
+      managerA.processRoot,
+    ]) {
+      await utimes(target, old, old);
+    }
+    now += 2000;
+
+    assert.equal(schedulerA.pendingCount, 1);
+    const heartbeat = schedulerA.runNext();
+    await heartbeatStarted.promise;
+    assert.equal(openControlHandles, 1);
+
+    await managerB.initialize();
+    assert.equal(await exists(managerA.processRoot), true);
+
+    let closed = false;
+    const closing = managerA.close().then(() => {
+      closed = true;
+    });
+    assert.equal(schedulerA.pendingCount, 0);
+    await Promise.resolve();
+    assert.equal(closed, false);
+    assert.equal(openControlHandles, 1);
+
+    continueHeartbeat.resolve();
+    await heartbeat;
+    await closing;
+    await managerA.close();
+    assert.equal(touchCalls, 2);
+    assert.equal(schedulerA.pendingCount, 0);
+    assert.equal(openControlHandles, 0);
+    assert.equal(managerA.stats().files.openFiles, 0);
+    assert.equal(await exists(managerA.processRoot), false);
+  } finally {
+    continueHeartbeat.resolve();
+    await Promise.allSettled([managerA.close(), managerB.close()]);
+    assert.equal(openControlHandles, 0);
+    assert.equal(schedulerA.pendingCount, 0);
+    assert.equal(schedulerB.pendingCount, 0);
+    await rm(cacheRoot, { recursive: true, force: true });
+  }
 });
 
 test('already removed files still release budget during idempotent cleanup', async (context) => {
