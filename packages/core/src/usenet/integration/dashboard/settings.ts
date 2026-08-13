@@ -45,6 +45,10 @@ export interface UsenetSettingsMutation {
   readonly deletes?: readonly string[];
 }
 
+type UsenetSettingsMutationInput =
+  | UsenetSettingsMutation
+  | (() => UsenetSettingsMutation);
+
 export interface UsenetSettingsMutationResult {
   readonly updated: string[];
   readonly reset: string[];
@@ -202,11 +206,22 @@ function classifyMutation(
   const reset: string[] = [];
   const issues: Record<string, MutationIssue> = {};
   const candidateValues = new Map<string, unknown>();
-  const acceptedKeys = new Set<string>();
+  const setKeys = new Set(Object.keys(mutation.sets ?? {}));
+  const deleteKeys = new Set(mutation.deletes ?? []);
+  const conflictingKeys = new Set(
+    [...setKeys].filter((key) => deleteKeys.has(key))
+  );
   const metadata = new Map(
     settingsStore.metadata.map((item) => [item.key, item])
   );
   let requiresRestart = false;
+
+  for (const key of conflictingKeys) {
+    issues[key] = {
+      kind: 'invalid',
+      message: 'A setting cannot be updated and reset in the same mutation',
+    };
+  }
 
   const classifyKey = (
     key: string
@@ -241,6 +256,7 @@ function classifyMutation(
   };
 
   for (const [key, value] of Object.entries(mutation.sets ?? {})) {
+    if (conflictingKeys.has(key)) continue;
     const classified = classifyKey(key);
     if (!classified) continue;
     const parsed = classified.field.schema.safeParse(value);
@@ -251,21 +267,14 @@ function classifyMutation(
       };
       continue;
     }
-    acceptedKeys.add(key);
     sets.push({ key, value: parsed.data });
     updated.push(key);
     candidateValues.set(key, parsed.data);
     if (classified.metadata.requiresRestart) requiresRestart = true;
   }
 
-  for (const key of mutation.deletes ?? []) {
-    if (acceptedKeys.has(key)) {
-      issues[key] = {
-        kind: 'invalid',
-        message: 'A setting cannot be updated and reset in the same mutation',
-      };
-      continue;
-    }
+  for (const key of deleteKeys) {
+    if (conflictingKeys.has(key)) continue;
     const classified = classifyKey(key);
     if (!classified) continue;
     if (classified.metadata.source === 'default') {
@@ -275,8 +284,6 @@ function classifyMutation(
       };
       continue;
     }
-    if (acceptedKeys.has(key)) continue;
-    acceptedKeys.add(key);
     const defaultValue = classified.field.schema.parse(
       classified.field.default
     );
@@ -324,7 +331,7 @@ function issueMessages(
 }
 
 async function executeMutation(
-  mutation: UsenetSettingsMutation,
+  mutationInput: UsenetSettingsMutationInput,
   username: string,
   options: {
     readonly unmanagedMessage: string;
@@ -336,6 +343,8 @@ async function executeMutation(
 
     for (let attempt = 0; attempt < MAX_VERSION_RETRIES; attempt++) {
       const expectedVersion = settingsStore.currentVersion;
+      const mutation =
+        typeof mutationInput === 'function' ? mutationInput() : mutationInput;
       const classified = classifyMutation(mutation, {
         unmanagedMessage: options.unmanagedMessage,
         allowEnvironmentOverrides: options.allowEnvironmentOverrides === true,
@@ -373,6 +382,8 @@ async function executeMutation(
       await settingsStore.reload();
     }
 
+    const mutation =
+      typeof mutationInput === 'function' ? mutationInput() : mutationInput;
     const classified = classifyMutation(mutation, {
       unmanagedMessage: options.unmanagedMessage,
       allowEnvironmentOverrides: options.allowEnvironmentOverrides === true,
@@ -517,41 +528,77 @@ export async function resetUsenetSettings(
 export async function importUsenetEnvironmentSettings(
   username: string
 ): Promise<UsenetEnvironmentImportResult> {
-  const patch: Record<string, unknown> = {};
-  const skippedAsDefault: string[] = [];
-  const failed: { key: string; reason: string }[] = [];
+  let skippedAsDefault: string[] = [];
+  let readFailures: { key: string; reason: string }[] = [];
+  let mutationKeys: string[] = [];
 
-  for (const item of settingsStore.metadata) {
-    if (!isUsenetEngineSettingKey(item.key) || item.source !== 'environment') {
-      continue;
-    }
-    try {
-      const value = settingsStore.getEffectiveValue(item.key);
-      if (JSON.stringify(value) === JSON.stringify(item.default)) {
-        skippedAsDefault.push(item.key);
-      } else {
-        patch[item.key] = value;
+  const buildEnvironmentMutation = (): UsenetSettingsMutation => {
+    const sets: Record<string, unknown> = {};
+    const deletes: string[] = [];
+    skippedAsDefault = [];
+    readFailures = [];
+    mutationKeys = [];
+
+    for (const item of settingsStore.metadata) {
+      if (
+        !isUsenetEngineSettingKey(item.key) ||
+        item.source !== 'environment'
+      ) {
+        continue;
       }
-    } catch (error) {
-      failed.push({
-        key: item.key,
-        reason: error instanceof Error ? error.message : 'unreadable',
-      });
+      try {
+        const value = settingsStore.getEffectiveValue(item.key);
+        if (JSON.stringify(value) === JSON.stringify(item.default)) {
+          if (settingsStore.hasStoredValue(item.key)) {
+            deletes.push(item.key);
+            mutationKeys.push(item.key);
+          } else {
+            skippedAsDefault.push(item.key);
+          }
+        } else {
+          sets[item.key] = value;
+          mutationKeys.push(item.key);
+        }
+      } catch (error) {
+        readFailures.push({
+          key: item.key,
+          reason: error instanceof Error ? error.message : 'unreadable',
+        });
+      }
     }
+
+    return { sets, deletes };
+  };
+
+  let result: InternalMutationResult;
+  try {
+    result = await executeMutation(buildEnvironmentMutation, username, {
+      unmanagedMessage: 'Not a usenet engine setting',
+      allowEnvironmentOverrides: true,
+    });
+  } catch (error) {
+    if (mutationKeys.length === 0) throw error;
+    const reason = error instanceof Error ? error.message : 'write failed';
+    return {
+      imported: [],
+      skippedAsDefault,
+      failed: [
+        ...readFailures,
+        ...mutationKeys.map((key) => ({ key, reason })),
+      ],
+    };
   }
 
-  const result = await executeMutation({ sets: patch }, username, {
-    unmanagedMessage: 'Not a usenet engine setting',
-    allowEnvironmentOverrides: true,
-  });
-  failed.push(
+  const importedKeys = new Set([...result.updated, ...result.reset]);
+  const failed = [
+    ...readFailures,
     ...Object.entries(result.issues).map(([key, issue]) => ({
       key,
       reason: issue.message,
-    }))
-  );
+    })),
+  ];
   return {
-    imported: result.updated,
+    imported: mutationKeys.filter((key) => importedKeys.has(key)),
     skippedAsDefault,
     failed,
   };

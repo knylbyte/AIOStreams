@@ -29,10 +29,9 @@ const originalEnvironment = new Map(
   RESOURCE_ENV_NAMES.map((name) => [name, process.env[name]])
 );
 const originalBootstrapEnvironment = new Map(
-  ['NODE_ENV', 'SECRET_KEY', 'BASE_URL', 'LOG_LEVEL'].map((name) => [
-    name,
-    process.env[name],
-  ])
+  ['NODE_ENV', 'SECRET_KEY', 'BASE_URL', 'LOG_LEVEL', 'LOG_FORMAT'].map(
+    (name) => [name, process.env[name]]
+  )
 );
 
 let core: typeof import('@aiostreams/core');
@@ -42,6 +41,15 @@ let baseUrl: string;
 
 function clearResourceEnvironment(): void {
   for (const name of RESOURCE_ENV_NAMES) delete process.env[name];
+}
+
+function setValidSpoolingEnvironment(): void {
+  process.env.USENET_STREAMING_MODE = 'segment_spooling';
+  process.env.USENET_SEGMENT_SPOOLING_MEMORY_BUDGET_BYTES = '128MB';
+  process.env.USENET_SEGMENT_SPOOLING_STREAM_BUFFER_BYTES = String(
+    2 * MEBIBYTE_BYTES
+  );
+  process.env.USENET_SEGMENT_SPOOLING_SPOOL_BYTES = String(64 * MEBIBYTE_BYTES);
 }
 
 async function resetStoredSettings(): Promise<void> {
@@ -93,6 +101,7 @@ describe.sequential('dashboard Usenet settings mutation routes', () => {
     await core.initDb(`sqlite://${join(databaseDirectory, 'settings.sqlite')}`);
     await core.settingsStore.initialise();
     delete process.env.LOG_LEVEL;
+    delete process.env.LOG_FORMAT;
 
     const dashboardRouter = (await import('./index.js')).default;
     const app = express();
@@ -239,6 +248,56 @@ describe.sequential('dashboard Usenet settings mutation routes', () => {
     expect(await response.text()).toContain('must not exceed half');
     expect(await storedUsenetValues()).toEqual(rowsBefore);
     expect(await core.SettingsRepository.getVersion()).toBe(versionBefore);
+  });
+
+  test('ENV import removes a stale default-shadowed override through the route', async () => {
+    await core.saveUsenetSettings(
+      { 'usenet.segmentSpoolingMemoryBudgetBytes': 1 },
+      'route-test'
+    );
+    setValidSpoolingEnvironment();
+    await core.settingsStore.reload({ emit: false });
+    const versionBefore = await core.SettingsRepository.getVersion();
+    const reload = vi.spyOn(core.settingsStore, 'reload');
+
+    const response = await post('/dashboard/settings/import/env');
+    const payload: unknown = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(payload).toMatchObject({
+      success: true,
+      data: {
+        imported: [
+          'usenet.streamingMode',
+          'usenet.segmentSpoolingMemoryBudgetBytes',
+          'usenet.segmentSpoolingStreamBufferBytes',
+          'usenet.segmentSpoolingSpoolBytes',
+        ],
+        skippedAsDefault: [],
+        failed: [],
+      },
+    });
+    expect(reload).toHaveBeenCalledTimes(1);
+    reload.mockRestore();
+    expect(await core.SettingsRepository.getVersion()).toBe(versionBefore + 1);
+    expect(
+      (await storedUsenetValues()).has(
+        'usenet.segmentSpoolingMemoryBudgetBytes'
+      )
+    ).toBe(false);
+
+    clearResourceEnvironment();
+    await core.settingsStore.reload({ emit: false });
+    expect(() =>
+      core.buildUsenetEngineOptions(
+        [],
+        core.settingsStore.current.usenet,
+        () => databaseDirectory
+      )
+    ).not.toThrow();
+    expect(
+      core.settingsStore.current.usenet.segmentSpoolingMemoryBudgetBytes
+    ).toBe(128_000_000);
   });
 
   test('ENV import rejects invalid Usenet values and commits a valid set once', async () => {

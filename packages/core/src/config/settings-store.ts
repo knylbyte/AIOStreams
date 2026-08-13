@@ -467,6 +467,16 @@ export class SettingsStore<TSections extends SectionSchemas> {
     return cursor as ConfigValue;
   }
 
+  /**
+   * Whether the loaded canonical settings state contains a DB-backed value for
+   * `key`. This exposes presence only (never the stored value) and performs no
+   * I/O; callers observe the same loaded state as {@link current}.
+   */
+  hasStoredValue(key: string): boolean {
+    this.requireField(key);
+    return this.storedKeys.has(key);
+  }
+
   private buildSnapshot(stored: Map<string, unknown>): Snapshot<TSections> {
     const snapshot: Record<string, any> = {};
     for (const sectionName of Object.keys(this.schemas)) {

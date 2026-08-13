@@ -10,7 +10,11 @@ import {
   resolveEngineResourcePlan,
   type EngineResourcePlanOptions,
 } from '../../resource-plan.js';
-import { saveUsenetSettings } from './settings.js';
+import {
+  importUsenetEnvironmentSettings,
+  mutateUsenetSettings,
+  saveUsenetSettings,
+} from './settings.js';
 
 const MEBIBYTE_BYTES = 1024 * 1024;
 
@@ -33,6 +37,15 @@ let databaseDirectory: string;
 
 function clearResourceEnvironment(): void {
   for (const name of RESOURCE_ENV_NAMES) delete process.env[name];
+}
+
+function setValidSpoolingEnvironment(): void {
+  process.env.USENET_STREAMING_MODE = 'segment_spooling';
+  process.env.USENET_SEGMENT_SPOOLING_MEMORY_BUDGET_BYTES = '128MB';
+  process.env.USENET_SEGMENT_SPOOLING_STREAM_BUFFER_BYTES = String(
+    2 * MEBIBYTE_BYTES
+  );
+  process.env.USENET_SEGMENT_SPOOLING_SPOOL_BYTES = String(64 * MEBIBYTE_BYTES);
 }
 
 async function resetStoredSettings(): Promise<void> {
@@ -382,6 +395,292 @@ test('concurrent valid patches cannot commit an invalid hybrid candidate', async
   for (const candidate of observed) {
     assert.doesNotThrow(() => resolveEngineResourcePlan(candidate));
   }
+});
+
+test('ENV import removes a stale default-shadowed override in the same batch', async () => {
+  await saveUsenetSettings(
+    { 'usenet.segmentSpoolingMemoryBudgetBytes': 1 },
+    'review-test'
+  );
+  assert.equal(
+    settingsStore.hasStoredValue('usenet.segmentSpoolingMemoryBudgetBytes'),
+    true
+  );
+
+  setValidSpoolingEnvironment();
+  await settingsStore.reload({ emit: false });
+  const versionBefore = await SettingsRepository.getVersion();
+  let reloads = 0;
+  const observed: EngineResourcePlanOptions[] = [];
+  const originalReload = settingsStore.reload;
+  settingsStore.reload = async (options = {}) => {
+    reloads++;
+    return originalReload.call(settingsStore, options);
+  };
+  const unsubscribe = settingsStore.subscribe(() => {
+    observed.push(currentResourceOptions());
+  });
+
+  let result: Awaited<ReturnType<typeof importUsenetEnvironmentSettings>>;
+  try {
+    result = await importUsenetEnvironmentSettings('review-test');
+  } finally {
+    unsubscribe();
+    settingsStore.reload = originalReload;
+  }
+
+  assert.deepEqual(result, {
+    imported: [
+      'usenet.streamingMode',
+      'usenet.segmentSpoolingMemoryBudgetBytes',
+      'usenet.segmentSpoolingStreamBufferBytes',
+      'usenet.segmentSpoolingSpoolBytes',
+    ],
+    skippedAsDefault: [],
+    failed: [],
+  });
+  assert.equal(await SettingsRepository.getVersion(), versionBefore + 1);
+  assert.equal(reloads, 1);
+  assert.ok(observed.length <= 1);
+  for (const candidate of observed) {
+    assert.doesNotThrow(() => resolveEngineResourcePlan(candidate));
+  }
+  assert.equal(
+    settingsStore.hasStoredValue('usenet.segmentSpoolingMemoryBudgetBytes'),
+    false
+  );
+  assert.equal(
+    (await storedSettingValues()).has(
+      'usenet.segmentSpoolingMemoryBudgetBytes'
+    ),
+    false
+  );
+
+  clearResourceEnvironment();
+  await settingsStore.reload({ emit: false });
+  assert.doesNotThrow(() =>
+    resolveEngineResourcePlan(currentResourceOptions())
+  );
+  assert.equal(
+    settingsStore.current.usenet.segmentSpoolingMemoryBudgetBytes,
+    128_000_000
+  );
+});
+
+test('default-valued ENV import without a stored override is a complete no-op', async () => {
+  process.env.USENET_SEGMENT_SPOOLING_MEMORY_BUDGET_BYTES = '128MB';
+  await settingsStore.reload({ emit: false });
+  assert.equal(
+    settingsStore.hasStoredValue('usenet.segmentSpoolingMemoryBudgetBytes'),
+    false
+  );
+  assert.throws(
+    () => settingsStore.hasStoredValue('usenet.unknownResourceSetting'),
+    /Unknown setting/
+  );
+
+  const versionBefore = await SettingsRepository.getVersion();
+  const snapshotBefore = settingsStore.current;
+  let reloads = 0;
+  let events = 0;
+  const originalReload = settingsStore.reload;
+  settingsStore.reload = async (options = {}) => {
+    reloads++;
+    return originalReload.call(settingsStore, options);
+  };
+  const unsubscribe = settingsStore.subscribe(() => {
+    events++;
+  });
+
+  let result: Awaited<ReturnType<typeof importUsenetEnvironmentSettings>>;
+  try {
+    result = await importUsenetEnvironmentSettings('review-test');
+  } finally {
+    unsubscribe();
+    settingsStore.reload = originalReload;
+  }
+
+  assert.deepEqual(result, {
+    imported: [],
+    skippedAsDefault: ['usenet.segmentSpoolingMemoryBudgetBytes'],
+    failed: [],
+  });
+  assert.deepEqual(await SettingsRepository.getAll(), []);
+  assert.equal(await SettingsRepository.getVersion(), versionBefore);
+  assert.equal(settingsStore.current, snapshotBefore);
+  assert.equal(reloads, 0);
+  assert.equal(events, 0);
+});
+
+test('ENV import rebuilds its stale-delete decision after a CAS conflict', async () => {
+  const memoryKey = 'usenet.segmentSpoolingMemoryBudgetBytes';
+  await saveUsenetSettings({ [memoryKey]: 1 }, 'review-test');
+  setValidSpoolingEnvironment();
+  await settingsStore.reload({ emit: false });
+
+  const versionBefore = await SettingsRepository.getVersion();
+  const originalApplyBatch = SettingsRepository.applyBatch;
+  let batchAttempts = 0;
+  SettingsRepository.applyBatch = async (batch) => {
+    batchAttempts++;
+    if (batchAttempts === 1) {
+      await SettingsRepository.delete(memoryKey);
+      return false;
+    }
+    return originalApplyBatch.call(SettingsRepository, batch);
+  };
+
+  let result: Awaited<ReturnType<typeof importUsenetEnvironmentSettings>>;
+  try {
+    result = await importUsenetEnvironmentSettings('review-test');
+  } finally {
+    SettingsRepository.applyBatch = originalApplyBatch;
+  }
+
+  assert.deepEqual(result, {
+    imported: [
+      'usenet.streamingMode',
+      'usenet.segmentSpoolingStreamBufferBytes',
+      'usenet.segmentSpoolingSpoolBytes',
+    ],
+    skippedAsDefault: [memoryKey],
+    failed: [],
+  });
+  assert.equal(batchAttempts, 2);
+  assert.equal(await SettingsRepository.getVersion(), versionBefore + 2);
+  assert.equal((await storedSettingValues()).has(memoryKey), false);
+});
+
+test('ENV import rolls back sets and a stale-override delete together', async () => {
+  await saveUsenetSettings(
+    { 'usenet.segmentSpoolingMemoryBudgetBytes': 1 },
+    'review-test'
+  );
+  setValidSpoolingEnvironment();
+  await settingsStore.reload({ emit: false });
+  await getDb().exec(`CREATE TRIGGER fail_usenet_env_import_delete
+    BEFORE DELETE ON settings
+    WHEN OLD.key = 'usenet.segmentSpoolingMemoryBudgetBytes'
+    BEGIN
+      SELECT RAISE(ABORT, 'forced env settings batch failure');
+    END`);
+
+  const versionBefore = await SettingsRepository.getVersion();
+  const rowsBefore = await storedSettingValues();
+  const snapshotBefore = settingsStore.current;
+  let reloads = 0;
+  let events = 0;
+  const originalReload = settingsStore.reload;
+  settingsStore.reload = async (options = {}) => {
+    reloads++;
+    return originalReload.call(settingsStore, options);
+  };
+  const unsubscribe = settingsStore.subscribe(() => {
+    events++;
+  });
+
+  let result: Awaited<ReturnType<typeof importUsenetEnvironmentSettings>>;
+  try {
+    result = await importUsenetEnvironmentSettings('review-test');
+  } finally {
+    unsubscribe();
+    settingsStore.reload = originalReload;
+    await getDb().exec('DROP TRIGGER fail_usenet_env_import_delete');
+  }
+
+  assert.deepEqual(result.imported, []);
+  assert.deepEqual(result.skippedAsDefault, []);
+  assert.equal(result.failed.length, 4);
+  for (const failure of result.failed) {
+    assert.match(failure.reason, /forced env settings batch failure/);
+  }
+  assert.deepEqual(await storedSettingValues(), rowsBefore);
+  assert.equal(await SettingsRepository.getVersion(), versionBefore);
+  assert.equal(settingsStore.current, snapshotBefore);
+  assert.equal(reloads, 0);
+  assert.equal(events, 0);
+});
+
+test('a set/delete conflict is rejected without persistence or reload', async () => {
+  const key = 'usenet.prefetchSegments';
+  const versionBefore = await SettingsRepository.getVersion();
+  const snapshotBefore = settingsStore.current;
+  let reloads = 0;
+  let events = 0;
+  const originalReload = settingsStore.reload;
+  settingsStore.reload = async (options = {}) => {
+    reloads++;
+    return originalReload.call(settingsStore, options);
+  };
+  const unsubscribe = settingsStore.subscribe(() => {
+    events++;
+  });
+
+  let result: Awaited<ReturnType<typeof mutateUsenetSettings>>;
+  try {
+    result = await mutateUsenetSettings(
+      { sets: { [key]: 16 }, deletes: [key] },
+      'review-test'
+    );
+  } finally {
+    unsubscribe();
+    settingsStore.reload = originalReload;
+  }
+
+  assert.deepEqual(result, {
+    updated: [],
+    reset: [],
+    requiresRestart: false,
+    errors: {
+      [key]: 'A setting cannot be updated and reset in the same mutation',
+    },
+  });
+  assert.deepEqual(await SettingsRepository.getAll(), []);
+  assert.equal(await SettingsRepository.getVersion(), versionBefore);
+  assert.equal(settingsStore.current, snapshotBefore);
+  assert.equal(reloads, 0);
+  assert.equal(events, 0);
+});
+
+test('a conflicting key is excluded while an independent key commits once', async () => {
+  const conflictKey = 'usenet.prefetchSegments';
+  const independentKey = 'usenet.segmentMemoryCacheBytes';
+  const versionBefore = await SettingsRepository.getVersion();
+  let reloads = 0;
+  const originalReload = settingsStore.reload;
+  settingsStore.reload = async (options = {}) => {
+    reloads++;
+    return originalReload.call(settingsStore, options);
+  };
+
+  let result: Awaited<ReturnType<typeof mutateUsenetSettings>>;
+  try {
+    result = await mutateUsenetSettings(
+      {
+        sets: { [conflictKey]: 16, [independentKey]: 24_000_000 },
+        deletes: [conflictKey],
+      },
+      'review-test'
+    );
+  } finally {
+    settingsStore.reload = originalReload;
+  }
+
+  assert.deepEqual(result, {
+    updated: [independentKey],
+    reset: [],
+    requiresRestart: true,
+    errors: {
+      [conflictKey]:
+        'A setting cannot be updated and reset in the same mutation',
+    },
+  });
+  assert.deepEqual(
+    await storedSettingValues(),
+    new Map([[independentKey, '24000000']])
+  );
+  assert.equal(await SettingsRepository.getVersion(), versionBefore + 1);
+  assert.equal(reloads, 1);
 });
 
 test('environment-locked fields keep the existing dotted-key error format', async () => {
