@@ -6,6 +6,7 @@ import { BiCog } from 'react-icons/bi';
 import { useFormContext, useWatch, type UseFormReturn } from 'react-hook-form';
 import { Form } from '@/components/ui/form';
 import { Card } from '@/components/ui/card';
+import { Alert } from '@/components/ui/alert';
 import { DashboardLoading } from '@/components/shared/dashboard-query-boundary';
 import {
   SettingsCard,
@@ -26,16 +27,16 @@ import {
   USENET_SETTINGS_QUERY_KEY,
   type UsenetProfiles,
 } from './queries';
-
-/** Config leaves a performance profile bundles (must match core PERFORMANCE_PROFILES). */
-const BUNDLED_LEAVES = [
-  'prefetchSegments',
-  'maxConcurrentDownloads',
-  'segmentDiskCacheBytes',
-] as const;
-const PROFILE_LEAF = 'performanceProfile';
-
-const usenetKey = (leaf: string) => `usenet.${leaf}`;
+import {
+  BUNDLED_LEAVES,
+  PROFILE_LEAF,
+  STREAMING_MODE_LEAF,
+  bundledValuesMatchPreset,
+  groupUsenetSettings,
+  leafOf,
+  usenetKey,
+  type BundledLeaf,
+} from './settings-page-logic';
 
 /** Scope for the settings actions menu: every usenet engine key except the
  *  provider accounts (managed in their own editor). Mirrors the backend's
@@ -47,101 +48,39 @@ const USENET_SCOPE = {
   noun: 'usenet',
 } as const;
 
-/**
- * Curated section layout for the usenet engine settings. Keys are grouped by
- * leaf name (the part after `usenet.`); anything unmapped falls into "Other" so
- * a newly-added field is never silently dropped.
- */
-const SECTIONS: { title: string; leaves: string[]; note?: string }[] = [
-  {
-    title: 'Performance',
-    leaves: [PROFILE_LEAF, ...BUNDLED_LEAVES],
-    note: 'Pick a profile and the values below are filled in for you — that is all most setups need. Editing any of the values switches the profile to **custom**.',
-  },
-  {
-    title: 'Connections & timeouts',
-    leaves: [
-      'streamingPriority',
-      'segmentTimeout',
-      'segmentStallTimeout',
-      'dialTimeout',
-      'idleConnection',
-      'streamIdleTimeout',
-    ],
-  },
-  {
-    title: 'Reliability',
-    leaves: ['circuitBreakerThreshold', 'circuitBreakerCooldown'],
-  },
-  {
-    title: 'Archive handling',
-    leaves: ['lazyRarResolution', 'strictArchiveMembership'],
-  },
-  {
-    title: 'Verification',
-    leaves: [
-      'verifyMode',
-      'verifyBudgetMs',
-      'damagePolicy',
-      'matroskaHoleFill',
-      'censusShadowConcurrency',
-      'censusMaxLifetime',
-    ],
-    note:
-      'When something is imported, AIOStreams checks that it can actually be downloaded from your providers — so broken or incomplete releases are caught up front instead of failing mid-playback. ' +
-      'The checks run alongside the import, so they normally add no waiting time: badly damaged releases are rejected, slightly damaged ones are recorded as “degraded”, the damage policy below decides whether those are still offered as streams. Any checking that did not finish during the import simply continues in the background. ' +
-      'A stream that is already playing is never interrupted by these verdicts; they apply from the next playback onwards. ' +
-      'Providers that give unreliable answers are detected and ignored automatically.',
-  },
-  {
-    title: 'Import & API',
-    leaves: ['maxNzbSize', 'maxConcurrentInspects', 'sabnzbdApiEnabled'],
-  },
-];
-
-const leafOf = (key: string) => key.replace(/^usenet\./, '');
-
-function groupKeys(
-  keys: SettingsKey[]
-): { title: string; note?: string; keys: SettingsKey[] }[] {
-  const byLeaf = new Map(keys.map((k) => [leafOf(k.key), k]));
-  const used = new Set<string>();
-  const groups = SECTIONS.map((s) => {
-    const sectionKeys = s.leaves
-      .map((leaf) => {
-        const k = byLeaf.get(leaf);
-        if (k) used.add(leaf);
-        return k;
-      })
-      .filter((k): k is SettingsKey => !!k);
-    return { title: s.title, note: s.note, keys: sectionKeys };
-  }).filter((g) => g.keys.length > 0);
-
-  const leftover = keys.filter((k) => !used.has(leafOf(k.key)));
-  if (leftover.length)
-    groups.push({ title: 'Other', note: undefined, keys: leftover });
-  return groups;
-}
+const PROFILE_NAME = toName(usenetKey(PROFILE_LEAF));
+const STREAMING_MODE_NAME = toName(usenetKey(STREAMING_MODE_LEAF));
+const BUNDLED_NAMES: Readonly<Record<BundledLeaf, string>> = {
+  prefetchSegments: toName(usenetKey('prefetchSegments')),
+  maxConcurrentDownloads: toName(usenetKey('maxConcurrentDownloads')),
+  segmentDiskCacheBytes: toName(usenetKey('segmentDiskCacheBytes')),
+};
 
 /**
  * Two-way link between the performance profile and its bundled fields:
- *  - selecting a profile fills the four fields with that profile's values
+ *  - selecting a profile fills the three fields with that profile's values
  *    (silently on first mount, so the form shows what's actually in effect);
  *  - editing any bundled field switches the profile to "custom".
  * Renders nothing — it just drives form state via the surrounding <Form>.
  */
 function ProfileLinker({ profiles }: { profiles: UsenetProfiles }) {
   const { setValue, getValues } = useFormContext();
-  const profileName = toName(usenetKey(PROFILE_LEAF));
-  // BUNDLED_LEAVES is a fixed-length tuple, so the per-field watches below are a
-  // stable, rules-of-hooks-safe set (one useWatch each, primitive deps).
-  const names = BUNDLED_LEAVES.map((leaf) => toName(usenetKey(leaf)));
+  const watchedProfile = useWatch({ name: PROFILE_NAME });
+  const profile =
+    typeof watchedProfile === 'string' ? watchedProfile : undefined;
 
-  const profile = useWatch({ name: profileName }) as string | undefined;
-  const b0 = useWatch({ name: names[0] });
-  const b1 = useWatch({ name: names[1] });
-  const b2 = useWatch({ name: names[2] });
-  const b3 = useWatch({ name: names[3] });
+  // These are deliberately three explicit, unconditional hooks. The profile
+  // bundle has three leaves, so no dynamic hook count or undefined field name
+  // can be introduced by iterating the tuple.
+  const prefetchSegments = useWatch({
+    name: BUNDLED_NAMES.prefetchSegments,
+  });
+  const maxConcurrentDownloads = useWatch({
+    name: BUNDLED_NAMES.maxConcurrentDownloads,
+  });
+  const segmentDiskCacheBytes = useWatch({
+    name: BUNDLED_NAMES.segmentDiskCacheBytes,
+  });
 
   const applyingRef = React.useRef(false);
 
@@ -152,20 +91,24 @@ function ProfileLinker({ profiles }: { profiles: UsenetProfiles }) {
     const preset =
       profile && profile !== 'custom' ? profiles[profile] : undefined;
     if (!preset) return;
-    const synced = BUNDLED_LEAVES.every(
-      (leaf, i) => Number(getValues(names[i])) === preset[leaf]
+    const synced = bundledValuesMatchPreset(
+      {
+        prefetchSegments: getValues(BUNDLED_NAMES.prefetchSegments),
+        maxConcurrentDownloads: getValues(BUNDLED_NAMES.maxConcurrentDownloads),
+        segmentDiskCacheBytes: getValues(BUNDLED_NAMES.segmentDiskCacheBytes),
+      },
+      preset
     );
     if (synced) return;
     applyingRef.current = true;
-    BUNDLED_LEAVES.forEach((leaf, i) =>
-      setValue(names[i], preset[leaf], { shouldDirty: true })
+    BUNDLED_LEAVES.forEach((leaf) =>
+      setValue(BUNDLED_NAMES[leaf], preset[leaf], { shouldDirty: true })
     );
     const t = setTimeout(() => {
       applyingRef.current = false;
     }, 0);
     return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [profile]);
+  }, [getValues, profile, profiles, setValue]);
 
   // Editing a bundled field while a profile is active flips it to "custom".
   React.useEffect(() => {
@@ -173,15 +116,68 @@ function ProfileLinker({ profiles }: { profiles: UsenetProfiles }) {
     const preset =
       profile && profile !== 'custom' ? profiles[profile] : undefined;
     if (!preset) return;
-    const current = [b0, b1, b2, b3];
-    const matches = BUNDLED_LEAVES.every(
-      (leaf, i) => Number(current[i]) === preset[leaf]
+    const matches = bundledValuesMatchPreset(
+      {
+        prefetchSegments,
+        maxConcurrentDownloads,
+        segmentDiskCacheBytes,
+      },
+      preset
     );
-    if (!matches) setValue(profileName, 'custom', { shouldDirty: true });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [b0, b1, b2, b3]);
+    if (!matches) setValue(PROFILE_NAME, 'custom', { shouldDirty: true });
+  }, [
+    maxConcurrentDownloads,
+    prefetchSegments,
+    profile,
+    profiles,
+    segmentDiskCacheBytes,
+    setValue,
+  ]);
 
   return null;
+}
+
+function SegmentHandlingInfo() {
+  return (
+    <Alert intent="info-basic" title="Segment handling">
+      <div className="space-y-2 text-sm">
+        <p>
+          <strong>Segment Buffering</strong> keeps prefetched, decoded segments
+          in memory and uses the existing compatible data path.
+        </p>
+        <p>
+          <strong>Segment Spooling</strong> decodes segment data incrementally
+          and writes prefetched data to a transient disk spool, from which it is
+          streamed under fixed byte budgets.
+        </p>
+        <p>
+          The performance profile remains independent and continues to control
+          concurrency and prefetch aggressiveness.
+        </p>
+      </div>
+    </Alert>
+  );
+}
+
+function UsenetSettingsSections({ keys }: { keys: SettingsKey[] }) {
+  const streamingMode = useWatch({ name: STREAMING_MODE_NAME });
+  const groups = groupUsenetSettings(keys, streamingMode);
+
+  return groups.map((group) => (
+    <SettingsCard key={group.id} title={group.title}>
+      {group.note && (
+        <p className="text-xs text-[--muted] -mt-1 mb-1">
+          <MarkdownLite>{group.note}</MarkdownLite>
+        </p>
+      )}
+      {group.keys.map((key) => (
+        <div key={key.key} id={`setting-${key.key}`}>
+          <SettingsField k={key} />
+        </div>
+      ))}
+      {group.id === 'streaming-mode' && <SegmentHandlingInfo />}
+    </SettingsCard>
+  ));
 }
 
 export function UsenetSettingsPage() {
@@ -244,7 +240,6 @@ export function UsenetSettingsPage() {
     );
   }
 
-  const groups = groupKeys(keys);
   const bundledNames = new Set(BUNDLED_LEAVES.map((l) => toName(usenetKey(l))));
   const profileNameKey = toName(usenetKey(PROFILE_LEAF));
 
@@ -313,20 +308,7 @@ export function UsenetSettingsPage() {
           return (
             <>
               <ProfileLinker profiles={profiles} />
-              {groups.map((g) => (
-                <SettingsCard key={g.title} title={g.title}>
-                  {g.note && (
-                    <p className="text-xs text-[--muted] -mt-1 mb-1">
-                      <MarkdownLite>{g.note}</MarkdownLite>
-                    </p>
-                  )}
-                  {g.keys.map((k) => (
-                    <div key={k.key} id={`setting-${k.key}`}>
-                      <SettingsField k={k} />
-                    </div>
-                  ))}
-                </SettingsCard>
-              ))}
+              <UsenetSettingsSections keys={keys} />
               <div className="flex justify-end">
                 <SettingsSubmitButton isPending={isPending} />
               </div>
