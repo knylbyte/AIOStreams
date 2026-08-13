@@ -92,8 +92,20 @@ function SecretTextField({
 }
 
 function LockBadge({ env }: { env: string }) {
+  const description = `Set by environment variable: ${env}`;
   return (
-    <Tooltip trigger={<BiLockAlt className="inline text-[--muted]" />}>
+    <Tooltip
+      trigger={
+        <span
+          className="inline-flex text-[--muted]"
+          role="img"
+          aria-label={description}
+          tabIndex={0}
+        >
+          <BiLockAlt aria-hidden="true" />
+        </span>
+      }
+    >
       Set by environment variable: <code>{env}</code>
     </Tooltip>
   );
@@ -146,7 +158,7 @@ function SettingsFieldControl({ k }: { k: SettingsKey }) {
       return (
         <MultilineStringField
           name={name}
-          label={k.label}
+          label={labelNode}
           help={secretHelp}
           disabled={disabled}
           secretSet={k.secretSet}
@@ -201,7 +213,7 @@ function SettingsFieldControl({ k }: { k: SettingsKey }) {
       return (
         <StringListField
           name={name}
-          label={k.label}
+          label={labelNode}
           help={help}
           disabled={disabled}
         />
@@ -210,7 +222,7 @@ function SettingsFieldControl({ k }: { k: SettingsKey }) {
       return (
         <KeyValueListField
           name={name}
-          label={k.label}
+          label={labelNode}
           help={help}
           disabled={disabled}
           valueKind={k.ui.mapValueKind ?? 'string'}
@@ -222,7 +234,7 @@ function SettingsFieldControl({ k }: { k: SettingsKey }) {
       return (
         <DurationField
           name={name}
-          label={k.label}
+          label={labelNode}
           help={help}
           disabled={disabled}
         />
@@ -231,7 +243,7 @@ function SettingsFieldControl({ k }: { k: SettingsKey }) {
       return (
         <SizeField
           name={name}
-          label={k.label}
+          label={labelNode}
           help={help}
           disabled={disabled}
         />
@@ -240,7 +252,7 @@ function SettingsFieldControl({ k }: { k: SettingsKey }) {
       return (
         <BoolOrListField
           name={name}
-          label={k.label}
+          label={labelNode}
           help={help}
           disabled={disabled}
         />
@@ -249,7 +261,7 @@ function SettingsFieldControl({ k }: { k: SettingsKey }) {
       return (
         <JsonField
           name={name}
-          label={k.label}
+          label={labelNode}
           help={help}
           disabled={disabled}
         />
@@ -260,7 +272,7 @@ function SettingsFieldControl({ k }: { k: SettingsKey }) {
         return (
           <MultilineStringField
             name={name}
-            label={k.label}
+            label={labelNode}
             help={help}
             disabled={disabled}
           />

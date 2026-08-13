@@ -19,7 +19,7 @@ export const md = (text?: string) =>
 
 interface CommonProps {
   name: string;
-  label: string;
+  label: React.ReactNode;
   help?: string;
   disabled?: boolean;
   secretSet?: boolean;
