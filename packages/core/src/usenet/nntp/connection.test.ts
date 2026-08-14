@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { getEventListeners } from 'node:events';
 import net from 'node:net';
 import test, { type TestContext } from 'node:test';
 // The production entry point initializes config before constructing module
@@ -108,6 +109,7 @@ class ControlledConsumer implements BackpressuredBodyConsumer {
   readonly chunks: Buffer[] = [];
   readonly endStarted = Promise.withResolvers<void>();
   endCalls = 0;
+  failCalls = 0;
   failure: Error | undefined;
   private readonly writesChanged = new Set<() => void>();
   private drainListener: (() => void) | undefined;
@@ -148,6 +150,7 @@ class ControlledConsumer implements BackpressuredBodyConsumer {
   }
 
   fail(error: Error): void {
+    this.failCalls++;
     this.failure ??= error;
     this.drainListener = undefined;
   }
@@ -189,6 +192,10 @@ class ControlledTimerScheduler {
 
   get delayMs(): number | undefined {
     return this.pending?.delayMs;
+  }
+
+  get pendingCount(): number {
+    return this.pending ? 1 : 0;
   }
 
   run(): void {
@@ -414,6 +421,284 @@ test('classifies an ordinary absolute segment deadline separately', async (conte
   assert.equal(error.kind, 'timeout');
   assert.equal(error.timeoutSource, 'absolute');
   assert.doesNotMatch(error.message, /local backpressure/);
+});
+
+test('uses a non-head absolute deadline while the pipeline head is locally paused', async (context) => {
+  let now = 0;
+  const timers = new ControlledTimerScheduler();
+  const { connection, server } = await connectTest(context, {
+    clock: () => now,
+    scheduleTimeout: timers.schedule,
+  });
+  const firstController = new AbortController();
+  const secondController = new AbortController();
+  const firstConsumer = new ControlledConsumer([false]);
+  const first = connection.bodyToConsumer(
+    'paused-head',
+    firstConsumer,
+    firstController.signal,
+    100,
+    1000
+  );
+  const second = connection.body(
+    'earlier-deadline',
+    secondController.signal,
+    100,
+    10
+  );
+  let firstResolved = false;
+  let secondResolved = false;
+  void first.then(
+    () => (firstResolved = true),
+    () => undefined
+  );
+  void second.then(
+    () => (secondResolved = true),
+    () => undefined
+  );
+  const firstFailed = rejection(first);
+  const secondFailed = rejection(second);
+  assert.equal(await server.nextCommand(), 'BODY <paused-head>');
+  assert.equal(await server.nextCommand(), 'BODY <earlier-deadline>');
+  assert.equal(getEventListeners(firstController.signal, 'abort').length, 1);
+  assert.equal(getEventListeners(secondController.signal, 'abort').length, 1);
+
+  await server.send(
+    '222 first\r\nfirst-body\r\n.\r\n222 second\r\nsecond-body\r\n.\r\n'
+  );
+  await firstConsumer.waitForWrites(1);
+  assert.equal(firstConsumer.hasDrainListener, true);
+  assert.equal(timers.delayMs, 10);
+
+  now = 10;
+  timers.run();
+  const firstError = await firstFailed;
+  const secondError = await secondFailed;
+  assert(firstError instanceof NntpError);
+  assert.equal(firstError, secondError);
+  assert.equal(firstError.kind, 'timeout');
+  assert.equal(firstError.timeoutSource, 'local_backpressure');
+  assert.match(firstError.message, /10ms/);
+  assert.equal(firstConsumer.failure, firstError);
+  assert.equal(firstConsumer.failCalls, 1);
+  assert.equal(firstConsumer.hasDrainListener, false);
+  await nextTurn();
+  assert.equal(firstResolved, false);
+  assert.equal(secondResolved, false);
+  assert.equal(getEventListeners(firstController.signal, 'abort').length, 0);
+  assert.equal(getEventListeners(secondController.signal, 'abort').length, 0);
+  assert.equal(timers.pendingCount, 0);
+  assert.equal(connection.inFlight, 0);
+  assert.equal(connection.isUsable, false);
+});
+
+test('enforces a non-head deadline synchronously before releasing a paused head', async (context) => {
+  let now = 0;
+  const timers = new ControlledTimerScheduler();
+  const { connection, server } = await connectTest(context, {
+    clock: () => now,
+    scheduleTimeout: timers.schedule,
+  });
+  const firstConsumer = new ControlledConsumer([false]);
+  const first = connection.bodyToConsumer(
+    'drain-head',
+    firstConsumer,
+    undefined,
+    100,
+    1000
+  );
+  const second = connection.body('drain-deadline', undefined, 100, 10);
+  const firstFailed = rejection(first);
+  const secondFailed = rejection(second);
+  assert.equal(await server.nextCommand(), 'BODY <drain-head>');
+  assert.equal(await server.nextCommand(), 'BODY <drain-deadline>');
+  await server.send(
+    '222 first\r\nfirst-body\r\n.\r\n222 second\r\nsecond-body\r\n.\r\n'
+  );
+  await firstConsumer.waitForWrites(1);
+
+  now = 11;
+  firstConsumer.emitDrain();
+  const firstError = await firstFailed;
+  const secondError = await secondFailed;
+  assert(firstError instanceof NntpError);
+  assert.equal(firstError, secondError);
+  assert.equal(firstError.timeoutSource, 'local_backpressure');
+  assert.match(firstError.message, /10ms/);
+  assert.equal(firstConsumer.endCalls, 0);
+  assert.equal(timers.pendingCount, 0);
+  assert.equal(connection.inFlight, 0);
+});
+
+test('does not end a locally paused head after its own absolute deadline', async (context) => {
+  let now = 0;
+  const timers = new ControlledTimerScheduler();
+  const { connection, server } = await connectTest(context, {
+    clock: () => now,
+    scheduleTimeout: timers.schedule,
+  });
+  const consumer = new ControlledConsumer([false]);
+  const pending = connection.bodyToConsumer(
+    'expired-before-drain',
+    consumer,
+    undefined,
+    100,
+    10
+  );
+  const failed = rejection(pending);
+  assert.equal(await server.nextCommand(), 'BODY <expired-before-drain>');
+  await server.send('222 article\r\ncomplete-body\r\n.\r\n');
+  await consumer.waitForWrites(1);
+
+  now = 10;
+  consumer.emitDrain();
+  const error = await failed;
+  assert(error instanceof NntpError);
+  assert.equal(error.timeoutSource, 'local_backpressure');
+  assert.equal(consumer.failure, error);
+  assert.equal(consumer.failCalls, 1);
+  assert.equal(consumer.endCalls, 0);
+  assert.equal(consumer.hasDrainListener, false);
+  assert.equal(timers.pendingCount, 0);
+  assert.equal(connection.inFlight, 0);
+});
+
+test('rejects an async consumer end that completes after the absolute deadline', async (context) => {
+  let now = 0;
+  const timers = new ControlledTimerScheduler();
+  const endGate = Promise.withResolvers<void>();
+  const { connection, server } = await connectTest(context, {
+    clock: () => now,
+    scheduleTimeout: timers.schedule,
+  });
+  const firstConsumer = new ControlledConsumer([true], endGate.promise);
+  const first = connection.bodyToConsumer(
+    'late-end',
+    firstConsumer,
+    undefined,
+    100,
+    10
+  );
+  const second = connection.body('after-late-end', undefined, 100, 100);
+  let secondResolved = false;
+  void second.then(
+    () => (secondResolved = true),
+    () => undefined
+  );
+  const firstFailed = rejection(first);
+  const secondFailed = rejection(second);
+  assert.equal(await server.nextCommand(), 'BODY <late-end>');
+  assert.equal(await server.nextCommand(), 'BODY <after-late-end>');
+  await server.send(
+    '222 first\r\nfirst-body\r\n.\r\n222 second\r\nsecond-body\r\n.\r\n'
+  );
+  await firstConsumer.endStarted.promise;
+
+  now = 11;
+  endGate.resolve();
+  const firstError = await firstFailed;
+  const secondError = await secondFailed;
+  assert(firstError instanceof NntpError);
+  assert.equal(firstError, secondError);
+  assert.equal(firstError.timeoutSource, 'local_backpressure');
+  assert.equal(firstConsumer.failure, firstError);
+  assert.equal(firstConsumer.failCalls, 1);
+  assert.equal(secondResolved, false);
+  assert.equal(timers.pendingCount, 0);
+  assert.equal(connection.inFlight, 0);
+});
+
+test('rejects buffered response progress after a delayed absolute deadline callback', async (context) => {
+  let now = 0;
+  const timers = new ControlledTimerScheduler();
+  const { connection, server } = await connectTest(context, {
+    clock: () => now,
+    scheduleTimeout: timers.schedule,
+  });
+  const pending = connection.body('late-buffered', undefined, 100, 10);
+  const failed = rejection(pending);
+  assert.equal(await server.nextCommand(), 'BODY <late-buffered>');
+  assert.equal(timers.delayMs, 10);
+
+  now = 11;
+  await server.send('222 article\r\nlate-body\r\n.\r\n');
+  const error = await failed;
+  assert(error instanceof NntpError);
+  assert.equal(error.kind, 'timeout');
+  assert.equal(error.timeoutSource, 'absolute');
+  assert.equal(connection.inFlight, 0);
+  assert.equal(connection.isUsable, false);
+  assert.equal(timers.pendingCount, 0);
+});
+
+test('keeps a non-expired controlled pipeline successful', async (context) => {
+  let now = 0;
+  const timers = new ControlledTimerScheduler();
+  const { connection, server } = await connectTest(context, {
+    clock: () => now,
+    scheduleTimeout: timers.schedule,
+  });
+  const consumer = new ControlledConsumer([false]);
+  const first = connection.bodyToConsumer(
+    'timely-first',
+    consumer,
+    undefined,
+    50,
+    100
+  );
+  const second = connection.body('timely-second', undefined, 50, 80);
+  assert.equal(await server.nextCommand(), 'BODY <timely-first>');
+  assert.equal(await server.nextCommand(), 'BODY <timely-second>');
+  assert.equal(timers.delayMs, 50);
+
+  now = 10;
+  await server.send(
+    '222 first\r\nfirst-body\r\n.\r\n222 second\r\nsecond-body\r\n.\r\n'
+  );
+  await consumer.waitForWrites(1);
+  assert.equal(timers.delayMs, 70);
+
+  now = 20;
+  consumer.emitDrain();
+  assert.equal(await first, Buffer.byteLength('first-body'));
+  assert.deepEqual(await second, Buffer.from('second-body'));
+  assert.deepEqual(consumer.body(), Buffer.from('first-body'));
+  assert.equal(consumer.failure, undefined);
+  assert.equal(connection.isUsable, true);
+  assert.equal(connection.inFlight, 0);
+  assert.equal(timers.pendingCount, 0);
+});
+
+test('does not create an absolute timer for unbounded requests during local pause', async (context) => {
+  for (const totalTimeoutMs of [undefined, 0]) {
+    let now = 0;
+    const timers = new ControlledTimerScheduler();
+    const { connection, server } = await connectTest(context, {
+      clock: () => now,
+      scheduleTimeout: timers.schedule,
+    });
+    const consumer = new ControlledConsumer([false]);
+    const messageId = `stall-only-pause-${String(totalTimeoutMs)}`;
+    const pending = connection.bodyToConsumer(
+      messageId,
+      consumer,
+      undefined,
+      10,
+      totalTimeoutMs
+    );
+    assert.equal(await server.nextCommand(), `BODY <${messageId}>`);
+    assert.equal(timers.delayMs, 10);
+    await server.send('222 article\r\ncomplete-body\r\n.\r\n');
+    await consumer.waitForWrites(1);
+    assert.equal(timers.pendingCount, 0);
+
+    now = 1000;
+    consumer.emitDrain();
+    assert.equal(await pending, Buffer.byteLength('complete-body'));
+    assert.equal(consumer.failure, undefined);
+    assert.equal(connection.isUsable, true);
+    assert.equal(timers.pendingCount, 0);
+  }
 });
 
 test('does not expose the next pipeline response until async consumer end settles', async (context) => {

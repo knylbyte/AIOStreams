@@ -145,6 +145,8 @@ export class NntpConnection {
   private deferredReadStart = 0;
   private deferredReadEnd = 0;
   private socketLocallyPaused = false;
+  /** Start of the current connection-wide local backpressure interval. */
+  private localPauseStartedAt: number | undefined;
   private continuationScheduled = false;
   private destroyed = false;
   private fatalError: Error | null = null;
@@ -689,80 +691,129 @@ export class NntpConnection {
   }
 
   /**
-   * (Re)arm the head request's progress timer. It enforces two independent
+   * (Re)arm the connection's sole response timer. It enforces two independent
    * budgets, whichever bites first:
    *  - the rolling stall budget (`stallTimeoutMs`), re-armed on every inbound
    *    byte and whenever the head advances, so it fires after a full window of
    *    SILENCE, to catch a connection that went dead mid-transfer; and
-   *  - the absolute per-request deadline (`deadlineAt`), a wall-clock cap that
-   *    inbound bytes do not push out, so a transfer that keeps trickling bytes
-   *    (never silent, never finished) is still abandoned once its total budget
-   *    elapses. `Infinity` when the caller set no total budget (stall only).
-   * The single timer is armed to `min(remaining stall, remaining deadline)`;
-   * destroying the connection makes the failover layer resubmit the work.
+   *  - the earliest finite absolute deadline across every written pipeline
+   *    request. Inbound bytes never push those deadlines out, and a later FIFO
+   *    request may therefore expire before the current head.
+   *
+   * While the socket is locally paused, provider-stall timing is suspended but
+   * the earliest pipeline deadline remains armed. The queue is caller-bounded,
+   * so the linear scan does not introduce an unbounded helper structure.
    */
   private armStallTimer(): void {
     this.stallTimer?.cancel();
+    this.stallTimer = null;
     const head = this.queue[0];
-    if (!head) {
-      this.stallTimer = null;
-      return;
-    }
-    const stallMs = head.stallTimeoutMs;
-    const locallyPaused = this.pausedHead === head;
-    const untilDeadline = head.deadlineAt - this.now(); // Infinity when unbounded
-    if (locallyPaused && untilDeadline === Infinity) {
-      this.stallTimer = null;
-      return;
-    }
-    const timeoutMs = Math.max(
-      0,
-      locallyPaused ? untilDeadline : Math.min(stallMs, untilDeadline)
+    if (!head) return;
+
+    const scheduledAt = this.now();
+    const earliestDeadline = this.earliestFiniteDeadline();
+    const deadlineDueAt = earliestDeadline?.deadlineAt ?? Infinity;
+    const stallDueAt = this.socketLocallyPaused
+      ? Infinity
+      : scheduledAt + head.stallTimeoutMs;
+    const dueAt = Math.min(deadlineDueAt, stallDueAt);
+    if (dueAt === Infinity) return;
+
+    this.stallTimer = this.scheduleTimeout(
+      () => {
+        this.stallTimer = null;
+        if (this.destroyed || this.queue.length === 0) return;
+
+        const callbackNow = this.now();
+        if (this.failExpiredPipelineDeadline(callbackNow)) return;
+
+        // A custom scheduler may invoke a callback before its requested due time.
+        // Never turn an early absolute-deadline callback into a provider stall.
+        if (
+          this.socketLocallyPaused ||
+          callbackNow < stallDueAt ||
+          this.queue[0] !== head
+        ) {
+          this.armStallTimer();
+          return;
+        }
+        this.failProviderStall(head);
+      },
+      Math.max(0, dueAt - scheduledAt)
     );
-    this.stallTimer = this.scheduleTimeout(() => {
-      this.stallTimer = null;
-      // Distinguish the two causes for the log/error: the absolute deadline
-      // (including a local sink pause) vs a full provider-silence window.
-      const deadlineHit =
-        head.deadlineAt !== Infinity && this.now() >= head.deadlineAt;
-      const timeoutSource = locallyPaused
-        ? 'local_backpressure'
-        : deadlineHit
-          ? 'absolute'
-          : 'provider_stall';
-      logger.warn(
-        {
-          provider: this.label,
-          connId: this.id,
-          inFlight: this.queue.length,
-          ...(timeoutSource === 'local_backpressure'
-            ? {
-                totalTimeoutMs: head.totalTimeoutMs,
-                localBackpressureMs:
-                  this.now() - (head.localPauseStartedAt ?? this.now()),
-              }
-            : deadlineHit
-              ? { totalTimeoutMs: head.totalTimeoutMs }
-              : { stallTimeoutMs: stallMs }),
-        },
-        timeoutSource === 'local_backpressure'
-          ? 'nntp segment exceeded its total time budget during local backpressure; destroying'
-          : deadlineHit
-            ? 'nntp segment exceeded its total time budget; destroying'
-            : 'nntp connection stalled; destroying'
-      );
-      this.fatalError = new NntpError(
-        'timeout',
-        timeoutSource === 'local_backpressure'
-          ? `segment exceeded total budget of ${head.totalTimeoutMs}ms during local backpressure`
-          : deadlineHit
-            ? `segment exceeded total budget of ${head.totalTimeoutMs}ms`
-            : `no response progress for ${stallMs}ms`,
-        { provider: this.label, timeoutSource }
-      );
-      this.destroy();
-    }, timeoutMs);
     this.stallTimer.unref?.();
+  }
+
+  /** Earliest finite deadline, preserving FIFO order when deadlines tie. */
+  private earliestFiniteDeadline(): PipelineRequest | undefined {
+    let earliest: PipelineRequest | undefined;
+    for (const request of this.queue) {
+      if (request.deadlineAt === Infinity) continue;
+      if (!earliest || request.deadlineAt < earliest.deadlineAt) {
+        earliest = request;
+      }
+    }
+    return earliest;
+  }
+
+  /**
+   * Enforce hard wall-clock deadlines synchronously at every response-progress
+   * boundary. This closes the race where the event loop delivers IO, drain, or
+   * consumer completion after a timer was due but before its callback ran.
+   */
+  private failExpiredPipelineDeadline(now = this.now()): boolean {
+    const expired = this.earliestFiniteDeadline();
+    if (!expired || now < expired.deadlineAt) return false;
+
+    const timeoutSource = this.socketLocallyPaused
+      ? 'local_backpressure'
+      : 'absolute';
+    logger.warn(
+      {
+        provider: this.label,
+        connId: this.id,
+        inFlight: this.queue.length,
+        totalTimeoutMs: expired.totalTimeoutMs,
+        ...(timeoutSource === 'local_backpressure'
+          ? {
+              localBackpressureMs: Math.max(
+                0,
+                now - (this.localPauseStartedAt ?? now)
+              ),
+            }
+          : {}),
+      },
+      timeoutSource === 'local_backpressure'
+        ? 'nntp segment exceeded its total time budget during local backpressure; destroying'
+        : 'nntp segment exceeded its total time budget; destroying'
+    );
+    this.fatalError = new NntpError(
+      'timeout',
+      timeoutSource === 'local_backpressure'
+        ? `segment exceeded total budget of ${expired.totalTimeoutMs}ms during local backpressure`
+        : `segment exceeded total budget of ${expired.totalTimeoutMs}ms`,
+      { provider: this.label, timeoutSource }
+    );
+    this.destroy();
+    return true;
+  }
+
+  private failProviderStall(head: PipelineRequest): void {
+    logger.warn(
+      {
+        provider: this.label,
+        connId: this.id,
+        inFlight: this.queue.length,
+        stallTimeoutMs: head.stallTimeoutMs,
+      },
+      'nntp connection stalled; destroying'
+    );
+    this.fatalError = new NntpError(
+      'timeout',
+      `no response progress for ${head.stallTimeoutMs}ms`,
+      { provider: this.label, timeoutSource: 'provider_stall' }
+    );
+    this.destroy();
   }
 
   private clearStallTimer(): void {
@@ -803,6 +854,7 @@ export class NntpConnection {
     const parser = this.parser;
     if (!parser || this.destroyed) return false;
     if (nread <= 0) return true;
+    if (this.failExpiredPipelineDeadline()) return false;
     if (this.processing || this.pausedHead) {
       this.onDesync('socket delivered data during local backpressure');
       return false;
@@ -829,6 +881,7 @@ export class NntpConnection {
     const parser = this.parser;
     let off = initialOffset;
     while (off < nread && this.queue.length > 0) {
+      if (this.failExpiredPipelineDeadline()) return false;
       const head = this.queue[0];
       if (head.stage === 'status') {
         const step = parser.feedLine(buf, off, nread);
@@ -862,13 +915,13 @@ export class NntpConnection {
       }
       if (head.consumer) {
         const streamed = parser.streamed;
-        this.finishHead(() => head.resolve(streamed));
+        if (!this.finishHead(() => head.resolve(streamed))) return false;
       } else {
         // A view of the pooled slot, valid until the ring recycles it (after
         // `inFlight` more bodies); long enough for the synchronous decode that
         // follows the resolve in the next microtask.
         const body = parser.dest!.subarray(0, parser.bodyLen);
-        this.finishHead(() => head.resolve(body));
+        if (!this.finishHead(() => head.resolve(body))) return false;
       }
     }
     return true;
@@ -907,6 +960,7 @@ export class NntpConnection {
     if (this.destroyed || this.pausedHead !== head || this.queue[0] !== head) {
       return;
     }
+    if (this.failExpiredPipelineDeadline()) return;
     if (head.payloadEnded) {
       this.startConsumerEnd(head);
       return;
@@ -942,8 +996,9 @@ export class NntpConnection {
         ) {
           return;
         }
+        if (this.failExpiredPipelineDeadline()) return;
         this.releaseLocalPause(head);
-        this.finishHead(() => head.resolve(streamed));
+        if (!this.finishHead(() => head.resolve(streamed))) return;
         this.scheduleReadContinuation();
       })
       .catch((error: unknown) => this.failFromConsumer(error));
@@ -963,8 +1018,10 @@ export class NntpConnection {
     }
     this.storeDeferredRead(buf, off, nread, ownedWindow);
     this.pausedHead = head;
-    head.localPauseStartedAt ??= this.now();
+    const now = this.now();
+    head.localPauseStartedAt ??= now;
     if (!this.socketLocallyPaused) {
+      this.localPauseStartedAt = now;
       this.socket.pause();
       this.socketLocallyPaused = true;
     }
@@ -1028,6 +1085,7 @@ export class NntpConnection {
 
   private continueAfterLocalPause(): void {
     if (this.destroyed || this.pausedHead || this.processing) return;
+    if (this.failExpiredPipelineDeadline()) return;
     if (this.deferredReadStart < this.deferredReadEnd) {
       const deferredRead = this.deferredRead;
       if (!deferredRead) {
@@ -1053,7 +1111,9 @@ export class NntpConnection {
     this.deferredRead = undefined;
     if (!this.destroyed && !this.pausedHead && this.socketLocallyPaused) {
       this.socketLocallyPaused = false;
+      this.localPauseStartedAt = undefined;
       this.socket.resume();
+      this.armStallTimer();
     }
   }
 
@@ -1083,8 +1143,7 @@ export class NntpConnection {
       return false;
     }
     if (head.kind === 'line') {
-      this.finishHead(() => head.resolve(line));
-      return true;
+      return this.finishHead(() => head.resolve(line));
     }
     // body request: ≥4xx (e.g. 430) → reject ONLY this request, no body to read.
     if (statusClass(status.code) >= 4) {
@@ -1094,8 +1153,7 @@ export class NntpConnection {
         { code: status.code, provider: this.label }
       );
       this.failBodyConsumer(head, err);
-      this.finishHead(() => head.reject(err));
-      return true;
+      return this.finishHead(() => head.reject(err), false);
     }
     if (head.solo) {
       this.opts.onLatencySample?.(this.now() - head.writtenAt);
@@ -1120,15 +1178,17 @@ export class NntpConnection {
     this.destroy();
   }
 
-  /** Shift the completed head, re-arm the stall timer, then deliver its result. */
-  private finishHead(deliver: () => void): void {
+  /** Shift the completed head, re-arm the response timer, then deliver it. */
+  private finishHead(deliver: () => void, enforceDeadline = true): boolean {
+    if (enforceDeadline && this.failExpiredPipelineDeadline()) return false;
     const head = this.queue.shift();
-    if (!head) return;
+    if (!head) return false;
     if (head.signal && head.onAbort) {
       head.signal.removeEventListener('abort', head.onAbort);
     }
     this.armStallTimer();
     deliver();
+    return true;
   }
 
   /**
@@ -1162,6 +1222,7 @@ export class NntpConnection {
     this.deferredReadStart = 0;
     this.deferredReadEnd = 0;
     this.socketLocallyPaused = false;
+    this.localPauseStartedAt = undefined;
     this.clearStallTimer();
     for (const req of pending) {
       if (req.signal && req.onAbort) {
