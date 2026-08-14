@@ -676,12 +676,12 @@ export class SpoolManager {
     let firstError: Error | undefined;
     if (this.processNamespaceOwned) {
       try {
+        // A foreign holder is already performing a compatible destructive
+        // cleanup. Owner-close therefore proceeds without stealing or waiting
+        // for the control lock; duplicate rm operations are ENOENT-idempotent.
         namespaceControl = await this.tryAcquireNamespaceControl(
           path.basename(this.processRoot)
         );
-        if (!namespaceControl) {
-          firstError = this.namespaceControlContentionError();
-        }
       } catch (error) {
         firstError = error instanceof Error ? error : new Error(String(error));
       }
@@ -689,9 +689,7 @@ export class SpoolManager {
 
     const trackedArtifacts = [...this.artifactReservations];
     const results = await Promise.allSettled(
-      namespaceControl
-        ? trackedArtifacts.map(([artifact]) => artifact.dispose())
-        : []
+      trackedArtifacts.map(([artifact]) => artifact.dispose())
     );
     for (const result of results) {
       if (result.status === 'rejected' && !firstError) {
@@ -702,7 +700,7 @@ export class SpoolManager {
       }
     }
     let namespaceRemoved = !this.processNamespaceOwned;
-    if (this.processNamespaceOwned && namespaceControl) {
+    if (this.processNamespaceOwned) {
       try {
         await this.fileSystem.rm(this.processRoot, {
           recursive: true,
@@ -811,8 +809,23 @@ export class SpoolManager {
         );
       }
     } catch (error) {
-      await Promise.allSettled([handle.close()]);
-      throw classifySpoolFileError(error, 'validating spool namespace control');
+      const validationError = classifySpoolFileError(
+        error,
+        'validating spool namespace control'
+      );
+      try {
+        await this.releaseNamespaceControl(handle, lockPath);
+      } catch (cleanupError) {
+        throw this.aggregateNamespaceControlErrors(validationError, [
+          cleanupError instanceof UsenetSpoolError
+            ? cleanupError
+            : classifySpoolFileError(
+                cleanupError,
+                'cleaning up spool namespace control'
+              ),
+        ]);
+      }
+      throw validationError;
     }
 
     let releasePromise: Promise<void> | undefined;
@@ -828,17 +841,43 @@ export class SpoolManager {
     handle: SpoolFileHandle,
     lockPath: string
   ): Promise<void> {
+    // Successful `wx` acquisition owns both cleanup obligations. Always
+    // attempt removal even when closing reports an error, then retain every
+    // failure behind one stable typed primary error.
+    const errors: UsenetSpoolError[] = [];
     try {
       await handle.close();
     } catch (error) {
-      throw classifySpoolFileError(error, 'closing spool namespace control');
+      errors.push(
+        classifySpoolFileError(error, 'closing spool namespace control')
+      );
     }
     try {
       await this.fileSystem.rm(lockPath, { force: false });
     } catch (error) {
-      if (isMissingSpoolError(error)) return;
-      throw classifySpoolFileError(error, 'releasing spool namespace control');
+      if (!isMissingSpoolError(error)) {
+        errors.push(
+          classifySpoolFileError(error, 'releasing spool namespace control')
+        );
+      }
     }
+    const [primary, ...secondary] = errors;
+    if (primary) {
+      throw this.aggregateNamespaceControlErrors(primary, secondary);
+    }
+  }
+
+  private aggregateNamespaceControlErrors(
+    primary: UsenetSpoolError,
+    secondary: readonly UsenetSpoolError[]
+  ): UsenetSpoolError {
+    if (secondary.length === 0) return primary;
+    return new UsenetSpoolError(primary.code, primary.message, {
+      cause: new AggregateError(
+        [primary, ...secondary],
+        'Multiple spool namespace control operations failed'
+      ),
+    });
   }
 
   private async ensureLivenessLockRoot(): Promise<void> {

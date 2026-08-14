@@ -275,6 +275,20 @@ async function createForeignNamespace(
   };
 }
 
+function namespaceLockPath(manager: SpoolManager): string {
+  return path.join(
+    manager.spoolRoot,
+    '.liveness-locks',
+    `${path.basename(manager.processRoot)}.lock`
+  );
+}
+
+function errnoError(code: string, message: string): Error {
+  const error = new Error(message);
+  Object.defineProperty(error, 'code', { value: code });
+  return error;
+}
+
 function controlledWriterFileSystem(
   writeStarted: PromiseWithResolvers<void>,
   continueWrite: PromiseWithResolvers<void>,
@@ -1470,6 +1484,407 @@ test('close waits for a fenced heartbeat while a cleaner contends', async () => 
     assert.equal(openControlHandles, 0);
     assert.equal(schedulerA.pendingCount, 0);
     assert.equal(schedulerB.pendingCount, 0);
+    await rm(cacheRoot, { recursive: true, force: true });
+  }
+});
+
+test('owner close cleans resources while a foreign cleaner holds its fence', async () => {
+  const cacheRoot = await mkdtemp(
+    path.join(tmpdir(), 'aiostreams-owner-close-contention-')
+  );
+  let now = Date.now();
+  const plan = testPlan({ orphanTtlMs: 900 });
+  const schedulerA = new ControlledScheduler();
+  const schedulerB = new ControlledScheduler();
+  const managerA = new SpoolManager({
+    plan,
+    engineId: 'owner-close-contention-a',
+    cacheRoot,
+    clock: () => now,
+    idGenerator: () => 'owner-close-contention-process-a',
+    scheduler: schedulerA.schedule,
+  });
+  const memory = new ByteBudget(8);
+  const artifact = await managerA.createArtifact({
+    sessionId: 'owner-close-contention-session',
+    segmentId: 'segment',
+    initialReservationBytes: 8,
+  });
+  await writeText(artifact, memory, 'data');
+  await artifact.complete();
+  const promotion = artifact.acquirePromotion();
+  const lockPath = namespaceLockPath(managerA);
+  const cleanerHasFence = Promise.withResolvers<void>();
+  const continueCleaner = Promise.withResolvers<void>();
+  let openControlHandles = 0;
+  const managerB = new SpoolManager({
+    plan,
+    engineId: 'owner-close-contention-b',
+    cacheRoot,
+    clock: () => now,
+    idGenerator: () => 'owner-close-contention-process-b',
+    scheduler: schedulerB.schedule,
+    fileSystem: {
+      open: async (filePath, flags, mode) => {
+        const isControl = flags === 'wx' && filePath.endsWith('.lock');
+        if (isControl) openControlHandles++;
+        const handle = await openSpoolFile(filePath, flags, mode, () => {
+          if (isControl) openControlHandles--;
+        });
+        if (filePath === lockPath && flags === 'wx') {
+          cleanerHasFence.resolve();
+          await continueCleaner.promise;
+        }
+        return handle;
+      },
+    },
+  });
+
+  try {
+    const old = new Date(now - 5000);
+    for (const target of [
+      path.join(managerA.processRoot, '.alive'),
+      promotion.path,
+      managerA.engineRoot,
+      managerA.processRoot,
+    ]) {
+      await utimes(target, old, old);
+    }
+    now += 2000;
+
+    const initializationB = managerB.initialize();
+    await cleanerHasFence.promise;
+    assert.equal(await exists(lockPath), true);
+
+    let ownerClosed = false;
+    const firstClose = managerA.close().then(() => {
+      ownerClosed = true;
+    });
+    const secondClose = managerA.close();
+    await Promise.resolve();
+    assert.equal(ownerClosed, false);
+    assert.equal(managerA.stats().budget.reservedBytes, 8);
+
+    promotion.release();
+    continueCleaner.resolve();
+    await Promise.all([firstClose, secondClose, initializationB]);
+
+    assert.equal(memory.stats().usedBytes, 0);
+    assert.deepEqual(managerA.stats().budget, {
+      maxBytes: 1024,
+      reservedBytes: 0,
+      actualBytes: 0,
+      peakReservedBytes: 8,
+      peakActualBytes: 4,
+      waiting: 0,
+    });
+    assert.equal(managerA.stats().files.openFiles, 0);
+    assert.equal(managerA.stats().artifacts, 0);
+    assert.equal(await exists(managerA.processRoot), false);
+    assert.equal(await exists(lockPath), false);
+    assert.equal(openControlHandles, 0);
+    await managerA.close();
+  } finally {
+    continueCleaner.resolve();
+    promotion.release();
+    await Promise.allSettled([
+      artifact.dispose(),
+      managerA.close(),
+      managerB.close(),
+    ]);
+    assert.equal(openControlHandles, 0);
+    assert.equal(schedulerA.pendingCount, 0);
+    assert.equal(schedulerB.pendingCount, 0);
+    await rm(cacheRoot, { recursive: true, force: true });
+  }
+});
+
+test('crash-left namespace fence does not strand owner close resources', async (context) => {
+  const scheduler = new ControlledScheduler();
+  const { manager } = await testManager(context, {
+    scheduler: scheduler.schedule,
+  });
+  const memory = new ByteBudget(8);
+  const artifact = await manager.createArtifact({
+    sessionId: 'crash-left-close-session',
+    segmentId: 'segment',
+    initialReservationBytes: 8,
+  });
+  await writeText(artifact, memory, 'data');
+  await artifact.complete();
+  const lockPath = namespaceLockPath(manager);
+  const staleLock = await open(lockPath, 'wx', 0o600);
+  await staleLock.close();
+
+  const firstClose = manager.close();
+  const secondClose = manager.close();
+  assert.strictEqual(secondClose, firstClose);
+  await firstClose;
+
+  assert.equal(await exists(lockPath), true);
+  assert.equal(await exists(manager.processRoot), false);
+  assert.equal(memory.stats().usedBytes, 0);
+  assert.equal(manager.stats().budget.reservedBytes, 0);
+  assert.equal(manager.stats().budget.actualBytes, 0);
+  assert.equal(manager.stats().files.openFiles, 0);
+  assert.equal(manager.stats().artifacts, 0);
+  await secondClose;
+  assert.equal(scheduler.pendingCount, 0);
+  await rm(lockPath, { force: false });
+});
+
+test('owner close treats files removed first by a cleaner as already cleaned', async (context) => {
+  const { manager } = await testManager(context);
+  const memory = new ByteBudget(8);
+  const artifact = await manager.createArtifact({
+    sessionId: 'parallel-delete-session',
+    segmentId: 'segment',
+    initialReservationBytes: 8,
+  });
+  await writeText(artifact, memory, 'data');
+  await artifact.complete();
+  const promotion = artifact.acquirePromotion();
+  const readyPath = promotion.path;
+  promotion.release();
+
+  await rm(readyPath, { force: false });
+  await rm(manager.processRoot, { recursive: true, force: true });
+  await manager.close();
+  await manager.close();
+
+  assert.equal(await exists(manager.processRoot), false);
+  assert.equal(memory.stats().usedBytes, 0);
+  assert.equal(manager.stats().budget.reservedBytes, 0);
+  assert.equal(manager.stats().budget.actualBytes, 0);
+  assert.equal(manager.stats().files.openFiles, 0);
+  assert.equal(manager.stats().artifacts, 0);
+});
+
+test('validation failure after wx closes the handle and removes its lock', async () => {
+  const cacheRoot = await mkdtemp(
+    path.join(tmpdir(), 'aiostreams-control-validation-')
+  );
+  const scheduler = new ControlledScheduler();
+  let lockPath = '';
+  let failValidation = true;
+  let openControlHandles = 0;
+  const manager = new SpoolManager({
+    plan: testPlan(),
+    engineId: 'control-validation',
+    cacheRoot,
+    idGenerator: () => 'control-validation-process',
+    scheduler: scheduler.schedule,
+    fileSystem: {
+      open: async (filePath, flags, mode) => {
+        const isControl = filePath === lockPath && flags === 'wx';
+        if (isControl) openControlHandles++;
+        return openSpoolFile(filePath, flags, mode, () => {
+          if (isControl) openControlHandles--;
+        });
+      },
+      lstat: async (target) => {
+        if (target === lockPath && failValidation) {
+          failValidation = false;
+          throw errnoError('EIO', 'synthetic control validation failure');
+        }
+        return spoolLstat(target);
+      },
+    },
+  });
+  lockPath = namespaceLockPath(manager);
+
+  try {
+    await assert.rejects(manager.initialize(), (error) =>
+      isSpoolError(error, 'USENET_SPOOL_IO')
+    );
+    assert.equal(openControlHandles, 0);
+    assert.equal(await exists(lockPath), false);
+
+    await manager.initialize();
+    assert.equal(await exists(manager.processRoot), true);
+    assert.equal(openControlHandles, 0);
+    await manager.close();
+  } finally {
+    await Promise.allSettled([manager.close()]);
+    assert.equal(openControlHandles, 0);
+    assert.equal(scheduler.pendingCount, 0);
+    await rm(cacheRoot, { recursive: true, force: true });
+  }
+});
+
+test('lock removal still runs when the acquired handle close reports failure', async () => {
+  const cacheRoot = await mkdtemp(
+    path.join(tmpdir(), 'aiostreams-control-close-error-')
+  );
+  const scheduler = new ControlledScheduler();
+  let lockPath = '';
+  let failControlClose = true;
+  let openControlHandles = 0;
+  let lockRemoveCalls = 0;
+  const manager = new SpoolManager({
+    plan: testPlan(),
+    engineId: 'control-close-error',
+    cacheRoot,
+    idGenerator: () => 'control-close-error-process',
+    scheduler: scheduler.schedule,
+    fileSystem: {
+      open: async (filePath, flags, mode) => {
+        const isControl = filePath === lockPath && flags === 'wx';
+        if (isControl) openControlHandles++;
+        const handle = await openSpoolFile(filePath, flags, mode, () => {
+          if (isControl) openControlHandles--;
+        });
+        if (!isControl) return handle;
+        return {
+          ...handle,
+          close: async () => {
+            await handle.close();
+            if (failControlClose) {
+              failControlClose = false;
+              throw errnoError('EIO', 'synthetic control close failure');
+            }
+          },
+        };
+      },
+      rm: async (target, options) => {
+        if (target === lockPath) lockRemoveCalls++;
+        await rm(target, options);
+      },
+    },
+  });
+  lockPath = namespaceLockPath(manager);
+
+  try {
+    await assert.rejects(manager.initialize(), (error) =>
+      isSpoolError(error, 'USENET_SPOOL_IO')
+    );
+    assert.equal(lockRemoveCalls, 1);
+    assert.equal(openControlHandles, 0);
+    assert.equal(await exists(lockPath), false);
+
+    await manager.initialize();
+    assert.equal(await exists(manager.processRoot), true);
+    assert.equal(openControlHandles, 0);
+    await manager.close();
+  } finally {
+    await Promise.allSettled([manager.close()]);
+    assert.equal(openControlHandles, 0);
+    assert.equal(scheduler.pendingCount, 0);
+    await rm(cacheRoot, { recursive: true, force: true });
+  }
+});
+
+test('lock removal failure is typed after the acquired handle is closed', async () => {
+  const cacheRoot = await mkdtemp(
+    path.join(tmpdir(), 'aiostreams-control-remove-error-')
+  );
+  const scheduler = new ControlledScheduler();
+  let lockPath = '';
+  let failLockRemove = true;
+  let openControlHandles = 0;
+  const manager = new SpoolManager({
+    plan: testPlan(),
+    engineId: 'control-remove-error',
+    cacheRoot,
+    idGenerator: () => 'control-remove-error-process',
+    scheduler: scheduler.schedule,
+    fileSystem: {
+      open: async (filePath, flags, mode) => {
+        const isControl = filePath === lockPath && flags === 'wx';
+        if (isControl) openControlHandles++;
+        return openSpoolFile(filePath, flags, mode, () => {
+          if (isControl) openControlHandles--;
+        });
+      },
+      rm: async (target, options) => {
+        if (target === lockPath && failLockRemove) {
+          failLockRemove = false;
+          throw errnoError('EACCES', 'synthetic control remove failure');
+        }
+        await rm(target, options);
+      },
+    },
+  });
+  lockPath = namespaceLockPath(manager);
+
+  try {
+    await assert.rejects(manager.initialize(), (error) =>
+      isSpoolError(error, 'USENET_SPOOL_UNAVAILABLE')
+    );
+    assert.equal(openControlHandles, 0);
+    assert.equal(await exists(lockPath), true);
+
+    await rm(lockPath, { force: false });
+    await manager.initialize();
+    assert.equal(await exists(manager.processRoot), true);
+    assert.equal(openControlHandles, 0);
+    await manager.close();
+  } finally {
+    await Promise.allSettled([manager.close()]);
+    assert.equal(openControlHandles, 0);
+    assert.equal(scheduler.pendingCount, 0);
+    await rm(cacheRoot, { recursive: true, force: true });
+  }
+});
+
+test('namespace-control release is idempotent and shares one promise', async () => {
+  const cacheRoot = await mkdtemp(
+    path.join(tmpdir(), 'aiostreams-control-release-once-')
+  );
+  const scheduler = new ControlledScheduler();
+  let lockPath = '';
+  let controlCloseCalls = 0;
+  let lockRemoveCalls = 0;
+  const manager = new SpoolManager({
+    plan: testPlan(),
+    engineId: 'control-release-once',
+    cacheRoot,
+    idGenerator: () => 'control-release-once-process',
+    scheduler: scheduler.schedule,
+    fileSystem: {
+      open: async (filePath, flags, mode) => {
+        const handle = await openSpoolFile(filePath, flags, mode);
+        if (filePath !== lockPath || flags !== 'wx') return handle;
+        return {
+          ...handle,
+          close: async () => {
+            controlCloseCalls++;
+            await handle.close();
+          },
+        };
+      },
+      rm: async (target, options) => {
+        if (target === lockPath) lockRemoveCalls++;
+        await rm(target, options);
+      },
+    },
+  });
+  lockPath = namespaceLockPath(manager);
+
+  try {
+    await manager.initialize();
+    controlCloseCalls = 0;
+    lockRemoveCalls = 0;
+
+    const control = await manager['tryAcquireNamespaceControl'](
+      path.basename(manager.processRoot)
+    );
+    assert(control);
+    const firstRelease = control.release();
+    const secondRelease = control.release();
+    assert.strictEqual(secondRelease, firstRelease);
+    await Promise.all([firstRelease, secondRelease]);
+
+    assert.equal(controlCloseCalls, 1);
+    assert.equal(lockRemoveCalls, 1);
+    assert.equal(await exists(lockPath), false);
+    assert.equal(await exists(manager.processRoot), true);
+
+    await manager.close();
+    assert.equal(await exists(manager.processRoot), false);
+    assert.equal(scheduler.pendingCount, 0);
+  } finally {
+    await Promise.allSettled([manager.close()]);
     await rm(cacheRoot, { recursive: true, force: true });
   }
 });
