@@ -1,6 +1,7 @@
 import { SegmentCache } from './segment-cache.js';
 import { PrioritySemaphore } from './priority-semaphore.js';
 import { StatsAccumulator } from '../stats/accumulator.js';
+import { createLogger } from '../../logging/logger.js';
 import {
   SegmentArena,
   SharedSegment,
@@ -29,6 +30,19 @@ import {
   ProviderConfig,
   SegmentData,
 } from '../types.js';
+import {
+  ArenaSegmentArtifact,
+  GrowingSpoolArtifactAdapter,
+  type SegmentArtifact,
+} from './segment-artifact.js';
+import { SegmentSpoolingRuntime } from './segment-spooling-runtime.js';
+import { SpoolingSegmentSink } from './spooling-segment-sink.js';
+import type { DecodedSegmentMetadata } from './streaming-yenc-article-decoder.js';
+import type { GrowingSpoolArtifact } from '../spool/growing-artifact.js';
+import { UsenetSpoolError } from '../spool/errors.js';
+import { resolveEstimatedDecodedSegmentBytes } from '../resource-plan.js';
+
+const logger = createLogger('usenet/multi-provider-pool');
 
 export type { SegmentHeadData } from '../nntp/segment-fetcher.js';
 export type { SharedSegment } from './segment-arena.js';
@@ -50,12 +64,71 @@ interface SharedFlight {
   ctl: AbortController;
 }
 
+/** One caller waiting for an independently releasable file-backed handle. */
+interface ArtifactWaiter {
+  deliver(artifact: SegmentArtifact): void;
+  fail(error: unknown): void;
+}
+
+/** One message-id fetch shared by every currently registered artifact waiter. */
+interface ArtifactFlight {
+  readonly waiters: Set<ArtifactWaiter>;
+  readonly ctl: AbortController;
+  onWire: boolean;
+}
+
+/** Optional construction seams used by the engine and deterministic tests. */
+export interface MultiProviderPoolDependencies {
+  readonly fetcher?: SegmentFetcher;
+  readonly spooling?: SegmentSpoolingRuntime;
+}
+
+class SharedSpoolArtifactOwner {
+  private references = 0;
+  private disposePromise: Promise<void> | undefined;
+
+  constructor(
+    private readonly artifact: GrowingSpoolArtifact,
+    private readonly metadata: DecodedSegmentMetadata
+  ) {}
+
+  acquire(): SegmentArtifact {
+    if (this.disposePromise) {
+      throw new UsenetSpoolError(
+        'USENET_SPOOL_CLOSED',
+        'Cannot acquire a disposed shared spool artifact'
+      );
+    }
+    this.references++;
+    let released = false;
+    return new GrowingSpoolArtifactAdapter(this.artifact, this.metadata, () => {
+      if (released) return this.disposePromise ?? Promise.resolve();
+      released = true;
+      this.references--;
+      if (this.references === 0) return this.dispose();
+      return Promise.resolve();
+    });
+  }
+
+  disposeIfUnused(): Promise<void> {
+    return this.references === 0 ? this.dispose() : Promise.resolve();
+  }
+
+  private dispose(): Promise<void> {
+    this.disposePromise ??= this.artifact.dispose();
+    return this.disposePromise;
+  }
+}
+
 /**
  * TTL for the negative-miss cache
  */
 const MISS_TTL_MS = 60_000;
 /** Max distinct missing message-ids remembered (insertion-order eviction). */
 const MISS_CACHE_MAX = 16_384;
+/** Hard bounds for callbacks retained by the Block-6 single-flight layer. */
+const ARTIFACT_FLIGHT_MAX = 16_384;
+const ARTIFACT_WAITERS_PER_FLIGHT_MAX = 1024;
 
 /**
  * Coordinates segment fetches: owns the segment cache, single-flight de-dupe and
@@ -66,8 +139,11 @@ const MISS_CACHE_MAX = 16_384;
 export class MultiProviderPool {
   private fetcher: SegmentFetcher;
   private globalDownloads: PrioritySemaphore;
+  private readonly spooling: SegmentSpoolingRuntime | undefined;
   /** Single-flight coordinator for shared (arena-backed) segment fetches. */
   private sharedInflight = new Map<string, SharedFlight>();
+  /** Single-flight coordinator for file-backed segment artifacts. */
+  private artifactInflight = new Map<string, ArtifactFlight>();
   /**
    * Single-flight for head-only probe fetches. Fill/repost NZBs list the SAME
    * articles under multiple `<file>` entries, and head fetches don't populate
@@ -149,11 +225,14 @@ export class MultiProviderPool {
     providers: ProviderConfig[],
     opts: EngineOptions,
     private cache: SegmentCache,
-    stats: StatsAccumulator
+    stats: StatsAccumulator,
+    dependencies: MultiProviderPoolDependencies = {}
   ) {
     // The fetcher owns the connection pools + failover + decode; the engine's
     // StatsAccumulator is its (in-process) stats sink.
-    this.fetcher = new LocalSegmentFetcher(providers, opts, stats);
+    this.fetcher =
+      dependencies.fetcher ?? new LocalSegmentFetcher(providers, opts, stats);
+    this.spooling = dependencies.spooling;
 
     // The global download budget is a HARD ceiling on concurrent in-flight
     // BODY/ARTICLE downloads. It is auto-sized (in buildUsenetEngineOptions) to
@@ -260,6 +339,249 @@ export class MultiProviderPool {
     });
     if (isNew) void this.runShared(segment, nzbHash, priority, joined);
     return p;
+  }
+
+  /**
+   * Fetch one decoded segment as independently releasable storage. This is the
+   * only network path used by segment spooling: it never calls the buffering
+   * APIs and never asks the persistent cache to materialize a complete body.
+   *
+   * Lookup order is arena, optional file-backed L2, negative miss cache, then
+   * a message-id single flight into the transient spool.
+   */
+  async fetchSegmentArtifact(
+    segment: NzbSegmentRef,
+    nzbHash: string,
+    signal: AbortSignal | undefined,
+    priority: CommandPriority = CommandPriority.High
+  ): Promise<SegmentArtifact> {
+    const id = segment.messageId;
+    const pinned = this.arena.acquire(id);
+    if (pinned) return new ArenaSegmentArtifact(pinned);
+    if (signal?.aborted) throw new NntpError('connection', 'aborted');
+
+    const runtime = this.spooling;
+    if (!runtime) {
+      throw new UsenetSpoolError(
+        'USENET_SPOOL_UNAVAILABLE',
+        'Segment artifact fetching requires segment-spooling mode'
+      );
+    }
+
+    if (runtime.artifactCache) {
+      const persistent = await runtime.artifactCache.acquire(id, signal);
+      if (persistent) {
+        if (signal?.aborted) {
+          await persistent.release();
+          throw new NntpError('connection', 'aborted');
+        }
+        return persistent;
+      }
+    }
+
+    const cached = this.cachedMiss(id);
+    if (cached !== undefined) throw this.cachedMissError(id, cached);
+    return this.joinArtifactFlight(segment, nzbHash, priority, signal);
+  }
+
+  private joinArtifactFlight(
+    segment: NzbSegmentRef,
+    nzbHash: string,
+    priority: CommandPriority,
+    signal: AbortSignal | undefined
+  ): Promise<SegmentArtifact> {
+    const id = segment.messageId;
+    let flight = this.artifactInflight.get(id);
+    const isNew = flight === undefined;
+    if (!flight) {
+      if (this.artifactInflight.size >= ARTIFACT_FLIGHT_MAX) {
+        return Promise.reject(
+          new UsenetSpoolError(
+            'USENET_SPOOL_CAPACITY',
+            'Segment artifact single-flight capacity reached'
+          )
+        );
+      }
+      flight = {
+        waiters: new Set<ArtifactWaiter>(),
+        ctl: new AbortController(),
+        onWire: false,
+      };
+      this.artifactInflight.set(id, flight);
+    }
+    const joined = flight;
+    if (joined.waiters.size >= ARTIFACT_WAITERS_PER_FLIGHT_MAX) {
+      return Promise.reject(
+        new UsenetSpoolError(
+          'USENET_SPOOL_CAPACITY',
+          'Segment artifact waiter capacity reached'
+        )
+      );
+    }
+
+    const promise = new Promise<SegmentArtifact>((resolve, reject) => {
+      let settled = false;
+      let onAbort: (() => void) | undefined;
+      const finish = (): boolean => {
+        if (settled) return false;
+        settled = true;
+        if (onAbort && signal) {
+          signal.removeEventListener('abort', onAbort);
+        }
+        return true;
+      };
+      const waiter: ArtifactWaiter = {
+        deliver: (artifact) => {
+          if (!finish()) {
+            void artifact.release().catch((releaseError: unknown) => {
+              logger.warn(
+                { err: releaseError },
+                'failed to release an abandoned segment artifact handle'
+              );
+            });
+            return;
+          }
+          resolve(artifact);
+        },
+        fail: (error) => {
+          if (finish()) reject(error);
+        },
+      };
+      joined.waiters.add(waiter);
+      if (signal) {
+        onAbort = () => {
+          if (!finish()) return;
+          joined.waiters.delete(waiter);
+          if (joined.waiters.size === 0 && !joined.onWire) {
+            if (this.artifactInflight.get(id) === joined) {
+              this.artifactInflight.delete(id);
+            }
+            joined.ctl.abort();
+          }
+          reject(new NntpError('connection', 'aborted'));
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      }
+    });
+    if (isNew) {
+      void this.runArtifactFlight(segment, nzbHash, priority, joined);
+    }
+    return promise;
+  }
+
+  /** Run one network/spool operation and fan out counted artifact handles. */
+  private async runArtifactFlight(
+    segment: NzbSegmentRef,
+    nzbHash: string,
+    priority: CommandPriority,
+    flight: ArtifactFlight
+  ): Promise<void> {
+    const id = segment.messageId;
+    const runtime = this.spooling;
+    if (!runtime) return;
+
+    let memoryLease:
+      | Awaited<ReturnType<SegmentSpoolingRuntime['acquireDownloadMemory']>>
+      | undefined;
+    let releaseGlobal: (() => void) | undefined;
+    const wire = this.wireTracker();
+    let unownedArtifact: GrowingSpoolArtifact | undefined;
+    try {
+      const downloadMemoryLease = await runtime.acquireDownloadMemory(
+        priority,
+        flight.ctl.signal
+      );
+      memoryLease = downloadMemoryLease;
+      try {
+        releaseGlobal = await this.globalDownloads.acquire(
+          priority,
+          flight.ctl.signal
+        );
+      } catch (error) {
+        if (flight.ctl.signal.aborted) {
+          throw new NntpError('connection', 'aborted');
+        }
+        throw error;
+      }
+
+      const result = await this.fetcher.fetchBodyToSink(
+        segment,
+        nzbHash,
+        priority,
+        async () => {
+          const artifact = await runtime.spoolManager.createArtifact({
+            sessionId: nzbHash,
+            segmentId: id,
+            initialReservationBytes: resolveEstimatedDecodedSegmentBytes({
+              segmentBytes: segment.bytes,
+            }),
+            signal: flight.ctl.signal,
+          });
+          const sink = new SpoolingSegmentSink(
+            artifact,
+            downloadMemoryLease.bytes,
+            runtime.plan.decoderChunkBytes
+          );
+          return {
+            sink,
+            value: artifact,
+            dispose: async (error: Error) => {
+              sink.fail(error);
+              await artifact.dispose();
+            },
+          };
+        },
+        flight.ctl.signal,
+        () => {
+          flight.onWire = true;
+          wire.start();
+        }
+      );
+      unownedArtifact = result.value;
+      const owner = new SharedSpoolArtifactOwner(result.value, result.metadata);
+      unownedArtifact = undefined;
+      if (this.artifactInflight.get(id) === flight) {
+        this.artifactInflight.delete(id);
+      }
+      const waiters = [...flight.waiters];
+      flight.waiters.clear();
+      for (const waiter of waiters) waiter.deliver(owner.acquire());
+      try {
+        await owner.disposeIfUnused();
+      } catch (cleanupError) {
+        logger.warn(
+          { err: cleanupError },
+          'failed to dispose an unclaimed segment spool artifact'
+        );
+      }
+    } catch (error) {
+      if (unownedArtifact) {
+        try {
+          await unownedArtifact.dispose();
+        } catch (cleanupError) {
+          logger.warn(
+            { err: cleanupError },
+            'failed to dispose an unowned segment spool artifact'
+          );
+        }
+      }
+      if (this.artifactInflight.get(id) === flight) {
+        this.artifactInflight.delete(id);
+      }
+      const normalized = flight.ctl.signal.aborted
+        ? new NntpError('connection', 'aborted')
+        : error;
+      const kind = definitiveLossKind(normalized);
+      if (kind) this.recordMiss(id, kind);
+      const waiters = [...flight.waiters];
+      flight.waiters.clear();
+      for (const waiter of waiters) waiter.fail(normalized);
+    } finally {
+      wire.end();
+      releaseGlobal?.();
+      memoryLease?.release();
+    }
   }
 
   /** The single flight behind {@link fetchSegmentShared}. */
@@ -579,6 +901,25 @@ export class MultiProviderPool {
   }
 
   close(): void {
+    const error = new UsenetSpoolError(
+      'USENET_SPOOL_CLOSED',
+      'Segment artifact pool is closed'
+    );
+    for (const flight of this.artifactInflight.values()) {
+      flight.ctl.abort(error);
+      const waiters = [...flight.waiters];
+      flight.waiters.clear();
+      for (const waiter of waiters) waiter.fail(error);
+    }
+    this.artifactInflight.clear();
     this.fetcher.close();
+    if (this.spooling) {
+      void this.spooling.close().catch((closeError: unknown) => {
+        logger.warn(
+          { err: closeError },
+          'failed to close segment-spooling resources'
+        );
+      });
+    }
   }
 }

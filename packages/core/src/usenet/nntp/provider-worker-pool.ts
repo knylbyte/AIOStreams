@@ -2,6 +2,7 @@ import { createLogger } from '../../logging/logger.js';
 import { ConnectionOptions, NntpConnection } from './connection.js';
 import { NntpError } from './errors.js';
 import { YencDecodeError } from '../pool/yenc.js';
+import { UsenetSpoolError } from '../spool/errors.js';
 import {
   CommandPriority,
   ProviderConfig,
@@ -474,6 +475,14 @@ export class ProviderWorkerPool {
       return;
     }
     if (err instanceof YencDecodeError) {
+      req.reject(err);
+      this.dispatch();
+      return;
+    }
+    // Spool capacity/I/O/memory failures are local sink failures, not evidence
+    // that the provider or its circuit is unhealthy.
+    if (err instanceof UsenetSpoolError) {
+      if (slot.conn && !slot.conn.isUsable) slot.conn = null;
       req.reject(err);
       this.dispatch();
       return;

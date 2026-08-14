@@ -23,6 +23,11 @@ import {
   SegmentData,
 } from '../types.js';
 import { StatsEvent } from '../stats/types.js';
+import {
+  StreamingYencArticleDecoder,
+  type BackpressuredByteSink,
+  type DecodedSegmentMetadata,
+} from '../pool/streaming-yenc-article-decoder.js';
 
 const logger = createLogger('usenet/segment-fetcher');
 
@@ -52,6 +57,20 @@ export interface SegmentHeadData {
   size?: number;
 }
 
+/** One provider-attempt-local sink and the resource it is filling. */
+export interface StreamingSegmentAttempt<T> {
+  readonly sink: BackpressuredByteSink;
+  readonly value: T;
+  /** Roll back partial storage before another provider attempt may start. */
+  dispose(error: Error): Promise<void>;
+}
+
+/** Successful incremental decode plus its caller-owned sink resource. */
+export interface StreamingSegmentResult<T> {
+  readonly value: T;
+  readonly metadata: DecodedSegmentMetadata;
+}
+
 /**
  * "Fetch one segment, with provider failover + decode." The connection-owning
  * half of the engine ({@link LocalSegmentFetcher}). The caller
@@ -74,6 +93,18 @@ export interface SegmentFetcher {
     signal?: AbortSignal,
     onWireStart?: () => void
   ): Promise<SegmentData>;
+  /**
+   * Incrementally decode a BODY into a fresh sink per provider attempt. Failed
+   * attempts are disposed before failover, so partial bytes are never reused.
+   */
+  fetchBodyToSink<T>(
+    segment: NzbSegmentRef,
+    nzbHash: string,
+    priority: CommandPriority,
+    createAttempt: () => Promise<StreamingSegmentAttempt<T>>,
+    signal?: AbortSignal,
+    onWireStart?: () => void
+  ): Promise<StreamingSegmentResult<T>>;
   /** Head-only probe: decode the leading `want` bytes + yEnc header fields. */
   fetchHead(
     segment: NzbSegmentRef,
@@ -352,6 +383,55 @@ export class LocalSegmentFetcher implements SegmentFetcher {
           size: decoded.size,
         };
         return { value: data, bytes: data.size };
+      },
+      signal
+    );
+  }
+
+  async fetchBodyToSink<T>(
+    segment: NzbSegmentRef,
+    nzbHash: string,
+    priority: CommandPriority,
+    createAttempt: () => Promise<StreamingSegmentAttempt<T>>,
+    signal?: AbortSignal,
+    onWireStart?: () => void
+  ): Promise<StreamingSegmentResult<T>> {
+    return this.submitWithFailover<StreamingSegmentResult<T>>(
+      segment,
+      nzbHash,
+      priority,
+      async (conn) => {
+        let attempt: StreamingSegmentAttempt<T> | undefined;
+        let decoder: StreamingYencArticleDecoder | undefined;
+        try {
+          attempt = await createAttempt();
+          decoder = new StreamingYencArticleDecoder(attempt.sink);
+          onWireStart?.();
+          await conn.bodyToConsumer(
+            segment.messageId,
+            decoder,
+            undefined,
+            this.opts.segmentStallTimeoutMs,
+            this.opts.segmentTimeoutMs
+          );
+          const metadata = await decoder.finish();
+          return {
+            value: { value: attempt.value, metadata },
+            bytes: metadata.size,
+          };
+        } catch (error) {
+          const failure =
+            error instanceof Error
+              ? error
+              : new YencDecodeError(
+                  undefined,
+                  'streaming segment fetch failed',
+                  { cause: error }
+                );
+          decoder?.fail(failure);
+          if (attempt) await attempt.dispose(failure);
+          throw failure;
+        }
       },
       signal
     );

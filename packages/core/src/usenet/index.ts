@@ -5,6 +5,7 @@ import { createLogger } from '../logging/logger.js';
 import { getCacheFolder } from '../utils/general.js';
 import { appConfig } from '../utils/index.js';
 import { MultiProviderPool } from './pool/multi-provider-pool.js';
+import { SegmentSpoolingRuntime } from './pool/segment-spooling-runtime.js';
 import { PrioritySemaphore } from './pool/priority-semaphore.js';
 import { SegmentCache, CacheStats } from './pool/segment-cache.js';
 import { StatsAccumulator } from './stats/accumulator.js';
@@ -146,6 +147,17 @@ export {
   hasPendingFragments,
 } from './pool/archive/open/index.js';
 export type { DataFragment } from './pool/archive/types.js';
+export {
+  ArenaSegmentArtifact,
+  GrowingSpoolArtifactAdapter,
+  ZeroSegmentArtifact,
+} from './pool/segment-artifact.js';
+export type {
+  SegmentArtifact,
+  SegmentArtifactReadOptions,
+  SegmentArtifactStorage,
+} from './pool/segment-artifact.js';
+export type { DecodedSegmentMetadata } from './pool/streaming-yenc-article-decoder.js';
 
 /** Unified live snapshot for the dashboard. */
 export interface EngineLiveStats {
@@ -233,11 +245,19 @@ export class UsenetEngine {
       namespace: 'segments',
     });
     this.stats = new StatsAccumulator();
+    const spooling = this.resourcePlan.segmentSpooling
+      ? new SegmentSpoolingRuntime({
+          plan: this.resourcePlan.segmentSpooling,
+          engineId: this.fingerprint,
+          cacheRoot: getCacheFolder(),
+        })
+      : undefined;
     this.pool = new MultiProviderPool(
       providers,
       this.options,
       this.cache,
-      this.stats
+      this.stats,
+      { spooling }
     );
     this.purgeTimer = setInterval(
       () => {

@@ -1,0 +1,609 @@
+import assert from 'node:assert/strict';
+import { getEventListeners } from 'node:events';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import test, { type TestContext } from 'node:test';
+import type { BackpressuredByteSink } from './streaming-yenc-article-decoder.js';
+import type {
+  SegmentFetcher,
+  SegmentHeadData,
+  StatDetail,
+  StreamingSegmentAttempt,
+  StreamingSegmentResult,
+} from '../nntp/segment-fetcher.js';
+import { ArticleNotFoundError, NntpError } from '../nntp/errors.js';
+import type {
+  CreateSpoolArtifactOptions,
+  SpoolManagerOptions,
+} from '../spool/manager.js';
+import { SpoolManager } from '../spool/manager.js';
+import type { GrowingSpoolArtifact } from '../spool/growing-artifact.js';
+import { UsenetSpoolError } from '../spool/errors.js';
+import type { SegmentSpoolingPlan } from '../resource-plan.js';
+import { StatsAccumulator } from '../stats/accumulator.js';
+import {
+  CommandPriority,
+  DEFAULT_ENGINE_OPTIONS,
+  type EngineOptions,
+  type NzbSegmentRef,
+  type ProviderPoolInfo,
+  type SegmentData,
+} from '../types.js';
+import { ByteBudget } from './byte-budget.js';
+import { SegmentCache } from './segment-cache.js';
+import type { SegmentArtifact } from './segment-artifact.js';
+import { SegmentSpoolingRuntime } from './segment-spooling-runtime.js';
+import { MultiProviderPool } from './multi-provider-pool.js';
+import { YencDecodeError } from './yenc.js';
+
+const KIBIBYTE_BYTES = 1024;
+const MEBIBYTE_BYTES = KIBIBYTE_BYTES * KIBIBYTE_BYTES;
+
+interface FakeBehavior {
+  readonly body: Buffer;
+  readonly gate?: Promise<void>;
+  readonly started?: PromiseWithResolvers<void>;
+  readonly error?: Error;
+}
+
+class FakeSegmentFetcher implements SegmentFetcher {
+  readonly behaviors = new Map<string, FakeBehavior>();
+  streamingCalls = 0;
+  bufferingCalls = 0;
+  closed = false;
+
+  async fetchBody(
+    segment: NzbSegmentRef,
+    _nzbHash: string,
+    _priority: CommandPriority,
+    _out?: () => Buffer,
+    _signal?: AbortSignal,
+    onWireStart?: () => void
+  ): Promise<SegmentData> {
+    this.bufferingCalls++;
+    onWireStart?.();
+    const body = Buffer.from(
+      this.behaviors.get(segment.messageId)?.body ?? 'buffering-body'
+    );
+    return { body, size: body.length, name: 'buffering.bin' };
+  }
+
+  async fetchBodyToSink<T>(
+    segment: NzbSegmentRef,
+    _nzbHash: string,
+    _priority: CommandPriority,
+    createAttempt: () => Promise<StreamingSegmentAttempt<T>>,
+    signal?: AbortSignal,
+    onWireStart?: () => void
+  ): Promise<StreamingSegmentResult<T>> {
+    if (signal?.aborted) throw new NntpError('connection', 'aborted');
+    this.streamingCalls++;
+    const behavior = this.behaviors.get(segment.messageId) ?? {
+      body: Buffer.from('streaming-body'),
+    };
+    const attempt = await createAttempt();
+    onWireStart?.();
+    behavior.started?.resolve();
+    try {
+      await behavior.gate;
+      if (behavior.error) throw behavior.error;
+      await writeBody(attempt.sink, behavior.body);
+      return {
+        value: attempt.value,
+        metadata: {
+          byteRange: [0, behavior.body.length],
+          fileSize: behavior.body.length,
+          totalParts: 1,
+          name: 'streaming.bin',
+          size: behavior.body.length,
+        },
+      };
+    } catch (error) {
+      const failure =
+        error instanceof Error ? error : new Error('fake segment fetch failed');
+      attempt.sink.fail(failure);
+      await attempt.dispose(failure);
+      throw failure;
+    }
+  }
+
+  async fetchHead(
+    segment: NzbSegmentRef,
+    _nzbHash: string,
+    _priority: CommandPriority,
+    want: number,
+    onWireStart?: () => void
+  ): Promise<SegmentHeadData> {
+    onWireStart?.();
+    const body = this.behaviors.get(segment.messageId)?.body ?? Buffer.alloc(0);
+    return { head: Buffer.from(body.subarray(0, want)), size: body.length };
+  }
+
+  statSegment(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+
+  statSegmentDetailed(): Promise<StatDetail> {
+    return Promise.resolve({ present: true, answered: true });
+  }
+
+  probeBodyOnProvider(): Promise<'ok'> {
+    return Promise.resolve('ok');
+  }
+
+  providerIds(): string[] {
+    return [];
+  }
+
+  info(): ProviderPoolInfo[] {
+    return [];
+  }
+
+  purgeStaleIdles(): void {}
+
+  close(): void {
+    this.closed = true;
+  }
+}
+
+class FailingSpoolManager extends SpoolManager {
+  constructor(options: SpoolManagerOptions) {
+    super(options);
+  }
+
+  override createArtifact(
+    _options: CreateSpoolArtifactOptions
+  ): Promise<GrowingSpoolArtifact> {
+    return Promise.reject(
+      new UsenetSpoolError(
+        'USENET_SPOOL_IO',
+        'Synthetic spool creation failure'
+      )
+    );
+  }
+}
+
+class CountingSpoolManager extends SpoolManager {
+  disposeCalls = 0;
+
+  override async createArtifact(
+    options: CreateSpoolArtifactOptions
+  ): Promise<GrowingSpoolArtifact> {
+    const artifact = await super.createArtifact(options);
+    const dispose = artifact.dispose.bind(artifact);
+    artifact.dispose = () => {
+      this.disposeCalls++;
+      return dispose();
+    };
+    return artifact;
+  }
+}
+
+async function writeBody(
+  sink: BackpressuredByteSink,
+  body: Buffer
+): Promise<void> {
+  const chunkBytes = 16 * KIBIBYTE_BYTES;
+  for (let offset = 0; offset < body.length; offset += chunkBytes) {
+    const chunk = Buffer.from(body.subarray(offset, offset + chunkBytes));
+    if (!sink.write(chunk)) {
+      await new Promise<void>((resolve) => sink.onceDrain(resolve));
+    }
+  }
+  await sink.end();
+}
+
+function spoolingPlan(): SegmentSpoolingPlan {
+  return {
+    memoryBudgetBytes: MEBIBYTE_BYTES,
+    perStreamBufferBytes: 512 * KIBIBYTE_BYTES,
+    spoolBytes: 16 * MEBIBYTE_BYTES,
+    minFreeDiskBytes: 0,
+    decoderChunkBytes: 64 * KIBIBYTE_BYTES,
+    writerQueueBytes: 128 * KIBIBYTE_BYTES,
+    readerHighWaterMarkBytes: 64 * KIBIBYTE_BYTES,
+    perDownloadBaseLeaseBytes: 128 * KIBIBYTE_BYTES,
+    maxOpenSpoolFiles: 16,
+    orphanTtlMs: 60_000,
+  };
+}
+
+interface HarnessOptions {
+  readonly maxConcurrentDownloads?: number;
+  readonly memoryBudget?: ByteBudget;
+  readonly spoolManager?: SpoolManager;
+}
+
+async function createHarness(
+  context: TestContext,
+  fetcher: FakeSegmentFetcher,
+  options: HarnessOptions = {}
+): Promise<{
+  readonly pool: MultiProviderPool;
+  readonly runtime: SegmentSpoolingRuntime;
+  readonly cache: SegmentCache;
+  readonly cacheRoot: string;
+}> {
+  const cacheRoot = await mkdtemp(path.join(tmpdir(), 'artifact-fetch-'));
+  const plan = spoolingPlan();
+  const runtime = new SegmentSpoolingRuntime({
+    plan,
+    engineId: 'artifact-fetch-test',
+    cacheRoot,
+    memoryBudget: options.memoryBudget,
+    spoolManager: options.spoolManager,
+  });
+  const cache = new SegmentCache({ arenaBytes: 2 * MEBIBYTE_BYTES });
+  const engineOptions: EngineOptions = {
+    ...DEFAULT_ENGINE_OPTIONS,
+    streamingMode: 'segment_spooling',
+    maxConcurrentDownloads: options.maxConcurrentDownloads ?? 4,
+  };
+  const pool = new MultiProviderPool(
+    [],
+    engineOptions,
+    cache,
+    new StatsAccumulator(),
+    { fetcher, spooling: runtime }
+  );
+  context.after(async () => {
+    pool.close();
+    await Promise.allSettled([runtime.close(), cache.close()]);
+    await rm(cacheRoot, { recursive: true, force: true });
+  });
+  return { pool, runtime, cache, cacheRoot };
+}
+
+async function readArtifact(artifact: SegmentArtifact): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of artifact.createReadStream()) {
+    assert(Buffer.isBuffer(chunk));
+    chunks.push(chunk);
+  }
+  await artifact.release();
+  return Buffer.concat(chunks);
+}
+
+test('fetchSegmentArtifact single-flights one network fetch into independently releasable handles', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const started = Promise.withResolvers<void>();
+  const gate = Promise.withResolvers<void>();
+  const body = Buffer.alloc(70 * KIBIBYTE_BYTES);
+  for (let index = 0; index < body.length; index++) body[index] = index % 251;
+  fetcher.behaviors.set('shared', { body, gate: gate.promise, started });
+  const { pool, runtime, cache } = await createHarness(context, fetcher);
+
+  const firstPromise = pool.fetchSegmentArtifact(
+    { messageId: 'shared', bytes: body.length },
+    'nzb',
+    undefined
+  );
+  const secondPromise = pool.fetchSegmentArtifact(
+    { messageId: 'shared', bytes: body.length },
+    'nzb',
+    undefined
+  );
+  await started.promise;
+  assert.equal(fetcher.streamingCalls, 1);
+  gate.resolve();
+
+  const [first, second] = await Promise.all([firstPromise, secondPromise]);
+  assert.notEqual(first, second);
+  assert.equal(first.storage, 'spool');
+  assert.deepEqual(
+    await Promise.all([readArtifact(first), readArtifact(second)]),
+    [body, body]
+  );
+  assert.equal(runtime.spoolManager.stats().artifacts, 0);
+  assert.equal(runtime.spoolManager.stats().budget.reservedBytes, 0);
+  assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+  assert.equal(cache.stats().misses, 0, 'spooling path must not call getAsync');
+  assert.equal(fetcher.bufferingCalls, 0);
+});
+
+test('one artifact waiter may abort while another receives the completed fetch', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const started = Promise.withResolvers<void>();
+  const gate = Promise.withResolvers<void>();
+  const body = Buffer.from('surviving waiter');
+  fetcher.behaviors.set('partial-abort', {
+    body,
+    gate: gate.promise,
+    started,
+  });
+  const { pool } = await createHarness(context, fetcher);
+  const aborter = new AbortController();
+
+  const abandoned = pool.fetchSegmentArtifact(
+    { messageId: 'partial-abort' },
+    'nzb',
+    aborter.signal
+  );
+  const surviving = pool.fetchSegmentArtifact(
+    { messageId: 'partial-abort' },
+    'nzb',
+    undefined
+  );
+  await started.promise;
+  aborter.abort();
+  await assert.rejects(abandoned, (error: unknown) => {
+    assert(error instanceof NntpError);
+    assert.equal(error.message, 'aborted');
+    return true;
+  });
+  assert.equal(getEventListeners(aborter.signal, 'abort').length, 0);
+  gate.resolve();
+  assert.deepEqual(await readArtifact(await surviving), body);
+  assert.equal(fetcher.streamingCalls, 1);
+});
+
+test('an on-wire flight with no remaining waiters completes and disposes consistently', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const started = Promise.withResolvers<void>();
+  const gate = Promise.withResolvers<void>();
+  fetcher.behaviors.set('on-wire-abort', {
+    body: Buffer.from('completed without a waiter'),
+    gate: gate.promise,
+    started,
+  });
+  const { pool, runtime } = await createHarness(context, fetcher);
+  const controller = new AbortController();
+  const abandoned = pool.fetchSegmentArtifact(
+    { messageId: 'on-wire-abort' },
+    'nzb',
+    controller.signal
+  );
+  await started.promise;
+  controller.abort();
+  await assert.rejects(abandoned, { name: 'NntpError' });
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+  gate.resolve();
+
+  const completeBudget = await runtime.memoryBudget.acquire(
+    spoolingPlan().memoryBudgetBytes
+  );
+  assert.equal(fetcher.streamingCalls, 1);
+  assert.equal(runtime.spoolManager.stats().artifacts, 0);
+  assert.equal(runtime.spoolManager.stats().budget.reservedBytes, 0);
+  completeBudget.release();
+});
+
+test('the last abort cancels artifact work before its global semaphore grant', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const blockerStarted = Promise.withResolvers<void>();
+  const blockerGate = Promise.withResolvers<void>();
+  fetcher.behaviors.set('blocker', {
+    body: Buffer.from('blocker'),
+    gate: blockerGate.promise,
+    started: blockerStarted,
+  });
+  fetcher.behaviors.set('queued', { body: Buffer.from('must not fetch') });
+  const { pool, runtime } = await createHarness(context, fetcher, {
+    maxConcurrentDownloads: 1,
+  });
+
+  const blocker = pool.fetchSegmentArtifact(
+    { messageId: 'blocker' },
+    'nzb',
+    undefined
+  );
+  await blockerStarted.promise;
+  const firstAbort = new AbortController();
+  const secondAbort = new AbortController();
+  const first = pool.fetchSegmentArtifact(
+    { messageId: 'queued' },
+    'nzb',
+    firstAbort.signal
+  );
+  const second = pool.fetchSegmentArtifact(
+    { messageId: 'queued' },
+    'nzb',
+    secondAbort.signal
+  );
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(pool.poolInfo().globalDownloadsWaiting, 1);
+  firstAbort.abort();
+  secondAbort.abort();
+  await Promise.all([
+    assert.rejects(first, { name: 'NntpError' }),
+    assert.rejects(second, { name: 'NntpError' }),
+  ]);
+  assert.equal(getEventListeners(firstAbort.signal, 'abort').length, 0);
+  assert.equal(getEventListeners(secondAbort.signal, 'abort').length, 0);
+  const remainingMemory = await runtime.memoryBudget.acquire(
+    spoolingPlan().memoryBudgetBytes - spoolingPlan().perDownloadBaseLeaseBytes
+  );
+  remainingMemory.release();
+  assert.equal(pool.poolInfo().globalDownloadsWaiting, 0);
+  assert.equal(fetcher.streamingCalls, 1);
+  assert.equal(runtime.memoryBudget.stats().usedBytes, 128 * KIBIBYTE_BYTES);
+
+  blockerGate.resolve();
+  await (await blocker).release();
+  assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+});
+
+test('definitive misses and decode failures dispose partial spools and populate the negative cache', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  fetcher.behaviors.set('missing', {
+    body: Buffer.alloc(0),
+    error: new ArticleNotFoundError('missing everywhere', {
+      messageId: 'missing',
+      allProviders: true,
+    }),
+  });
+  fetcher.behaviors.set('undecodable', {
+    body: Buffer.alloc(0),
+    error: new YencDecodeError(
+      'no_end_found',
+      'synthetic terminal decode failure',
+      { terminal: true }
+    ),
+  });
+  const { pool, runtime } = await createHarness(context, fetcher);
+
+  await assert.rejects(
+    pool.fetchSegmentArtifact({ messageId: 'missing' }, 'nzb', undefined),
+    ArticleNotFoundError
+  );
+  await assert.rejects(
+    pool.fetchSegmentArtifact({ messageId: 'missing' }, 'nzb', undefined),
+    ArticleNotFoundError
+  );
+  await assert.rejects(
+    pool.fetchSegmentArtifact({ messageId: 'undecodable' }, 'nzb', undefined),
+    YencDecodeError
+  );
+  await assert.rejects(
+    pool.fetchSegmentArtifact({ messageId: 'undecodable' }, 'nzb', undefined),
+    YencDecodeError
+  );
+
+  assert.equal(fetcher.streamingCalls, 2);
+  assert.equal(runtime.spoolManager.stats().artifacts, 0);
+  assert.equal(runtime.spoolManager.stats().budget.reservedBytes, 0);
+  assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+});
+
+test('spool and memory-budget failures leave every resource owner empty', async (context) => {
+  await context.test('spool creation failure', async (subtest) => {
+    const fetcher = new FakeSegmentFetcher();
+    fetcher.behaviors.set('spool-failure', { body: Buffer.from('body') });
+    const cacheRoot = await mkdtemp(path.join(tmpdir(), 'failing-spool-'));
+    const failing = new FailingSpoolManager({
+      plan: spoolingPlan(),
+      engineId: 'failing-spool',
+      cacheRoot,
+    });
+    subtest.after(async () => {
+      await Promise.allSettled([failing.close()]);
+      await rm(cacheRoot, { recursive: true, force: true });
+    });
+    const { pool, runtime } = await createHarness(subtest, fetcher, {
+      spoolManager: failing,
+    });
+    await assert.rejects(
+      pool.fetchSegmentArtifact(
+        { messageId: 'spool-failure' },
+        'nzb',
+        undefined
+      ),
+      (error: unknown) => {
+        assert(error instanceof UsenetSpoolError);
+        assert.equal(error.code, 'USENET_SPOOL_IO');
+        return true;
+      }
+    );
+    assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+    assert.equal(runtime.spoolManager.stats().artifacts, 0);
+  });
+
+  await context.test('oversized base memory lease', async (subtest) => {
+    const fetcher = new FakeSegmentFetcher();
+    const { pool, runtime } = await createHarness(subtest, fetcher, {
+      memoryBudget: new ByteBudget(1),
+    });
+    await assert.rejects(
+      pool.fetchSegmentArtifact(
+        { messageId: 'budget-failure' },
+        'nzb',
+        undefined
+      ),
+      (error: unknown) => {
+        assert(error instanceof UsenetSpoolError);
+        assert.equal(error.code, 'USENET_MEMORY_BUDGET');
+        return true;
+      }
+    );
+    assert.equal(fetcher.streamingCalls, 0);
+    assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+    assert.equal(runtime.spoolManager.stats().artifacts, 0);
+  });
+
+  await context.test('oversized initial disk reservation', async (subtest) => {
+    const fetcher = new FakeSegmentFetcher();
+    const { pool, runtime } = await createHarness(subtest, fetcher);
+    await assert.rejects(
+      pool.fetchSegmentArtifact(
+        {
+          messageId: 'disk-budget-failure',
+          bytes: spoolingPlan().spoolBytes + 1,
+        },
+        'nzb',
+        undefined
+      ),
+      (error: unknown) => {
+        assert(error instanceof UsenetSpoolError);
+        assert.equal(error.code, 'USENET_SPOOL_CAPACITY');
+        return true;
+      }
+    );
+    assert.equal(fetcher.streamingCalls, 1);
+    assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+    assert.equal(runtime.spoolManager.stats().artifacts, 0);
+    assert.equal(runtime.spoolManager.stats().budget.reservedBytes, 0);
+  });
+});
+
+test('the final independent release disposes a shared spool exactly once', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  fetcher.behaviors.set('release-once', { body: Buffer.from('release-once') });
+  const cacheRoot = await mkdtemp(path.join(tmpdir(), 'counting-spool-'));
+  const manager = new CountingSpoolManager({
+    plan: spoolingPlan(),
+    engineId: 'counting-spool',
+    cacheRoot,
+  });
+  context.after(async () => {
+    await Promise.allSettled([manager.close()]);
+    await rm(cacheRoot, { recursive: true, force: true });
+  });
+  const { pool, runtime } = await createHarness(context, fetcher, {
+    spoolManager: manager,
+  });
+  const [first, second] = await Promise.all([
+    pool.fetchSegmentArtifact({ messageId: 'release-once' }, 'nzb', undefined),
+    pool.fetchSegmentArtifact({ messageId: 'release-once' }, 'nzb', undefined),
+  ]);
+  assert.equal(runtime.spoolManager.stats().artifacts, 1);
+  await first.release();
+  await first.release();
+  assert.equal(runtime.spoolManager.stats().artifacts, 1);
+  await second.release();
+  await second.release();
+  assert.equal(manager.disposeCalls, 1);
+  assert.equal(runtime.spoolManager.stats().artifacts, 0);
+  assert.equal(runtime.spoolManager.stats().budget.reservedBytes, 0);
+});
+
+test('arena artifacts and all existing buffering APIs remain on their original paths', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  fetcher.behaviors.set('buffered', { body: Buffer.from('buffered-result') });
+  const { pool, cache } = await createHarness(context, fetcher);
+  const lease = cache.arena.checkout(MEBIBYTE_BYTES);
+  assert(lease);
+  const resident = Buffer.from('arena-result');
+  resident.copy(lease.slot);
+  cache.arena.commit(lease, 'arena-hit', {
+    body: lease.slot.subarray(0, resident.length),
+    size: resident.length,
+  });
+
+  const arena = await pool.fetchSegmentArtifact(
+    { messageId: 'arena-hit' },
+    'nzb',
+    undefined
+  );
+  assert.equal(arena.storage, 'arena');
+  assert.deepEqual(await readArtifact(arena), resident);
+  const buffered = await pool.fetchSegment(
+    { messageId: 'buffered' },
+    'nzb',
+    undefined
+  );
+  assert.deepEqual(buffered.body, Buffer.from('buffered-result'));
+  assert.equal(fetcher.streamingCalls, 0);
+  assert.equal(fetcher.bufferingCalls, 1);
+});
