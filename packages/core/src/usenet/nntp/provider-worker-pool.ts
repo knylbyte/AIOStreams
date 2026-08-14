@@ -27,6 +27,20 @@ export interface WorkerPoolOptions extends ConnectionOptions {
   onDialError?: (err: unknown) => void;
 }
 
+/** Cancel handle for the pool's single periodic maintenance task. */
+export interface WorkerPoolScheduledTask {
+  cancel(): void;
+  unref?(): void;
+}
+
+/**
+ * Narrow scheduler seam for deterministic keepalive tests. Production uses one
+ * native interval; implementations must not schedule overlapping callbacks.
+ */
+export interface WorkerPoolScheduler {
+  every(intervalMs: number, callback: () => void): WorkerPoolScheduledTask;
+}
+
 /**
  * One unit of work submitted to a provider: the `run` closure performs the
  * actual `BODY`/`STAT` (and decode) on a ready connection. The worker pool owns
@@ -55,10 +69,15 @@ export interface WorkRequest<T = unknown> {
    */
   explicitTransferStart?: boolean;
   /**
-   * Cancels the request while it is still queued; once on a connection the
-   * transfer completes normally.
+   * Cancels while queued or assigned pre-wire; once its provider command has
+   * entered the connection FIFO, the transfer completes normally.
    */
   signal?: AbortSignal;
+}
+
+interface QueuedWorkRequest<T = unknown> extends WorkRequest<T> {
+  /** Installed while assigned but before the provider command is enqueued. */
+  cancelPreWire?: (error: NntpError) => boolean;
 }
 
 /** A single connection slot owned by the pool (lazily dialed). */
@@ -70,10 +89,15 @@ interface Slot {
   failures: number;
   /**
    * Requests dequeued onto this connection, including local preparation and
-   * commands already present in `conn.inFlight`. This is the sole pipeline
-   * occupancy counter; `conn.inFlight` must never be added to it.
+   * commands already present in `conn.inFlight`. Together with `maintenance`
+   * this is the sole logical pipeline occupancy; `conn.inFlight` must never be
+   * added to either counter.
    */
   assigned: number;
+  /** Active provider-maintenance commands occupying this connection's FIFO. */
+  maintenance: number;
+  /** Idempotent release for the one possible active maintenance command. */
+  releaseMaintenance?: () => void;
   /**
    * Assignment-order fence for commands not yet appended to the FIFO. Its
    * length is hard-bounded by this slot's `pipelineDepth`.
@@ -96,8 +120,11 @@ export interface WorkExecution {
 interface CommandTurn {
   ready: boolean;
   completed: boolean;
+  failure?: Error;
   start?: () => void;
+  cancel?: (error: NntpError) => boolean;
   resolve?: () => void;
+  reject?: (error: Error) => void;
   signal?: AbortSignal;
   onAbort?: () => void;
 }
@@ -116,6 +143,16 @@ const AUTH_RECOVERY_BASE_MS = 60_000;
 const AUTH_RECOVERY_FACTOR = 5;
 const AUTH_RECOVERY_CAP_MS = 5 * 60_000;
 
+const SYSTEM_WORKER_POOL_SCHEDULER: WorkerPoolScheduler = {
+  every(intervalMs, callback) {
+    const timer = setInterval(callback, intervalMs);
+    return {
+      cancel: () => clearInterval(timer),
+      unref: () => timer.unref?.(),
+    };
+  },
+};
+
 /**
  * Per-provider pool of long-lived **worker connections** that pull from priority
  * and normal request queues (rather than callers leasing a connection per request).
@@ -125,15 +162,15 @@ const AUTH_RECOVERY_CAP_MS = 5 * 60_000;
  */
 export class ProviderWorkerPool {
   private slots: Slot[];
-  private prioQ: WorkRequest[] = [];
-  private normalQ: WorkRequest[] = [];
+  private prioQ: QueuedWorkRequest[] = [];
+  private normalQ: QueuedWorkRequest[] = [];
   private state: ProviderState;
   private closed = false;
 
   /** Adaptive connection ceiling (≤ maxConnections); lowered on a limit hit. */
   private allowed: number;
   private throttleTimer?: ReturnType<typeof setInterval>;
-  private keepaliveTimer?: ReturnType<typeof setInterval>;
+  private keepaliveTask?: WorkerPoolScheduledTask;
   private trippedUntil = 0;
 
   private lastDialOkAt = 0;
@@ -162,7 +199,8 @@ export class ProviderWorkerPool {
 
   constructor(
     readonly config: ProviderConfig,
-    private opts: WorkerPoolOptions
+    private opts: WorkerPoolOptions,
+    scheduler: WorkerPoolScheduler = SYSTEM_WORKER_POOL_SCHEDULER
   ) {
     const clamped = Math.min(1, Math.max(0, opts.streamingPriority));
     this.lowOdds = Math.round((1 - clamped) * 100);
@@ -173,11 +211,12 @@ export class ProviderWorkerPool {
       connecting: false,
       failures: 0,
       assigned: 0,
+      maintenance: 0,
       commandTurns: [],
     }));
     this.state = config.enabled === false ? 'disabled' : 'online';
-    this.keepaliveTimer = setInterval(() => this.keepalive(), KEEPALIVE_MS);
-    this.keepaliveTimer.unref?.();
+    this.keepaliveTask = scheduler.every(KEEPALIVE_MS, () => this.keepalive());
+    this.keepaliveTask.unref?.();
   }
 
   get id(): string {
@@ -205,11 +244,11 @@ export class ProviderWorkerPool {
   /** Total pipeline slots free right now (used for least-busy provider ordering). */
   get freeSlots(): number {
     if (this.state !== 'online') return 0;
-    return Math.max(0, this.allowed * this.depth - this.assignedTotal());
+    return Math.max(0, this.allowed * this.depth - this.occupancyTotal());
   }
 
   get inFlight(): number {
-    return this.assignedTotal();
+    return this.occupancyTotal();
   }
   /**
    * Mean time to complete a whole article fetch
@@ -271,7 +310,7 @@ export class ProviderWorkerPool {
         );
         return;
       }
-      const full: WorkRequest<T> = {
+      const full: QueuedWorkRequest<T> = {
         ...req,
         resolve,
         reject,
@@ -279,15 +318,17 @@ export class ProviderWorkerPool {
       if (req.signal) {
         const signal = req.signal;
         const onAbort = (): void => {
+          const abortError = new NntpError('connection', 'aborted', {
+            provider: this.label,
+          });
           for (const q of [this.prioQ, this.normalQ]) {
-            const i = q.indexOf(full as WorkRequest);
+            const i = q.indexOf(full as QueuedWorkRequest);
             if (i === -1) continue;
             q.splice(i, 1);
-            full.reject(
-              new NntpError('connection', 'aborted', { provider: this.label })
-            );
+            full.reject(abortError);
             return;
           }
+          full.cancelPreWire?.(abortError);
         };
         signal.addEventListener('abort', onAbort);
         // Detach on settle: stream-lifetime signals outlive many requests, and
@@ -303,7 +344,7 @@ export class ProviderWorkerPool {
         };
       }
       (req.priority === CommandPriority.High ? this.prioQ : this.normalQ).push(
-        full as WorkRequest
+        full as QueuedWorkRequest
       );
       this.dispatch();
     });
@@ -342,7 +383,7 @@ export class ProviderWorkerPool {
             });
           }
           await execution.waitForCommandTurn(req.signal);
-          if (req.signal?.aborted) {
+          if (this.closed || req.signal?.aborted) {
             throw new NntpError('connection', 'aborted', {
               provider: this.label,
             });
@@ -383,17 +424,26 @@ export class ProviderWorkerPool {
     return n;
   }
 
-  private assignedTotal(): number {
+  private slotOccupancy(slot: Slot): number {
+    return slot.assigned + slot.maintenance;
+  }
+
+  /**
+   * Logical provider-pipeline occupancy. Provider assignments and maintenance
+   * commands are disjoint owners of slots; `conn.inFlight` is observational
+   * only and must never be added to this value.
+   */
+  private occupancyTotal(): number {
     let n = 0;
-    for (const s of this.slots) n += s.assigned;
+    for (const slot of this.slots) n += this.slotOccupancy(slot);
     return n;
   }
 
   /**
    * Peek the next dispatchable request and dequeue it.
    */
-  private pullFor(): WorkRequest | undefined {
-    const fits = (q: WorkRequest[]): boolean => q.length > 0;
+  private pullFor(): QueuedWorkRequest | undefined {
+    const fits = (q: QueuedWorkRequest[]): boolean => q.length > 0;
     const hasHigh = fits(this.prioQ);
     const hasLow = fits(this.normalQ);
     // When both classes have compatible work, divert `1 - streamingPriority` of
@@ -441,7 +491,10 @@ export class ProviderWorkerPool {
         slot.conn = null;
         continue;
       }
-      while (slot.assigned < this.depth && slot.conn.canAccept(this.depth)) {
+      while (
+        this.slotOccupancy(slot) < this.depth &&
+        slot.conn.canAccept(this.depth)
+      ) {
         const req = this.pullFor();
         if (!req) break;
         slot.assigned++;
@@ -457,7 +510,7 @@ export class ProviderWorkerPool {
     //    concurrency.
     const queued = this.prioQ.length + this.normalQ.length;
     if (queued === 0) return;
-    const demand = this.assignedTotal() + queued;
+    const demand = this.occupancyTotal() + queued;
     const wantConns = Math.min(this.allowed, Math.ceil(demand / this.depth));
     let toDial = wantConns - this.openConns();
     // Recovering from `auth_failed` (cooldown elapsed): dial only a single probe
@@ -549,36 +602,85 @@ export class ProviderWorkerPool {
     setTimeout(() => this.dispatch(), DIAL_BACKOFF_MS).unref?.();
   }
 
-  private fireTransfer(slot: Slot, req: WorkRequest): void {
+  private fireTransfer(slot: Slot, req: QueuedWorkRequest): void {
     const conn = slot.conn!;
     const turn: CommandTurn = {
       ready: slot.commandTurns.length === 0,
       completed: false,
     };
     slot.commandTurns.push(turn);
+    if (slot.commandTurns.length > this.depth) {
+      throw new Error('provider command-turn accounting overflow');
+    }
     let started: number | undefined;
+    let commandEnqueued = false;
     let assignmentReleased = false;
     const releaseAssignment = (): void => {
       if (assignmentReleased) return;
       assignmentReleased = true;
       this.completeCommandTurn(slot, turn);
+      req.cancelPreWire = undefined;
       slot.assigned--;
       if (slot.assigned < 0) {
         throw new Error('provider worker assignment accounting underflow');
       }
     };
+    const transfer = Promise.withResolvers<{
+      value: unknown;
+      bytes: number;
+    }>();
+    let transferSettled = false;
+    const settleTransfer = (
+      outcome:
+        | {
+            readonly ok: true;
+            readonly value: { value: unknown; bytes: number };
+          }
+        | { readonly ok: false; readonly error: unknown }
+    ): void => {
+      if (transferSettled) return;
+      transferSettled = true;
+      req.cancelPreWire = undefined;
+      turn.cancel = undefined;
+      if (outcome.ok) transfer.resolve(outcome.value);
+      else transfer.reject(outcome.error);
+    };
+    const cancelPreWire = (error: NntpError): boolean => {
+      if (commandEnqueued || transferSettled) return false;
+      turn.start = undefined;
+      this.completeCommandTurn(slot, turn, error);
+      settleTransfer({ ok: false, error });
+      return true;
+    };
+    req.cancelPreWire = cancelPreWire;
+    turn.cancel = cancelPreWire;
     const execution: WorkExecution = {
       waitForCommandTurn: (signal) => this.waitForCommandTurn(turn, signal),
       markTransferStarted: () => {
+        if (commandEnqueued || transferSettled) return;
+        commandEnqueued = true;
+        req.cancelPreWire = undefined;
+        turn.cancel = undefined;
         started ??= Date.now();
         this.completeCommandTurn(slot, turn);
       },
     };
-    const invoke = (): Promise<{ value: unknown; bytes: number }> => {
+    const invoke = (): void => {
+      turn.start = undefined;
+      if (transferSettled) return;
+      if (this.closed) {
+        cancelPreWire(
+          new NntpError('no_providers', 'pool closed', {
+            provider: this.label,
+          })
+        );
+        return;
+      }
       if (req.signal?.aborted) {
-        return Promise.reject(
+        cancelPreWire(
           new NntpError('connection', 'aborted', { provider: this.label })
         );
+        return;
       }
       try {
         if (!req.explicitTransferStart) started = Date.now();
@@ -587,26 +689,20 @@ export class ProviderWorkerPool {
         // before returning its Promise. Prepared work marks from the exact
         // connection enqueue callback instead.
         if (!req.explicitTransferStart) execution.markTransferStarted();
-        return pending;
+        pending.then(
+          (value) => settleTransfer({ ok: true, value }),
+          (error: unknown) => settleTransfer({ ok: false, error })
+        );
       } catch (error) {
-        return Promise.reject(error);
+        settleTransfer({ ok: false, error });
       }
     };
-    let transfer: Promise<{ value: unknown; bytes: number }>;
     if (req.explicitTransferStart || turn.ready) {
-      transfer = invoke();
+      invoke();
     } else {
-      const deferred = Promise.withResolvers<{
-        value: unknown;
-        bytes: number;
-      }>();
-      turn.start = () => {
-        turn.start = undefined;
-        invoke().then(deferred.resolve, deferred.reject);
-      };
-      transfer = deferred.promise;
+      turn.start = invoke;
     }
-    transfer.then(
+    transfer.promise.then(
       (res) => {
         const durationMs = started === undefined ? 0 : Date.now() - started;
         releaseAssignment();
@@ -632,6 +728,8 @@ export class ProviderWorkerPool {
     turn: CommandTurn,
     signal: AbortSignal | undefined
   ): Promise<void> {
+    if (turn.failure) return Promise.reject(turn.failure);
+    if (turn.completed) return Promise.resolve();
     if (signal?.aborted) {
       return Promise.reject(
         new NntpError('connection', 'aborted', { provider: this.label })
@@ -640,16 +738,16 @@ export class ProviderWorkerPool {
     if (turn.ready) return Promise.resolve();
     const deferred = Promise.withResolvers<void>();
     turn.resolve = deferred.resolve;
+    turn.reject = deferred.reject;
     if (signal) {
       const onAbort = (): void => {
         if (turn.onAbort !== onAbort) return;
-        turn.resolve = undefined;
-        turn.signal = undefined;
-        turn.onAbort = undefined;
-        signal.removeEventListener('abort', onAbort);
-        deferred.reject(
-          new NntpError('connection', 'aborted', { provider: this.label })
-        );
+        const error = new NntpError('connection', 'aborted', {
+          provider: this.label,
+        });
+        if (turn.cancel?.(error)) return;
+        this.clearCommandTurnWaiter(turn);
+        deferred.reject(error);
       };
       turn.signal = signal;
       turn.onAbort = onAbort;
@@ -658,27 +756,39 @@ export class ProviderWorkerPool {
     return deferred.promise;
   }
 
-  /** Advance the bounded assignment-order fence exactly once. */
-  private completeCommandTurn(slot: Slot, turn: CommandTurn): void {
-    if (turn.completed) return;
-    turn.completed = true;
+  private clearCommandTurnWaiter(turn: CommandTurn): void {
     if (turn.signal && turn.onAbort) {
       turn.signal.removeEventListener('abort', turn.onAbort);
     }
     turn.signal = undefined;
     turn.onAbort = undefined;
     turn.resolve = undefined;
-    while (slot.commandTurns[0]?.completed) slot.commandTurns.shift();
+    turn.reject = undefined;
+  }
+
+  /** Remove one bounded assignment-order turn and advance its successor. */
+  private completeCommandTurn(
+    slot: Slot,
+    turn: CommandTurn,
+    failure?: Error
+  ): void {
+    if (turn.completed) return;
+    turn.completed = true;
+    turn.failure = failure;
+    turn.start = undefined;
+    turn.cancel = undefined;
+    const reject = turn.reject;
+    this.clearCommandTurnWaiter(turn);
+    const index = slot.commandTurns.indexOf(turn);
+    if (index === -1) return;
+    slot.commandTurns.splice(index, 1);
+    if (failure) reject?.(failure);
+    if (index !== 0) return;
     const next = slot.commandTurns[0];
     if (!next || next.ready) return;
     next.ready = true;
     const resolve = next.resolve;
-    next.resolve = undefined;
-    if (next.signal && next.onAbort) {
-      next.signal.removeEventListener('abort', next.onAbort);
-    }
-    next.signal = undefined;
-    next.onAbort = undefined;
+    this.clearCommandTurnWaiter(next);
     resolve?.();
     next.start?.();
   }
@@ -713,7 +823,20 @@ export class ProviderWorkerPool {
       this.dispatch();
       return;
     }
-    // Local preparation and command-turn aborts leave a usable provider
+    // A caller abort before command enqueue is local cancellation for direct
+    // and prepared work alike. It leaves a usable provider connection healthy.
+    if (
+      !transferStarted &&
+      err instanceof NntpError &&
+      err.kind === 'connection' &&
+      err.message === 'aborted' &&
+      slot.conn?.isUsable
+    ) {
+      req.reject(err);
+      this.dispatch();
+      return;
+    }
+    // Other local preparation/turn failures also leave a usable provider
     // connection untouched and must not contribute to its circuit breaker.
     if (req.explicitTransferStart && !transferStarted && slot.conn?.isUsable) {
       req.reject(err);
@@ -822,13 +945,34 @@ export class ProviderWorkerPool {
     if (this.hasWork()) this.dispatch();
     for (const slot of this.slots) {
       const conn = slot.conn;
-      if (!conn || !conn.isUsable || slot.assigned > 0) continue;
+      if (!conn || !conn.isUsable || this.slotOccupancy(slot) > 0) continue;
+      slot.maintenance++;
+      if (this.slotOccupancy(slot) > this.depth) {
+        throw new Error('provider maintenance accounting overflow');
+      }
+      let released = false;
+      const releaseMaintenance = (): void => {
+        if (released) return;
+        released = true;
+        if (slot.releaseMaintenance === releaseMaintenance) {
+          slot.releaseMaintenance = undefined;
+        }
+        slot.maintenance--;
+        if (slot.maintenance < 0) {
+          throw new Error('provider maintenance accounting underflow');
+        }
+      };
+      slot.releaseMaintenance = releaseMaintenance;
       conn
         .date(undefined, this.opts.idleConnectionMs)
         .catch(() => {
+          conn.destroy();
           if (slot.conn === conn) slot.conn = null;
         })
-        .finally(() => this.dispatch());
+        .finally(() => {
+          releaseMaintenance();
+          this.dispatch();
+        });
     }
   }
 
@@ -836,7 +980,11 @@ export class ProviderWorkerPool {
   purgeStaleIdles(): void {
     for (const slot of this.slots) {
       const conn = slot.conn;
-      if (conn && slot.assigned === 0 && (conn.isStale() || !conn.isUsable)) {
+      if (
+        conn &&
+        this.slotOccupancy(slot) === 0 &&
+        (conn.isStale() || !conn.isUsable)
+      ) {
         conn.quit();
         slot.conn = null;
       }
@@ -851,7 +999,7 @@ export class ProviderWorkerPool {
     let acquired = 0;
     for (const s of this.slots) {
       if (s.conn || s.connecting) total++;
-      if (s.assigned > 0) acquired++;
+      if (this.slotOccupancy(s) > 0) acquired++;
     }
     return {
       id: this.config.id,
@@ -874,17 +1022,25 @@ export class ProviderWorkerPool {
   }
 
   close(): void {
+    if (this.closed) return;
     this.closed = true;
     if (this.throttleTimer) clearInterval(this.throttleTimer);
-    if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
+    this.keepaliveTask?.cancel();
     this.throttleTimer = undefined;
-    this.keepaliveTimer = undefined;
+    this.keepaliveTask = undefined;
+    const closeError = new NntpError('no_providers', 'pool closed', {
+      provider: this.label,
+    });
     for (const slot of this.slots) {
+      // Reverse order prevents completing an earlier turn from starting a later
+      // one while shutdown is cancelling the bounded pre-wire set.
+      for (const turn of [...slot.commandTurns].reverse()) {
+        turn.cancel?.(closeError);
+      }
+      slot.releaseMaintenance?.();
       if (slot.conn) slot.conn.quit();
       slot.conn = null;
     }
-    this.failAllQueued(
-      new NntpError('no_providers', 'pool closed', { provider: this.label })
-    );
+    this.failAllQueued(closeError);
   }
 }

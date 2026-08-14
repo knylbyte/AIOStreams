@@ -17,6 +17,12 @@ import type { StatsEvent } from '../stats/types.js';
 import { UsenetSpoolError } from '../spool/errors.js';
 import { NntpError } from './errors.js';
 import {
+  ProviderWorkerPool,
+  type WorkerPoolOptions,
+  type WorkerPoolScheduledTask,
+  type WorkerPoolScheduler,
+} from './provider-worker-pool.js';
+import {
   LocalSegmentFetcher,
   type StatsSink,
   type StreamingSegmentAttempt,
@@ -31,6 +37,7 @@ class AutomaticNntpServer {
     readonly resolve: () => void;
   }[] = [];
   readonly commands: string[] = [];
+  maxPendingResponses = 0;
 
   private constructor(private readonly response: Buffer | undefined) {
     this.server.on('connection', (socket) => {
@@ -47,7 +54,13 @@ class AutomaticNntpServer {
           pending = pending.slice(end + 2);
           this.commands.push(command);
           if (this.response) socket.write(this.response);
-          else this.pendingResponses.push(socket);
+          else {
+            this.pendingResponses.push(socket);
+            this.maxPendingResponses = Math.max(
+              this.maxPendingResponses,
+              this.pendingResponses.length
+            );
+          }
           this.resolveCommandWaiters();
         }
       });
@@ -90,6 +103,12 @@ class AutomaticNntpServer {
     socket.write(response);
   }
 
+  failNext(): void {
+    const socket = this.pendingResponses.shift();
+    assert(socket, 'a command must be pending before its socket is failed');
+    socket.destroy();
+  }
+
   private resolveCommandWaiters(): void {
     for (let index = this.commandWaiters.length - 1; index >= 0; index--) {
       const waiter = this.commandWaiters[index];
@@ -104,6 +123,28 @@ class AutomaticNntpServer {
     await new Promise<void>((resolve, reject) => {
       this.server.close((error) => (error ? reject(error) : resolve()));
     });
+  }
+}
+
+class ControlledWorkerPoolScheduler implements WorkerPoolScheduler {
+  private callback: (() => void) | undefined;
+  private active = false;
+
+  every(_intervalMs: number, callback: () => void): WorkerPoolScheduledTask {
+    assert.equal(this.callback, undefined);
+    this.callback = callback;
+    this.active = true;
+    return {
+      cancel: () => {
+        this.active = false;
+      },
+    };
+  }
+
+  run(): void {
+    assert.equal(this.active, true);
+    assert(this.callback);
+    this.callback();
   }
 }
 
@@ -181,6 +222,56 @@ function provider(
   };
 }
 
+function workerPoolOptions(pipelineDepth: number): WorkerPoolOptions {
+  return {
+    dialTimeoutMs: 1000,
+    idleConnectionMs: 1000,
+    circuitBreakerThreshold: 2,
+    circuitBreakerCooldownMs: 1000,
+    pipelineDepth,
+    streamingPriority: 1,
+  };
+}
+
+async function warmWorkerPool(
+  pool: ProviderWorkerPool,
+  server: AutomaticNntpServer
+): Promise<void> {
+  const warm = pool.submit<boolean>({
+    priority: CommandPriority.High,
+    run: async (conn) => ({
+      value: await conn.stat('warm', undefined, 1000),
+      bytes: 0,
+    }),
+  });
+  await server.waitForCommandCount(1);
+  server.respondNext(Buffer.from('223 1 <warm> article exists\r\n', 'latin1'));
+  await warm;
+}
+
+function submitPreparedBody(
+  pool: ProviderWorkerPool,
+  messageId: string,
+  started: PromiseWithResolvers<void>,
+  gate: PromiseWithResolvers<void>
+): Promise<unknown> {
+  return pool.submitPrepared<Buffer, undefined>({
+    priority: CommandPriority.High,
+    prepare: async () => {
+      started.resolve();
+      await gate.promise;
+      return undefined;
+    },
+    run: async (conn, _prepared, markTransferStarted) => {
+      const pending = conn.body(messageId, undefined, 1000, 5000);
+      markTransferStarted();
+      const value = await pending;
+      return { value, bytes: value.length };
+    },
+    dispose: async () => undefined,
+  });
+}
+
 function articleResponse(name: string, body: Buffer): Buffer {
   return Buffer.concat([
     Buffer.from('222 article follows\r\n', 'latin1'),
@@ -202,6 +293,226 @@ function collectingAttempt(disposals: {
     },
   };
 }
+
+test('depth-one keepalive reserves the only logical pipeline slot', async (context) => {
+  const server = await AutomaticNntpServer.create(context);
+  const scheduler = new ControlledWorkerPoolScheduler();
+  const pool = new ProviderWorkerPool(
+    provider('keepalive-depth-one', server.port, 0, 1),
+    workerPoolOptions(1),
+    scheduler
+  );
+  context.after(() => pool.close());
+  await warmWorkerPool(pool, server);
+
+  scheduler.run();
+  await server.waitForCommandCount(2);
+  assert.equal(server.commands[1], 'DATE');
+
+  const started = Promise.withResolvers<void>();
+  const gate = Promise.withResolvers<void>();
+  let preparationStarted = false;
+  void started.promise.then(() => {
+    preparationStarted = true;
+  });
+  const fetch = submitPreparedBody(pool, 'after-depth-one-date', started, gate);
+  await Promise.resolve();
+
+  assert.equal(preparationStarted, false);
+  assert.equal(pool.inFlight, 1);
+  assert.deepEqual(
+    {
+      freeSlots: pool.info().freeSlots,
+      acquired: pool.info().acquired,
+      idle: pool.info().idle,
+      queued: pool.info().queued,
+    },
+    { freeSlots: 0, acquired: 1, idle: 0, queued: 1 }
+  );
+
+  server.respondNext(Buffer.from('111 20260814120000\r\n', 'latin1'));
+  await started.promise;
+  gate.resolve();
+  await server.waitForCommandCount(3);
+  assert.equal(server.commands[2], 'BODY <after-depth-one-date>');
+  server.respondNext(
+    Buffer.from('222 article follows\r\ndepth-one\r\n.\r\n', 'latin1')
+  );
+  await fetch;
+
+  assert.equal(pool.inFlight, 0);
+  assert.equal(pool.info().freeSlots, 1);
+  assert.equal(pool.info().queued, 0);
+});
+
+test('depth-two keepalive admits only one provider assignment beside DATE', async (context) => {
+  const server = await AutomaticNntpServer.create(context);
+  const scheduler = new ControlledWorkerPoolScheduler();
+  const pool = new ProviderWorkerPool(
+    provider('keepalive-depth-two', server.port, 0, 2),
+    workerPoolOptions(2),
+    scheduler
+  );
+  context.after(() => pool.close());
+  await warmWorkerPool(pool, server);
+
+  scheduler.run();
+  await server.waitForCommandCount(2);
+  const starts: string[] = [];
+  const firstStarted = Promise.withResolvers<void>();
+  const secondStarted = Promise.withResolvers<void>();
+  const firstGate = Promise.withResolvers<void>();
+  const secondGate = Promise.withResolvers<void>();
+  void firstStarted.promise.then(() => starts.push('first'));
+  void secondStarted.promise.then(() => starts.push('second'));
+  const first = submitPreparedBody(
+    pool,
+    'keepalive-first',
+    firstStarted,
+    firstGate
+  );
+  const second = submitPreparedBody(
+    pool,
+    'keepalive-second',
+    secondStarted,
+    secondGate
+  );
+
+  await firstStarted.promise;
+  await Promise.resolve();
+  assert.deepEqual(starts, ['first']);
+  assert.equal(pool.info().freeSlots, 0);
+  assert.equal(pool.info().queued, 1);
+  firstGate.resolve();
+  await server.waitForCommandCount(3);
+  assert.deepEqual(server.commands.slice(1), [
+    'DATE',
+    'BODY <keepalive-first>',
+  ]);
+  assert.equal(server.maxPendingResponses, 2);
+
+  server.respondNext(Buffer.from('111 20260814120000\r\n', 'latin1'));
+  await secondStarted.promise;
+  assert.deepEqual(starts, ['first', 'second']);
+  assert.equal(pool.inFlight, 2);
+  assert.equal(pool.info().freeSlots, 0);
+  secondGate.resolve();
+  await server.waitForCommandCount(4);
+  assert.equal(server.maxPendingResponses, 2);
+  server.respondNext(
+    Buffer.from('222 article follows\r\nfirst\r\n.\r\n', 'latin1')
+  );
+  server.respondNext(
+    Buffer.from('222 article follows\r\nsecond\r\n.\r\n', 'latin1')
+  );
+  await Promise.all([first, second]);
+
+  assert.equal(pool.inFlight, 0);
+  assert.equal(pool.info().freeSlots, 2);
+});
+
+test('keepalive failure releases maintenance occupancy and reconnects queued work', async (context) => {
+  const server = await AutomaticNntpServer.create(context);
+  const scheduler = new ControlledWorkerPoolScheduler();
+  const pool = new ProviderWorkerPool(
+    provider('keepalive-failure', server.port, 0, 1),
+    workerPoolOptions(1),
+    scheduler
+  );
+  context.after(() => pool.close());
+  await warmWorkerPool(pool, server);
+
+  scheduler.run();
+  await server.waitForCommandCount(2);
+  const started = Promise.withResolvers<void>();
+  const gate = Promise.withResolvers<void>();
+  const fetch = submitPreparedBody(pool, 'after-date-failure', started, gate);
+  assert.equal(pool.inFlight, 1);
+  server.failNext();
+
+  await started.promise;
+  gate.resolve();
+  await server.waitForCommandCount(3);
+  assert.equal(server.commands[2], 'BODY <after-date-failure>');
+  server.respondNext(
+    Buffer.from('222 article follows\r\nreconnected\r\n.\r\n', 'latin1')
+  );
+  await fetch;
+
+  assert.equal(pool.inFlight, 0);
+  assert.equal(pool.info().freeSlots, 1);
+  assert.equal(pool.info().tripped, false);
+});
+
+test('pool close releases an active keepalive reservation exactly once', async (context) => {
+  const server = await AutomaticNntpServer.create(context);
+  const scheduler = new ControlledWorkerPoolScheduler();
+  const pool = new ProviderWorkerPool(
+    provider('keepalive-close', server.port, 0, 1),
+    workerPoolOptions(1),
+    scheduler
+  );
+  await warmWorkerPool(pool, server);
+
+  scheduler.run();
+  await server.waitForCommandCount(2);
+  assert.equal(pool.inFlight, 1);
+  pool.close();
+  assert.equal(pool.inFlight, 0);
+  pool.close();
+  assert.equal(pool.inFlight, 0);
+});
+
+test('keepalive occupancy is visible without changing provider service metrics', async (context) => {
+  const server = await AutomaticNntpServer.create(context);
+  const scheduler = new ControlledWorkerPoolScheduler();
+  const pool = new ProviderWorkerPool(
+    provider('keepalive-stats', server.port, 0, 1),
+    workerPoolOptions(1),
+    scheduler
+  );
+  context.after(() => pool.close());
+  await warmWorkerPool(pool, server);
+  pool.recordServiceTime(17);
+  pool.recordThroughput(1000, 10);
+  pool.recordOutcome(true);
+  const baseline = {
+    service: pool.avgServiceTimeMs,
+    throughput: pool.throughput,
+    missRate: pool.missRate,
+  };
+
+  scheduler.run();
+  await server.waitForCommandCount(2);
+  assert.equal(pool.info().acquired, 1);
+  assert.equal(pool.info().idle, 0);
+  assert.equal(pool.info().freeSlots, 0);
+  const afterDate = pool.submit<boolean>({
+    priority: CommandPriority.High,
+    run: async (conn) => ({
+      value: await conn.stat('after-date', undefined, 1000),
+      bytes: 0,
+    }),
+  });
+  server.respondNext(Buffer.from('111 20260814120000\r\n', 'latin1'));
+  await server.waitForCommandCount(3);
+
+  assert.deepEqual(
+    {
+      service: pool.avgServiceTimeMs,
+      throughput: pool.throughput,
+      missRate: pool.missRate,
+    },
+    baseline
+  );
+  assert.equal(pool.info().queued, 0);
+  assert.equal(pool.info().acquired, 1);
+  server.respondNext(
+    Buffer.from('223 2 <after-date> article exists\r\n', 'latin1')
+  );
+  await afterDate;
+  assert.equal(pool.inFlight, 0);
+});
 
 test('streaming SegmentFetcher preserves provider order and 430 failover with fresh attempt ownership', async (context) => {
   const decoded = Buffer.from([0, 1, 2, 3, 42, 61, 127, 128, 200, 254, 255]);
@@ -705,4 +1016,267 @@ test('abort during streaming attempt preparation never sends BODY or leaks the a
   assert.equal(fetcher.info()[0].queued, 0);
   assert.equal(fetcher.info()[0].tripped, false);
   assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+});
+
+test('assigned direct BODY aborts immediately behind slow prepared work', async (context) => {
+  const server = await AutomaticNntpServer.create(context);
+  const fetcher = new LocalSegmentFetcher(
+    [provider('direct-pre-wire-abort', server.port, 0, 2)],
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      circuitBreakerThreshold: 1,
+      dialTimeoutMs: 1000,
+      segmentStallTimeoutMs: 1000,
+      segmentTimeoutMs: 5000,
+    },
+    new NoopStats()
+  );
+  context.after(() => fetcher.close());
+  const slowStarted = Promise.withResolvers<void>();
+  const slowGate = Promise.withResolvers<void>();
+  const disposals = { count: 0 };
+  const slow = fetcher.fetchBodyToSink(
+    { messageId: 'slow-prepared-first' },
+    'nzb-direct-abort',
+    CommandPriority.High,
+    async () => {
+      slowStarted.resolve();
+      await slowGate.promise;
+      return collectingAttempt(disposals);
+    }
+  );
+  await slowStarted.promise;
+
+  const controller = new AbortController();
+  let directOnWire = 0;
+  const direct = fetcher.fetchBody(
+    { messageId: 'aborted-direct-second' },
+    'nzb-direct-abort',
+    CommandPriority.High,
+    undefined,
+    controller.signal,
+    () => {
+      directOnWire++;
+    }
+  );
+  assert.equal(fetcher.info()[0].freeSlots, 0);
+  controller.abort();
+
+  await assert.rejects(direct, (error: unknown) => {
+    assert(error instanceof NntpError);
+    assert.equal(error.kind, 'connection');
+    assert.equal(error.message, 'aborted');
+    return true;
+  });
+  assert.equal(server.commands.length, 0);
+  assert.equal(directOnWire, 0);
+  assert.equal(fetcher.info()[0].freeSlots, 1);
+  assert.equal(fetcher.info()[0].tripped, false);
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+
+  slowGate.resolve();
+  await server.waitForCommandCount(1);
+  assert.deepEqual(server.commands, ['BODY <slow-prepared-first>']);
+  server.respondNext(articleResponse('slow.bin', Buffer.from('slow')));
+  await slow;
+  assert.equal(disposals.count, 0);
+  assert.deepEqual(server.commands, ['BODY <slow-prepared-first>']);
+});
+
+test('aborted middle assignment cannot block the third command turn', async (context) => {
+  const server = await AutomaticNntpServer.create(context);
+  const fetcher = new LocalSegmentFetcher(
+    [provider('middle-turn-abort', server.port, 0, 3)],
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      circuitBreakerThreshold: 1,
+      dialTimeoutMs: 1000,
+      segmentStallTimeoutMs: 1000,
+      segmentTimeoutMs: 5000,
+    },
+    new NoopStats()
+  );
+  context.after(() => fetcher.close());
+  const firstStarted = Promise.withResolvers<void>();
+  const firstGate = Promise.withResolvers<void>();
+  const disposals = { count: 0 };
+  const first = fetcher.fetchBodyToSink(
+    { messageId: 'turn-first' },
+    'nzb-middle-abort',
+    CommandPriority.High,
+    async () => {
+      firstStarted.resolve();
+      await firstGate.promise;
+      return collectingAttempt(disposals);
+    }
+  );
+  await firstStarted.promise;
+
+  const middleController = new AbortController();
+  let middleOnWire = 0;
+  const middle = fetcher.fetchBody(
+    { messageId: 'turn-second-aborted' },
+    'nzb-middle-abort',
+    CommandPriority.High,
+    undefined,
+    middleController.signal,
+    () => {
+      middleOnWire++;
+    }
+  );
+  const third = fetcher.fetchBody(
+    { messageId: 'turn-third' },
+    'nzb-middle-abort',
+    CommandPriority.High
+  );
+  assert.equal(fetcher.info()[0].freeSlots, 0);
+  middleController.abort();
+  await assert.rejects(middle, (error: unknown) => {
+    assert(error instanceof NntpError);
+    assert.equal(error.message, 'aborted');
+    return true;
+  });
+  assert.equal(fetcher.info()[0].freeSlots, 1);
+  assert.equal(middleOnWire, 0);
+  assert.equal(getEventListeners(middleController.signal, 'abort').length, 0);
+
+  firstGate.resolve();
+  await server.waitForCommandCount(2);
+  assert.deepEqual(server.commands, ['BODY <turn-first>', 'BODY <turn-third>']);
+  const response = articleResponse('turn.bin', Buffer.from('turn'));
+  server.respondNext(response);
+  server.respondNext(response);
+  await Promise.all([first, third]);
+  assert.equal(disposals.count, 0);
+  assert.equal(fetcher.info()[0].freeSlots, 3);
+});
+
+test('assigned direct STAT aborts pre-wire behind a prepared BODY', async (context) => {
+  const server = await AutomaticNntpServer.create(context);
+  const fetcher = new LocalSegmentFetcher(
+    [provider('stat-pre-wire-abort', server.port, 0, 2)],
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      circuitBreakerThreshold: 1,
+      dialTimeoutMs: 1000,
+      segmentStallTimeoutMs: 1000,
+      segmentTimeoutMs: 5000,
+    },
+    new NoopStats()
+  );
+  context.after(() => fetcher.close());
+  const slowStarted = Promise.withResolvers<void>();
+  const slowGate = Promise.withResolvers<void>();
+  const disposals = { count: 0 };
+  const slow = fetcher.fetchBodyToSink(
+    { messageId: 'stat-blocking-body' },
+    'nzb-stat-abort',
+    CommandPriority.High,
+    async () => {
+      slowStarted.resolve();
+      await slowGate.promise;
+      return collectingAttempt(disposals);
+    }
+  );
+  await slowStarted.promise;
+
+  const controller = new AbortController();
+  const stat = fetcher.statSegmentDetailed(
+    'aborted-stat',
+    'nzb-stat-abort',
+    CommandPriority.High,
+    controller.signal
+  );
+  assert.equal(fetcher.info()[0].freeSlots, 0);
+  controller.abort();
+  await assert.rejects(stat, (error: unknown) => {
+    assert(error instanceof NntpError);
+    assert.equal(error.message, 'aborted');
+    return true;
+  });
+  await Promise.resolve();
+
+  assert.equal(fetcher.info()[0].freeSlots, 1);
+  assert.equal(fetcher.info()[0].tripped, false);
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+  assert.equal(server.commands.length, 0);
+  slowGate.resolve();
+  await server.waitForCommandCount(1);
+  assert.deepEqual(server.commands, ['BODY <stat-blocking-body>']);
+  server.respondNext(articleResponse('stat.bin', Buffer.from('stat')));
+  await slow;
+  assert.equal(disposals.count, 0);
+});
+
+test('pool close cancels every deferred command turn and releases listeners', async (context) => {
+  const server = await AutomaticNntpServer.create(context);
+  const fetcher = new LocalSegmentFetcher(
+    [provider('close-deferred-turns', server.port, 0, 2)],
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      dialTimeoutMs: 1000,
+      segmentStallTimeoutMs: 1000,
+      segmentTimeoutMs: 5000,
+    },
+    new NoopStats()
+  );
+  context.after(() => fetcher.close());
+  const preparedController = new AbortController();
+  const directController = new AbortController();
+  const preparationStarted = Promise.withResolvers<void>();
+  const preparationGate = Promise.withResolvers<void>();
+  const disposed = Promise.withResolvers<void>();
+  let disposeCalls = 0;
+  let directOnWire = 0;
+  const prepared = fetcher.fetchBodyToSink(
+    { messageId: 'close-prepared-first' },
+    'nzb-close-turns',
+    CommandPriority.High,
+    async () => {
+      preparationStarted.resolve();
+      await preparationGate.promise;
+      return {
+        sink: new CollectingSink(),
+        value: undefined,
+        dispose: async () => {
+          disposeCalls++;
+          disposed.resolve();
+        },
+      };
+    },
+    preparedController.signal
+  );
+  await preparationStarted.promise;
+  const direct = fetcher.fetchBody(
+    { messageId: 'close-direct-second' },
+    'nzb-close-turns',
+    CommandPriority.High,
+    undefined,
+    directController.signal,
+    () => {
+      directOnWire++;
+    }
+  );
+  assert.equal(fetcher.info()[0].freeSlots, 0);
+
+  fetcher.close();
+  await Promise.all([
+    assert.rejects(prepared, NntpError),
+    assert.rejects(direct, NntpError),
+  ]);
+  assert.equal(directOnWire, 0);
+  assert.equal(fetcher.info()[0].freeSlots, 2);
+  assert.equal(fetcher.info()[0].acquired, 0);
+  assert.equal(fetcher.info()[0].queued, 0);
+  assert.equal(getEventListeners(preparedController.signal, 'abort').length, 0);
+  assert.equal(getEventListeners(directController.signal, 'abort').length, 0);
+  assert.equal(
+    server.commands.filter((command) => command.startsWith('BODY ')).length,
+    0
+  );
+
+  preparationGate.resolve();
+  await disposed.promise;
+  assert.equal(disposeCalls, 1);
+  fetcher.close();
 });
