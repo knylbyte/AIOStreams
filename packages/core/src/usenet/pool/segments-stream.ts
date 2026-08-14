@@ -1,13 +1,27 @@
 import { createLogger } from '../../logging/logger.js';
-import { MultiProviderPool } from './multi-provider-pool.js';
 import { OrderedParallelStream } from './ordered-parallel-stream.js';
-import { CommandPriority, NzbSegmentRef } from '../types.js';
+import {
+  CommandPriority,
+  type NzbSegmentRef,
+  type SegmentData,
+} from '../types.js';
 import type { HoleDecision, HoleKind } from '../holes.js';
 
 const logger = createLogger('usenet/segments');
 
+/** Narrow source contract retained by the legacy buffering stream. */
+export interface SegmentBufferingSource {
+  fetchSegmentInto(
+    segment: NzbSegmentRef,
+    nzbHash: string,
+    signal: AbortSignal | undefined,
+    priority: CommandPriority,
+    out: () => Buffer
+  ): Promise<SegmentData>;
+}
+
 export interface SegmentsStreamOptions {
-  pool: MultiProviderPool;
+  pool: SegmentBufferingSource;
   /** Segments to stream, in file order. */
   segments: NzbSegmentRef[];
   nzbHash: string;
@@ -48,7 +62,7 @@ export interface SegmentsStreamOptions {
  * ranges.
  */
 export class SegmentsStream extends OrderedParallelStream {
-  private pool: MultiProviderPool;
+  private pool: SegmentBufferingSource;
   private segments: NzbSegmentRef[];
   private nzbHash: string;
   private priority: CommandPriority;

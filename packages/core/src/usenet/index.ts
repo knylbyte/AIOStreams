@@ -1084,7 +1084,8 @@ export class UsenetEngine {
       memo,
       holes?.holeHooks
         ? { hooks: holes.holeHooks, fileIndex: holes.fileIndex }
-        : undefined
+        : undefined,
+      this.resourcePlan
     );
     await stream.open(signal);
     return stream;

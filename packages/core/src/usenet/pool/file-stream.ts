@@ -1,11 +1,17 @@
 import { Readable } from 'node:stream';
 import { createLogger } from '../../logging/logger.js';
-import { MultiProviderPool } from './multi-provider-pool.js';
-import { SegmentsStream } from './segments-stream.js';
+import { createSegmentReadStream } from './segment-read-stream-factory.js';
+import type { SegmentBufferingSource } from './segments-stream.js';
+import type { SpoolingSegmentArtifactSource } from './spooling-segments-stream.js';
+import type { SharedSegment } from './segment-arena.js';
 import { isImplausibleYencFileSize } from './yenc.js';
 import { definitiveLossKind } from '../nntp/errors.js';
 import { CommandPriority, EngineOptions, NzbSegmentRef } from '../types.js';
 import type { HoleHooks } from '../holes.js';
+import {
+  resolveEngineResourcePlan,
+  type EngineResourcePlan,
+} from '../resource-plan.js';
 
 const logger = createLogger('usenet/file-stream');
 
@@ -20,6 +26,17 @@ export interface FileSource {
    * Critical for archive inspection, which opens one stream per volume.
    */
   knownSize?: number;
+}
+
+/** Narrow pool surface used by direct and random-access file reads. */
+export interface FileStreamPool
+  extends SegmentBufferingSource, SpoolingSegmentArtifactSource {
+  fetchSegmentShared(
+    segment: NzbSegmentRef,
+    nzbHash: string,
+    signal: AbortSignal | undefined,
+    priority: CommandPriority
+  ): Promise<SharedSegment>;
 }
 
 /**
@@ -94,17 +111,20 @@ export class FileStream implements SeekableStream {
   private memo?: SegmentMemo;
   /** Playback hole handling (zero-fill policy owner + persisted holes). */
   private holes?: { hooks: HoleHooks; fileIndex: number };
+  private readonly resourcePlan: EngineResourcePlan;
 
   constructor(
-    private pool: MultiProviderPool,
+    private pool: FileStreamPool,
     private source: FileSource,
     private nzbHash: string,
     private opts: EngineOptions,
     memo?: SegmentMemo,
-    holes?: { hooks: HoleHooks; fileIndex: number }
+    holes?: { hooks: HoleHooks; fileIndex: number },
+    resourcePlan?: EngineResourcePlan
   ) {
     this.memo = memo;
     this.holes = holes;
+    this.resourcePlan = resourcePlan ?? resolveEngineResourcePlan(opts);
   }
 
   get filename(): string | undefined {
@@ -372,9 +392,23 @@ export class FileStream implements SeekableStream {
     // Deferred passthrough: do the (async) interpolation search, then wire up a
     // SegmentsStream. We use a PassThrough-like Readable that begins emitting
     // once the start segment is located.
+    let inner: Readable | undefined;
+    let detachRelay: (() => void) | undefined;
     const out = new Readable({
       read() {
-        /* pushed by the inner stream */
+        if (!out.isPaused()) inner?.resume();
+      },
+      destroy(error, callback) {
+        detachRelay?.();
+        detachRelay = undefined;
+        const current = inner;
+        inner = undefined;
+        if (!current || current.closed) {
+          callback(error);
+          return;
+        }
+        current.once('close', () => callback(error));
+        if (!current.destroyed) current.destroy(error ?? undefined);
       },
     });
 
@@ -395,43 +429,54 @@ export class FileStream implements SeekableStream {
                   .filter((l) => l >= 0 && l < segments.length)
               )
             : undefined;
-        const inner = new SegmentsStream({
-          pool: this.pool,
-          segments,
-          nzbHash: this.nzbHash,
-          sizeForSegment: holes
-            ? (local) => this.exactSegmentSize(segmentIndex + local)
-            : undefined,
-          onHole: holes
-            ? (local, bytes, kind) =>
-                holes.hooks.onHole({
-                  nzbFileIndex: holes.fileIndex,
-                  segmentIndex: segmentIndex + local,
-                  targetOffset: this.segmentStartByte(segmentIndex + local),
-                  bytes,
-                  kind,
-                })
-            : undefined,
-          knownHoles: knownLocal,
-          // The read-ahead window IS the per-stream parallelism: a stream keeps
-          // up to `prefetchSegments` segment fetches in flight ahead of the read
-          // cursor, and the global download semaphore (Σ provider connections)
-          // caps how many of those actually run at once. So a lone stream can use
-          // the whole account, while concurrent streams fair-share it via that
-          // semaphore; there is no separate per-stream connection cap.
-          maxWorkers: this.opts.prefetchSegments,
-          // Buffer sized to the same window so completed-but-not-yet-emitted
-          // segments can ride out per-segment latency jitter without stalling
-          // dispatch.
-          bufferSizeBytes: Math.max(
-            this.avgDecodedSize * this.opts.prefetchSegments,
-            1
-          ),
-          skipBytes: start - segmentStartByte,
-          limitBytes: length,
-          priority: CommandPriority.High,
-        });
-        inner.on('data', (chunk: Buffer) => {
+        const spoolingPlan = this.resourcePlan.segmentSpooling;
+        inner = createSegmentReadStream(
+          {
+            pool: this.pool,
+            segments,
+            nzbHash: this.nzbHash,
+            sizeForSegment:
+              this.resourcePlan.mode === 'segment_spooling'
+                ? (local) => this.exactSpoolingSegmentSize(segmentIndex + local)
+                : holes
+                  ? (local) => this.exactSegmentSize(segmentIndex + local)
+                  : undefined,
+            onHole: holes
+              ? (local, bytes, kind) =>
+                  holes.hooks.onHole({
+                    nzbFileIndex: holes.fileIndex,
+                    segmentIndex: segmentIndex + local,
+                    targetOffset: this.segmentStartByte(segmentIndex + local),
+                    bytes,
+                    kind,
+                  })
+              : undefined,
+            knownHoles: knownLocal,
+            // The read-ahead window IS the per-stream parallelism: a stream keeps
+            // up to `prefetchSegments` segment fetches in flight ahead of the read
+            // cursor, and the global download semaphore (Σ provider connections)
+            // caps how many of those actually run at once. So a lone stream can use
+            // the whole account, while concurrent streams fair-share it via that
+            // semaphore; there is no separate per-stream connection cap.
+            maxPrefetchSegments: this.opts.prefetchSegments,
+            // Buffer sized to the same window so completed-but-not-yet-emitted
+            // segments can ride out per-segment latency jitter without stalling
+            // dispatch.
+            bufferingBufferSizeBytes: Math.max(
+              this.avgDecodedSize * this.opts.prefetchSegments,
+              1
+            ),
+            spoolingReaderHighWaterMarkBytes:
+              spoolingPlan?.readerHighWaterMarkBytes,
+            skipBytes: start - segmentStartByte,
+            limitBytes: length,
+            priority: CommandPriority.High,
+          },
+          this.resourcePlan.mode
+        );
+        const current = inner;
+        let terminal = false;
+        const onData = (chunk: Buffer): void => {
           if (!firstByteSeen) {
             firstByteSeen = true;
             logger.debug(
@@ -444,13 +489,44 @@ export class FileStream implements SeekableStream {
               'range first byte'
             );
           }
-          if (!out.push(chunk)) inner.pause();
-        });
-        inner.on('end', () => out.push(null));
-        inner.on('error', (err) => out.destroy(err));
-        out.on('resume', () => inner.resume());
-        const destroyInner = () => inner.destroy();
-        out.on('close', destroyInner);
+          if (!out.push(chunk)) current.pause();
+        };
+        const onEnd = (): void => {
+          terminal = true;
+          detachRelay?.();
+          detachRelay = undefined;
+          inner = undefined;
+          out.push(null);
+        };
+        const onError = (error: Error): void => {
+          terminal = true;
+          out.destroy(error);
+        };
+        const onClose = (): void => {
+          if (!terminal && !out.destroyed) {
+            out.destroy(new Error('Segment read stream closed before EOF'));
+          }
+        };
+        const onPause = (): void => {
+          current.pause();
+        };
+        const onResume = (): void => {
+          current.resume();
+        };
+        detachRelay = () => {
+          current.removeListener('data', onData);
+          current.removeListener('end', onEnd);
+          current.removeListener('error', onError);
+          current.removeListener('close', onClose);
+          out.removeListener('pause', onPause);
+          out.removeListener('resume', onResume);
+        };
+        out.on('pause', onPause);
+        out.on('resume', onResume);
+        current.on('end', onEnd);
+        current.on('error', onError);
+        current.on('close', onClose);
+        current.on('data', onData);
       })
       .catch((err) =>
         out.destroy(err instanceof Error ? err : new Error(String(err)))
@@ -558,6 +634,18 @@ export class FileStream implements SeekableStream {
     if (!this.sizeExact) return undefined;
     const last = this._size - part * (n - 1);
     return last > 0 && last <= part ? last : undefined;
+  }
+
+  /** Add the trivial exact one-part known-size case used for early tailing. */
+  private exactSpoolingSegmentSize(index: number): number | undefined {
+    const exact = this.exactSegmentSize(index);
+    if (exact !== undefined) return exact;
+    return index === 0 &&
+      this.source.segments.length === 1 &&
+      this.sizeExact &&
+      this._size > 0
+      ? this._size
+      : undefined;
   }
 
   private async rangeForSegment(index: number): Promise<KnownRange> {

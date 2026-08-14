@@ -47,6 +47,9 @@ interface FakeBehavior {
   readonly gate?: Promise<void>;
   readonly started?: PromiseWithResolvers<void>;
   readonly finished?: PromiseWithResolvers<void>;
+  readonly firstChunkBytes?: number;
+  readonly firstChunkWritten?: PromiseWithResolvers<void>;
+  readonly afterFirstChunkGate?: Promise<void>;
   readonly error?: Error;
 }
 
@@ -95,7 +98,26 @@ class FakeSegmentFetcher implements SegmentFetcher {
       behavior.started?.resolve();
       await behavior.gate;
       if (behavior.error) throw behavior.error;
-      await writeBody(attempt.sink, behavior.body);
+      const firstChunkBytes = behavior.firstChunkBytes;
+      if (
+        firstChunkBytes !== undefined &&
+        firstChunkBytes > 0 &&
+        firstChunkBytes < behavior.body.length
+      ) {
+        await writeBodyChunks(
+          attempt.sink,
+          behavior.body.subarray(0, firstChunkBytes)
+        );
+        behavior.firstChunkWritten?.resolve();
+        await behavior.afterFirstChunkGate;
+        await writeBodyChunks(
+          attempt.sink,
+          behavior.body.subarray(firstChunkBytes)
+        );
+        await attempt.sink.end();
+      } else {
+        await writeBody(attempt.sink, behavior.body);
+      }
       return {
         value: attempt.value,
         metadata: {
@@ -213,6 +235,14 @@ async function writeBody(
   sink: BackpressuredByteSink,
   body: Buffer
 ): Promise<void> {
+  await writeBodyChunks(sink, body);
+  await sink.end();
+}
+
+async function writeBodyChunks(
+  sink: BackpressuredByteSink,
+  body: Buffer
+): Promise<void> {
   const chunkBytes = 16 * KIBIBYTE_BYTES;
   for (let offset = 0; offset < body.length; offset += chunkBytes) {
     const chunk = Buffer.from(body.subarray(offset, offset + chunkBytes));
@@ -220,7 +250,6 @@ async function writeBody(
       await new Promise<void>((resolve) => sink.onceDrain(resolve));
     }
   }
-  await sink.end();
 }
 
 function spoolingPlan(): SegmentSpoolingPlan {
@@ -329,6 +358,95 @@ test('fetchSegmentArtifact single-flights one network fetch into independently r
   assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
   assert.equal(cache.stats().misses, 0, 'spooling path must not call getAsync');
   assert.equal(fetcher.bufferingCalls, 0);
+});
+
+test('an exact-length artifact becomes readable after its first committed spool chunk', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const firstChunkWritten = Promise.withResolvers<void>();
+  const afterFirstChunkGate = Promise.withResolvers<void>();
+  const finished = Promise.withResolvers<void>();
+  const body = Buffer.alloc(64 * KIBIBYTE_BYTES, 0x5a);
+  fetcher.behaviors.set('growing', {
+    body,
+    firstChunkBytes: 16 * KIBIBYTE_BYTES,
+    firstChunkWritten,
+    afterFirstChunkGate: afterFirstChunkGate.promise,
+    finished,
+  });
+  const { pool, runtime } = await createHarness(context, fetcher);
+  let producerFinished = false;
+  void finished.promise.then(() => {
+    producerFinished = true;
+  });
+
+  const artifactPromise = pool.fetchSegmentArtifact(
+    { messageId: 'growing', bytes: body.length },
+    'nzb',
+    undefined,
+    CommandPriority.High,
+    { expectedLength: body.length }
+  );
+  await firstChunkWritten.promise;
+  const artifact = await artifactPromise;
+  assert.equal(producerFinished, false);
+  const reader = artifact.createReadStream();
+  const chunks: Buffer[] = [];
+  const firstData = Promise.withResolvers<void>();
+  reader.on('data', (chunk: Buffer) => {
+    chunks.push(chunk);
+    firstData.resolve();
+  });
+  const readerEnded = new Promise<void>((resolve, reject) => {
+    reader.once('end', resolve);
+    reader.once('error', reject);
+  });
+  await firstData.promise;
+  assert.equal(producerFinished, false);
+
+  afterFirstChunkGate.resolve();
+  await Promise.all([finished.promise, readerEnded]);
+  await artifact.release();
+  assert.deepEqual(Buffer.concat(chunks), body);
+  assert.equal(runtime.spoolManager.stats().artifacts, 0);
+  assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+});
+
+test('stream memory reserves exactly the inner and outer reader high-water marks', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const { pool, runtime } = await createHarness(context, fetcher);
+  const lease = await pool.acquireSegmentStreamMemory(CommandPriority.High);
+  assert.equal(lease.bytes, 2 * runtime.plan.readerHighWaterMarkBytes);
+  assert.equal(runtime.memoryBudget.stats().usedBytes, lease.bytes);
+  lease.release();
+  lease.release();
+  assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+});
+
+test('bounded stream admission preserves download-memory progress', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const { pool, runtime } = await createHarness(context, fetcher);
+  const active = await Promise.all(
+    Array.from({ length: 4 }, () =>
+      pool.acquireSegmentStreamMemory(CommandPriority.High)
+    )
+  );
+  let fifthGranted = false;
+  const fifthPromise = pool
+    .acquireSegmentStreamMemory(CommandPriority.High)
+    .then((lease) => {
+      fifthGranted = true;
+      return lease;
+    });
+  await Promise.resolve();
+  assert.equal(fifthGranted, false);
+
+  const download = await runtime.acquireDownloadMemory(CommandPriority.High);
+  active[0].release();
+  const fifth = await fifthPromise;
+  download.release();
+  fifth.release();
+  for (const lease of active) lease.release();
+  assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
 });
 
 test('one artifact waiter may abort while another receives the completed fetch', async (context) => {
