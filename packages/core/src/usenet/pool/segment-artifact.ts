@@ -5,6 +5,9 @@ import type { SharedSegment } from './segment-arena.js';
 import type { GrowingSpoolArtifact } from '../spool/growing-artifact.js';
 
 const ARTIFACT_CHUNK_BYTES = 64 * 1024;
+const MEBIBYTE_BYTES = 1024 * 1024;
+/** Matches the largest planned Block-1 spool reader HWM and bounds owned data. */
+const MAX_ARTIFACT_READER_HIGH_WATER_MARK_BYTES = 2 * MEBIBYTE_BYTES;
 const logger = createLogger('usenet/segment-artifact');
 
 /** Bounded range options shared by every decoded-segment storage variant. */
@@ -68,9 +71,13 @@ function validateReadRange(
   ) {
     throw new RangeError('Segment artifact range is outside decoded bytes');
   }
-  if (!Number.isSafeInteger(highWaterMark) || highWaterMark <= 0) {
+  if (
+    !Number.isSafeInteger(highWaterMark) ||
+    highWaterMark <= 0 ||
+    highWaterMark > MAX_ARTIFACT_READER_HIGH_WATER_MARK_BYTES
+  ) {
     throw new RangeError(
-      'Segment artifact highWaterMark must be a safe positive integer'
+      'Segment artifact highWaterMark must be a safe positive integer no larger than 2 MiB'
     );
   }
   return { start, endExclusive, highWaterMark };
@@ -99,9 +106,9 @@ class BufferRangeReadable extends Readable {
       ARTIFACT_CHUNK_BYTES,
       this.endExclusive - this.position
     );
-    const next = this.position + bytes;
-    const chunk = this.body.subarray(this.position, next);
-    this.position = next;
+    const chunk = Buffer.allocUnsafe(bytes);
+    this.body.copy(chunk, 0, this.position, this.position + bytes);
+    this.position += bytes;
     this.push(chunk);
   }
 }
@@ -116,7 +123,12 @@ function metadataFromShared(shared: SharedSegment): DecodedSegmentMetadata {
   };
 }
 
-/** A single-reader artifact that keeps one SegmentArena pin alive. */
+/**
+ * A single-reader artifact that keeps one SegmentArena pin alive while copying
+ * each emitted chunk into independent owned memory. No view into the recyclable
+ * arena slot escapes `_read`; chunks are at most 64 KiB and the internal
+ * Readable high-water mark is capped at 2 MiB.
+ */
 export class ArenaSegmentArtifact implements SegmentArtifact {
   readonly metadata: DecodedSegmentMetadata;
   readonly length: number;
@@ -226,14 +238,10 @@ export class GrowingSpoolArtifactAdapter implements SegmentArtifact {
 
 class ZeroReadable extends Readable {
   private remaining: number;
-  private readonly zeroChunk: Buffer;
 
   constructor(length: number, highWaterMark: number) {
     super({ highWaterMark });
     this.remaining = length;
-    this.zeroChunk = Buffer.alloc(
-      Math.min(ARTIFACT_CHUNK_BYTES, Math.max(1, length))
-    );
   }
 
   override _read(size: number): void {
@@ -243,15 +251,19 @@ class ZeroReadable extends Readable {
     }
     const bytes = Math.min(
       this.remaining,
-      this.zeroChunk.length,
+      ARTIFACT_CHUNK_BYTES,
       Math.max(1, size)
     );
     this.remaining -= bytes;
-    this.push(this.zeroChunk.subarray(0, bytes));
+    this.push(Buffer.alloc(bytes));
   }
 }
 
-/** A sparse logical segment that emits zeroes through a fixed-size buffer. */
+/**
+ * A sparse logical segment that emits independently owned zero chunks of at
+ * most 64 KiB. Its Readable queue is bounded by the 2 MiB HWM cap and no
+ * allocation scales with the logical hole length.
+ */
 export class ZeroSegmentArtifact implements SegmentArtifact {
   readonly metadata: DecodedSegmentMetadata;
   readonly storage = 'zero' as const;

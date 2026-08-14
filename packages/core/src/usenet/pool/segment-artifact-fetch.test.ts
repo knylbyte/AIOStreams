@@ -42,8 +42,11 @@ const MEBIBYTE_BYTES = KIBIBYTE_BYTES * KIBIBYTE_BYTES;
 
 interface FakeBehavior {
   readonly body: Buffer;
+  readonly attemptCreated?: PromiseWithResolvers<void>;
+  readonly preWireGate?: Promise<void>;
   readonly gate?: Promise<void>;
   readonly started?: PromiseWithResolvers<void>;
+  readonly finished?: PromiseWithResolvers<void>;
   readonly error?: Error;
 }
 
@@ -82,10 +85,14 @@ class FakeSegmentFetcher implements SegmentFetcher {
     const behavior = this.behaviors.get(segment.messageId) ?? {
       body: Buffer.from('streaming-body'),
     };
-    const attempt = await createAttempt();
-    onWireStart?.();
-    behavior.started?.resolve();
+    let attempt: StreamingSegmentAttempt<T> | undefined;
     try {
+      attempt = await createAttempt();
+      behavior.attemptCreated?.resolve();
+      await behavior.preWireGate;
+      if (signal?.aborted) throw new NntpError('connection', 'aborted');
+      onWireStart?.();
+      behavior.started?.resolve();
       await behavior.gate;
       if (behavior.error) throw behavior.error;
       await writeBody(attempt.sink, behavior.body);
@@ -102,9 +109,13 @@ class FakeSegmentFetcher implements SegmentFetcher {
     } catch (error) {
       const failure =
         error instanceof Error ? error : new Error('fake segment fetch failed');
-      attempt.sink.fail(failure);
-      await attempt.dispose(failure);
+      if (attempt) {
+        attempt.sink.fail(failure);
+        await attempt.dispose(failure);
+      }
       throw failure;
+    } finally {
+      behavior.finished?.resolve();
     }
   }
 
@@ -177,6 +188,24 @@ class CountingSpoolManager extends SpoolManager {
       return dispose();
     };
     return artifact;
+  }
+}
+
+class GatedSpoolManager extends SpoolManager {
+  constructor(
+    options: SpoolManagerOptions,
+    private readonly started: PromiseWithResolvers<void>,
+    private readonly gate: Promise<void>
+  ) {
+    super(options);
+  }
+
+  override async createArtifact(
+    options: CreateSpoolArtifactOptions
+  ): Promise<GrowingSpoolArtifact> {
+    this.started.resolve();
+    await this.gate;
+    return super.createArtifact(options);
   }
 }
 
@@ -423,6 +452,117 @@ test('the last abort cancels artifact work before its global semaphore grant', a
   blockerGate.resolve();
   await (await blocker).release();
   assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+});
+
+test('the last pre-wire waiter abort disposes a created spool attempt and every permit once', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const attemptCreated = Promise.withResolvers<void>();
+  const preWireGate = Promise.withResolvers<void>();
+  const finished = Promise.withResolvers<void>();
+  fetcher.behaviors.set('prepared-abort', {
+    body: Buffer.from('must not reach the wire'),
+    attemptCreated,
+    preWireGate: preWireGate.promise,
+    finished,
+  });
+  const cacheRoot = await mkdtemp(path.join(tmpdir(), 'prepared-abort-'));
+  const manager = new CountingSpoolManager({
+    plan: spoolingPlan(),
+    engineId: 'prepared-abort',
+    cacheRoot,
+  });
+  context.after(async () => {
+    await Promise.allSettled([manager.close()]);
+    await rm(cacheRoot, { recursive: true, force: true });
+  });
+  const { pool, runtime } = await createHarness(context, fetcher, {
+    maxConcurrentDownloads: 1,
+    spoolManager: manager,
+  });
+  const controller = new AbortController();
+  const pending = pool.fetchSegmentArtifact(
+    { messageId: 'prepared-abort' },
+    'nzb',
+    controller.signal
+  );
+
+  await attemptCreated.promise;
+  assert.equal(pool.poolInfo().globalDownloadsInUse, 1);
+  assert.equal(pool.poolInfo().globalDownloadsOnWire, 0);
+  assert.equal(runtime.memoryBudget.stats().usedBytes, 128 * KIBIBYTE_BYTES);
+  assert.equal(runtime.spoolManager.stats().artifacts, 1);
+  controller.abort();
+  await assert.rejects(pending, { name: 'NntpError' });
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+  preWireGate.resolve();
+  await finished.promise;
+  const allMemory = await runtime.memoryBudget.acquire(
+    spoolingPlan().memoryBudgetBytes
+  );
+
+  assert.equal(fetcher.streamingCalls, 1);
+  assert.equal(pool.poolInfo().globalDownloadsInUse, 0);
+  assert.equal(pool.poolInfo().globalDownloadsOnWire, 0);
+  assert.equal(runtime.spoolManager.stats().artifacts, 0);
+  assert.equal(runtime.spoolManager.stats().budget.reservedBytes, 0);
+  assert.equal(runtime.spoolManager.stats().files.openFiles, 0);
+  assert.equal(manager.disposeCalls, 1);
+  allMemory.release();
+});
+
+test('abort during spool attempt creation remains pre-wire and releases partial ownership', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const creationStarted = Promise.withResolvers<void>();
+  const creationGate = Promise.withResolvers<void>();
+  const finished = Promise.withResolvers<void>();
+  fetcher.behaviors.set('creation-abort', {
+    body: Buffer.from('must not reach the wire'),
+    finished,
+  });
+  const cacheRoot = await mkdtemp(path.join(tmpdir(), 'creation-abort-'));
+  const manager = new GatedSpoolManager(
+    {
+      plan: spoolingPlan(),
+      engineId: 'creation-abort',
+      cacheRoot,
+    },
+    creationStarted,
+    creationGate.promise
+  );
+  context.after(async () => {
+    await Promise.allSettled([manager.close()]);
+    await rm(cacheRoot, { recursive: true, force: true });
+  });
+  const { pool, runtime } = await createHarness(context, fetcher, {
+    maxConcurrentDownloads: 1,
+    spoolManager: manager,
+  });
+  const controller = new AbortController();
+  const pending = pool.fetchSegmentArtifact(
+    { messageId: 'creation-abort' },
+    'nzb',
+    controller.signal
+  );
+
+  await creationStarted.promise;
+  assert.equal(pool.poolInfo().globalDownloadsInUse, 1);
+  assert.equal(pool.poolInfo().globalDownloadsOnWire, 0);
+  controller.abort();
+  await assert.rejects(pending, { name: 'NntpError' });
+  creationGate.resolve();
+  await finished.promise;
+  const allMemory = await runtime.memoryBudget.acquire(
+    spoolingPlan().memoryBudgetBytes
+  );
+
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+  assert.equal(fetcher.streamingCalls, 1);
+  assert.equal(pool.poolInfo().globalDownloadsInUse, 0);
+  assert.equal(pool.poolInfo().globalDownloadsOnWire, 0);
+  assert.equal(runtime.spoolManager.stats().artifacts, 0);
+  assert.equal(runtime.spoolManager.stats().budget.reservedBytes, 0);
+  assert.equal(runtime.spoolManager.stats().files.openFiles, 0);
+  allMemory.release();
 });
 
 test('definitive misses and decode failures dispose partial spools and populate the negative cache', async (context) => {

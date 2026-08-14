@@ -42,9 +42,18 @@ export interface WorkResult<T = unknown> {
 
 export interface WorkRequest<T = unknown> {
   priority: CommandPriority;
-  run: (conn: NntpConnection) => Promise<{ value: T; bytes: number }>;
+  run: (
+    conn: NntpConnection,
+    execution: WorkExecution
+  ) => Promise<{ value: T; bytes: number }>;
   resolve: (r: WorkResult<T>) => void;
   reject: (err: unknown) => void;
+  /**
+   * The request performs bounded local preparation after assignment and marks
+   * the provider transfer only when its command has entered the connection
+   * FIFO. Queue/connect/preparation time is excluded from throughput metrics.
+   */
+  explicitTransferStart?: boolean;
   /**
    * Cancels the request while it is still queued; once on a connection the
    * transfer completes normally.
@@ -59,6 +68,38 @@ interface Slot {
   connecting: boolean;
   /** Consecutive failures on this slot's connection (per-connection breaker). */
   failures: number;
+  /**
+   * Requests dequeued onto this connection, including local preparation and
+   * commands already present in `conn.inFlight`. This is the sole pipeline
+   * occupancy counter; `conn.inFlight` must never be added to it.
+   */
+  assigned: number;
+  /**
+   * Assignment-order fence for commands not yet appended to the FIFO. Its
+   * length is hard-bounded by this slot's `pipelineDepth`.
+   */
+  commandTurns: CommandTurn[];
+}
+
+/** Per-assignment timing control supplied to work closures. */
+export interface WorkExecution {
+  /**
+   * Wait until every earlier assignment has either enqueued its command or
+   * failed pre-wire. This preserves command FIFO when preparations complete
+   * out of order.
+   */
+  waitForCommandTurn(signal?: AbortSignal): Promise<void>;
+  /** Idempotently mark the instant the provider command entered the FIFO. */
+  markTransferStarted(): void;
+}
+
+interface CommandTurn {
+  ready: boolean;
+  completed: boolean;
+  start?: () => void;
+  resolve?: () => void;
+  signal?: AbortSignal;
+  onAbort?: () => void;
 }
 
 /** Additive-increase step interval for the adaptive connection-limit throttle. */
@@ -131,6 +172,8 @@ export class ProviderWorkerPool {
       conn: null,
       connecting: false,
       failures: 0,
+      assigned: 0,
+      commandTurns: [],
     }));
     this.state = config.enabled === false ? 'disabled' : 'online';
     this.keepaliveTimer = setInterval(() => this.keepalive(), KEEPALIVE_MS);
@@ -162,11 +205,11 @@ export class ProviderWorkerPool {
   /** Total pipeline slots free right now (used for least-busy provider ordering). */
   get freeSlots(): number {
     if (this.state !== 'online') return 0;
-    return Math.max(0, this.allowed * this.depth - this.inFlightTotal());
+    return Math.max(0, this.allowed * this.depth - this.assignedTotal());
   }
 
   get inFlight(): number {
-    return this.inFlightTotal();
+    return this.assignedTotal();
   }
   /**
    * Mean time to complete a whole article fetch
@@ -266,6 +309,70 @@ export class ProviderWorkerPool {
     });
   }
 
+  /**
+   * Submit work whose provider-attempt storage must be prepared asynchronously.
+   * The existing priority queue assigns and counts a pipeline slot before
+   * `prepare` starts, preserving FIFO and `pipelineDepth`. Provider service
+   * timing starts only when `run` calls `markTransferStarted` after command
+   * enqueue. A prepared attempt is disposed exactly once on every failure or
+   * pre-wire abort; success transfers its ownership through the result.
+   */
+  submitPrepared<T, Prepared>(req: {
+    priority: CommandPriority;
+    prepare: () => Promise<Prepared>;
+    run: (
+      conn: NntpConnection,
+      prepared: Prepared,
+      markTransferStarted: () => void
+    ) => Promise<{ value: T; bytes: number }>;
+    dispose: (prepared: Prepared, error: Error) => Promise<void>;
+    signal?: AbortSignal;
+  }): Promise<WorkResult<T>> {
+    return this.submit<T>({
+      priority: req.priority,
+      signal: req.signal,
+      explicitTransferStart: true,
+      run: async (conn, execution) => {
+        let prepared: { readonly value: Prepared } | undefined;
+        try {
+          prepared = { value: await req.prepare() };
+          if (req.signal?.aborted) {
+            throw new NntpError('connection', 'aborted', {
+              provider: this.label,
+            });
+          }
+          await execution.waitForCommandTurn(req.signal);
+          if (req.signal?.aborted) {
+            throw new NntpError('connection', 'aborted', {
+              provider: this.label,
+            });
+          }
+          const result = await req.run(
+            conn,
+            prepared.value,
+            execution.markTransferStarted
+          );
+          prepared = undefined;
+          return result;
+        } catch (error) {
+          const failure =
+            error instanceof Error
+              ? error
+              : new NntpError('connection', 'provider request failed', {
+                  provider: this.label,
+                  cause: error,
+                });
+          if (prepared) {
+            const owned = prepared.value;
+            prepared = undefined;
+            await req.dispose(owned, failure);
+          }
+          throw failure;
+        }
+      },
+    });
+  }
+
   private hasWork(): boolean {
     return this.prioQ.length > 0 || this.normalQ.length > 0;
   }
@@ -276,9 +383,9 @@ export class ProviderWorkerPool {
     return n;
   }
 
-  private inFlightTotal(): number {
+  private assignedTotal(): number {
     let n = 0;
-    for (const s of this.slots) if (s.conn) n += s.conn.inFlight;
+    for (const s of this.slots) n += s.assigned;
     return n;
   }
 
@@ -334,9 +441,10 @@ export class ProviderWorkerPool {
         slot.conn = null;
         continue;
       }
-      while (slot.conn.canAccept(this.depth)) {
+      while (slot.assigned < this.depth && slot.conn.canAccept(this.depth)) {
         const req = this.pullFor();
         if (!req) break;
+        slot.assigned++;
         this.fireTransfer(slot, req);
       }
     }
@@ -349,7 +457,7 @@ export class ProviderWorkerPool {
     //    concurrency.
     const queued = this.prioQ.length + this.normalQ.length;
     if (queued === 0) return;
-    const demand = this.inFlightTotal() + queued;
+    const demand = this.assignedTotal() + queued;
     const wantConns = Math.min(this.allowed, Math.ceil(demand / this.depth));
     let toDial = wantConns - this.openConns();
     // Recovering from `auth_failed` (cooldown elapsed): dial only a single probe
@@ -443,10 +551,65 @@ export class ProviderWorkerPool {
 
   private fireTransfer(slot: Slot, req: WorkRequest): void {
     const conn = slot.conn!;
-    const started = Date.now();
-    req.run(conn).then(
+    const turn: CommandTurn = {
+      ready: slot.commandTurns.length === 0,
+      completed: false,
+    };
+    slot.commandTurns.push(turn);
+    let started: number | undefined;
+    let assignmentReleased = false;
+    const releaseAssignment = (): void => {
+      if (assignmentReleased) return;
+      assignmentReleased = true;
+      this.completeCommandTurn(slot, turn);
+      slot.assigned--;
+      if (slot.assigned < 0) {
+        throw new Error('provider worker assignment accounting underflow');
+      }
+    };
+    const execution: WorkExecution = {
+      waitForCommandTurn: (signal) => this.waitForCommandTurn(turn, signal),
+      markTransferStarted: () => {
+        started ??= Date.now();
+        this.completeCommandTurn(slot, turn);
+      },
+    };
+    const invoke = (): Promise<{ value: unknown; bytes: number }> => {
+      if (req.signal?.aborted) {
+        return Promise.reject(
+          new NntpError('connection', 'aborted', { provider: this.label })
+        );
+      }
+      try {
+        if (!req.explicitTransferStart) started = Date.now();
+        const pending = req.run(conn, execution);
+        // Existing buffering/HEAD/STAT work synchronously queues its command
+        // before returning its Promise. Prepared work marks from the exact
+        // connection enqueue callback instead.
+        if (!req.explicitTransferStart) execution.markTransferStarted();
+        return pending;
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    };
+    let transfer: Promise<{ value: unknown; bytes: number }>;
+    if (req.explicitTransferStart || turn.ready) {
+      transfer = invoke();
+    } else {
+      const deferred = Promise.withResolvers<{
+        value: unknown;
+        bytes: number;
+      }>();
+      turn.start = () => {
+        turn.start = undefined;
+        invoke().then(deferred.resolve, deferred.reject);
+      };
+      transfer = deferred.promise;
+    }
+    transfer.then(
       (res) => {
-        const durationMs = Date.now() - started;
+        const durationMs = started === undefined ? 0 : Date.now() - started;
+        releaseAssignment();
         slot.failures = 0;
         // Refresh staleness on real work so purge only reaps genuinely idle
         // connections (touch-at-connect-only redialed active streams every
@@ -458,11 +621,74 @@ export class ProviderWorkerPool {
         req.resolve({ ...res, durationMs });
         this.dispatch();
       },
-      (err) => this.onTransferError(slot, req, err)
+      (err) => {
+        releaseAssignment();
+        this.onTransferError(slot, req, err, started !== undefined);
+      }
     );
   }
 
-  private onTransferError(slot: Slot, req: WorkRequest, err: unknown): void {
+  private waitForCommandTurn(
+    turn: CommandTurn,
+    signal: AbortSignal | undefined
+  ): Promise<void> {
+    if (signal?.aborted) {
+      return Promise.reject(
+        new NntpError('connection', 'aborted', { provider: this.label })
+      );
+    }
+    if (turn.ready) return Promise.resolve();
+    const deferred = Promise.withResolvers<void>();
+    turn.resolve = deferred.resolve;
+    if (signal) {
+      const onAbort = (): void => {
+        if (turn.onAbort !== onAbort) return;
+        turn.resolve = undefined;
+        turn.signal = undefined;
+        turn.onAbort = undefined;
+        signal.removeEventListener('abort', onAbort);
+        deferred.reject(
+          new NntpError('connection', 'aborted', { provider: this.label })
+        );
+      };
+      turn.signal = signal;
+      turn.onAbort = onAbort;
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    return deferred.promise;
+  }
+
+  /** Advance the bounded assignment-order fence exactly once. */
+  private completeCommandTurn(slot: Slot, turn: CommandTurn): void {
+    if (turn.completed) return;
+    turn.completed = true;
+    if (turn.signal && turn.onAbort) {
+      turn.signal.removeEventListener('abort', turn.onAbort);
+    }
+    turn.signal = undefined;
+    turn.onAbort = undefined;
+    turn.resolve = undefined;
+    while (slot.commandTurns[0]?.completed) slot.commandTurns.shift();
+    const next = slot.commandTurns[0];
+    if (!next || next.ready) return;
+    next.ready = true;
+    const resolve = next.resolve;
+    next.resolve = undefined;
+    if (next.signal && next.onAbort) {
+      next.signal.removeEventListener('abort', next.onAbort);
+    }
+    next.signal = undefined;
+    next.onAbort = undefined;
+    resolve?.();
+    next.start?.();
+  }
+
+  private onTransferError(
+    slot: Slot,
+    req: WorkRequest,
+    err: unknown,
+    transferStarted: boolean
+  ): void {
     if (this.closed) {
       req.reject(err);
       return;
@@ -483,6 +709,13 @@ export class ProviderWorkerPool {
     // that the provider or its circuit is unhealthy.
     if (err instanceof UsenetSpoolError) {
       if (slot.conn && !slot.conn.isUsable) slot.conn = null;
+      req.reject(err);
+      this.dispatch();
+      return;
+    }
+    // Local preparation and command-turn aborts leave a usable provider
+    // connection untouched and must not contribute to its circuit breaker.
+    if (req.explicitTransferStart && !transferStarted && slot.conn?.isUsable) {
       req.reject(err);
       this.dispatch();
       return;
@@ -589,7 +822,7 @@ export class ProviderWorkerPool {
     if (this.hasWork()) this.dispatch();
     for (const slot of this.slots) {
       const conn = slot.conn;
-      if (!conn || !conn.isUsable || conn.inFlight > 0) continue;
+      if (!conn || !conn.isUsable || slot.assigned > 0) continue;
       conn
         .date(undefined, this.opts.idleConnectionMs)
         .catch(() => {
@@ -603,7 +836,7 @@ export class ProviderWorkerPool {
   purgeStaleIdles(): void {
     for (const slot of this.slots) {
       const conn = slot.conn;
-      if (conn && conn.inFlight === 0 && (conn.isStale() || !conn.isUsable)) {
+      if (conn && slot.assigned === 0 && (conn.isStale() || !conn.isUsable)) {
         conn.quit();
         slot.conn = null;
       }
@@ -618,7 +851,7 @@ export class ProviderWorkerPool {
     let acquired = 0;
     for (const s of this.slots) {
       if (s.conn || s.connecting) total++;
-      if (s.conn && s.conn.inFlight > 0) acquired++;
+      if (s.assigned > 0) acquired++;
     }
     return {
       id: this.config.id,

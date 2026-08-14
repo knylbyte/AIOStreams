@@ -466,13 +466,17 @@ export class NntpConnection {
    * Stream one complete raw BODY into a lifecycle consumer with socket-level
    * backpressure. The raw article is never accumulated; a false write pauses
    * the entire pipelined connection until the consumer emits one drain.
+   * `onEnqueued` runs synchronously only after the command and matching request
+   * have both entered the connection FIFO, providing the streaming fetcher's
+   * exact on-wire linearization point.
    */
   bodyToConsumer(
     messageId: string,
     consumer: BackpressuredBodyConsumer,
     signal: AbortSignal | undefined,
     stallTimeoutMs: number,
-    totalTimeoutMs?: number
+    totalTimeoutMs?: number,
+    onEnqueued?: () => void
   ): Promise<number> {
     return this.submit<number>(
       'body',
@@ -481,7 +485,8 @@ export class NntpConnection {
       stallTimeoutMs,
       (chunk) => consumer.write(chunk),
       totalTimeoutMs,
-      consumer
+      consumer,
+      onEnqueued
     );
   }
 
@@ -586,7 +591,8 @@ export class NntpConnection {
     stallTimeoutMs: number,
     consumer?: (chunk: Buffer) => boolean,
     totalTimeoutMs?: number,
-    bodyConsumer?: BackpressuredBodyConsumer
+    bodyConsumer?: BackpressuredBodyConsumer,
+    onEnqueued?: () => void
   ): Promise<T> {
     if (!this.isUsable) {
       const error =
@@ -624,7 +630,8 @@ export class NntpConnection {
       stallTimeoutMs,
       consumer,
       totalTimeoutMs,
-      bodyConsumer
+      bodyConsumer,
+      onEnqueued
     );
   }
 
@@ -643,7 +650,8 @@ export class NntpConnection {
     stallTimeoutMs: number,
     consumer?: (chunk: Buffer) => boolean,
     totalTimeoutMs?: number,
-    bodyConsumer?: BackpressuredBodyConsumer
+    bodyConsumer?: BackpressuredBodyConsumer,
+    onEnqueued?: () => void
   ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const now = this.now();
@@ -681,6 +689,16 @@ export class NntpConnection {
       }
       this.queue.push(req);
       this.armStallTimer();
+      try {
+        onEnqueued?.();
+      } catch (cause) {
+        this.fatalError = new NntpError(
+          'connection',
+          'command enqueue observer failed',
+          { provider: this.label, cause }
+        );
+        this.destroy();
+      }
       // Response bytes only exist during a read callback; the next onRead picks
       // this request up.
     });

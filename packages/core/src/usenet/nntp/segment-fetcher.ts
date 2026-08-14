@@ -1,9 +1,9 @@
 import { createLogger } from '../../logging/logger.js';
 import {
   ProviderWorkerPool,
+  type WorkResult,
   WorkerPoolOptions,
 } from './provider-worker-pool.js';
-import { NntpConnection } from './connection.js';
 import {
   ArticleNotFoundError,
   NntpError,
@@ -362,28 +362,33 @@ export class LocalSegmentFetcher implements SegmentFetcher {
     return this.submitWithFailover<SegmentData>(
       segment,
       nzbHash,
-      priority,
-      async (conn) => {
-        onWireStart?.();
-        const raw = await conn.body(
-          segment.messageId,
-          undefined,
-          this.opts.segmentStallTimeoutMs,
-          this.opts.segmentTimeoutMs
-        );
-        // Failover attempts run sequentially, so re-decoding a retry into the
-        // same target is safe: only the resolving attempt's bytes survive.
-        const decoded = decodeArticle(raw, out?.());
-        const data: SegmentData = {
-          body: decoded.body,
-          byteRange: decoded.byteRange,
-          fileSize: decoded.fileSize,
-          totalParts: decoded.totalParts,
-          name: decoded.name,
-          size: decoded.size,
-        };
-        return { value: data, bytes: data.size };
-      },
+      (pool) =>
+        pool.submit<SegmentData>({
+          priority,
+          signal,
+          run: async (conn) => {
+            onWireStart?.();
+            const raw = await conn.body(
+              segment.messageId,
+              undefined,
+              this.opts.segmentStallTimeoutMs,
+              this.opts.segmentTimeoutMs
+            );
+            // Failover attempts run sequentially, so re-decoding a retry into
+            // the same target is safe: only the resolving attempt's bytes
+            // survive.
+            const decoded = decodeArticle(raw, out?.());
+            const data: SegmentData = {
+              body: decoded.body,
+              byteRange: decoded.byteRange,
+              fileSize: decoded.fileSize,
+              totalParts: decoded.totalParts,
+              name: decoded.name,
+              size: decoded.size,
+            };
+            return { value: data, bytes: data.size };
+          },
+        }),
       signal
     );
   }
@@ -399,40 +404,61 @@ export class LocalSegmentFetcher implements SegmentFetcher {
     return this.submitWithFailover<StreamingSegmentResult<T>>(
       segment,
       nzbHash,
-      priority,
-      async (conn) => {
-        let attempt: StreamingSegmentAttempt<T> | undefined;
-        let decoder: StreamingYencArticleDecoder | undefined;
-        try {
-          attempt = await createAttempt();
-          decoder = new StreamingYencArticleDecoder(attempt.sink);
-          onWireStart?.();
-          await conn.bodyToConsumer(
-            segment.messageId,
-            decoder,
-            undefined,
-            this.opts.segmentStallTimeoutMs,
-            this.opts.segmentTimeoutMs
-          );
-          const metadata = await decoder.finish();
-          return {
-            value: { value: attempt.value, metadata },
-            bytes: metadata.size,
-          };
-        } catch (error) {
-          const failure =
-            error instanceof Error
-              ? error
-              : new YencDecodeError(
-                  undefined,
-                  'streaming segment fetch failed',
-                  { cause: error }
-                );
-          decoder?.fail(failure);
-          if (attempt) await attempt.dispose(failure);
-          throw failure;
-        }
-      },
+      (pool) =>
+        pool.submitPrepared<
+          StreamingSegmentResult<T>,
+          {
+            readonly attempt: StreamingSegmentAttempt<T>;
+            readonly decoder: StreamingYencArticleDecoder;
+          }
+        >({
+          priority,
+          signal,
+          prepare: async () => {
+            const attempt = await createAttempt();
+            try {
+              return {
+                attempt,
+                decoder: new StreamingYencArticleDecoder(attempt.sink),
+              };
+            } catch (error) {
+              const failure =
+                error instanceof Error
+                  ? error
+                  : new YencDecodeError(
+                      undefined,
+                      'streaming decoder setup failed',
+                      { cause: error }
+                    );
+              await attempt.dispose(failure);
+              throw failure;
+            }
+          },
+          run: (conn, prepared, markTransferStarted) => {
+            const transfer = conn.bodyToConsumer(
+              segment.messageId,
+              prepared.decoder,
+              undefined,
+              this.opts.segmentStallTimeoutMs,
+              this.opts.segmentTimeoutMs,
+              () => {
+                markTransferStarted();
+                onWireStart?.();
+              }
+            );
+            return transfer.then(async () => {
+              const metadata = await prepared.decoder.finish();
+              return {
+                value: { value: prepared.attempt.value, metadata },
+                bytes: metadata.size,
+              };
+            });
+          },
+          dispose: async (prepared, error) => {
+            prepared.decoder.fail(error);
+            await prepared.attempt.dispose(error);
+          },
+        }),
       signal
     );
   }
@@ -444,22 +470,22 @@ export class LocalSegmentFetcher implements SegmentFetcher {
     want: number,
     onWireStart?: () => void
   ): Promise<SegmentHeadData> {
-    return this.submitWithFailover<SegmentHeadData>(
-      segment,
-      nzbHash,
-      priority,
-      async (conn) => {
-        onWireStart?.();
-        const capture = new YencHeadCapture(want);
-        const rawBytes = await conn.bodyStreaming(
-          segment.messageId,
-          (chunk) => capture.push(chunk),
-          undefined,
-          this.opts.segmentStallTimeoutMs,
-          this.opts.segmentTimeoutMs
-        );
-        return { value: capture.finish(), bytes: rawBytes };
-      }
+    return this.submitWithFailover<SegmentHeadData>(segment, nzbHash, (pool) =>
+      pool.submit<SegmentHeadData>({
+        priority,
+        run: async (conn) => {
+          onWireStart?.();
+          const capture = new YencHeadCapture(want);
+          const rawBytes = await conn.bodyStreaming(
+            segment.messageId,
+            (chunk) => capture.push(chunk),
+            undefined,
+            this.opts.segmentStallTimeoutMs,
+            this.opts.segmentTimeoutMs
+          );
+          return { value: capture.finish(), bytes: rawBytes };
+        },
+      })
     );
   }
 
@@ -607,8 +633,9 @@ export class LocalSegmentFetcher implements SegmentFetcher {
 
   /**
    * Submit one fetch to providers in priority/affinity order with per-segment
-   * 430 failover and backup escalation. `run` performs the actual transfer +
-   * decode on a ready (possibly pipelined) connection chosen by the worker pool.
+   * 430 failover and backup escalation. `submit` binds either a direct request
+   * or a prepared streaming request to the current provider while this method
+   * remains the sole owner of ordering, affinity and outcome classification.
    * Throws {@link ArticleNotFoundError} only when a provider ACTUALLY answered
    * 430 (and no provider was merely unreachable); otherwise the last
    * transient/unreachable error so a transport/capacity problem never reads as
@@ -617,8 +644,7 @@ export class LocalSegmentFetcher implements SegmentFetcher {
   private async submitWithFailover<T>(
     segment: NzbSegmentRef,
     nzbHash: string | undefined,
-    priority: CommandPriority,
-    run: (conn: NntpConnection) => Promise<{ value: T; bytes: number }>,
+    submit: (pool: ProviderWorkerPool) => Promise<WorkResult<T>>,
     signal?: AbortSignal
   ): Promise<T> {
     const notFound = new Set<string>();
@@ -654,11 +680,7 @@ export class LocalSegmentFetcher implements SegmentFetcher {
       // EWMAs (used for ordering); the stats events here drive the dashboard.
       this.stats.fetchStarted(pool.id);
       try {
-        const { value, bytes, durationMs } = await pool.submit<T>({
-          priority,
-          run,
-          signal,
-        });
+        const { value, bytes, durationMs } = await submit(pool);
         if (nzbHash) this.affinity.record(nzbHash, pool.id, false, 'body');
         this.stats.record({
           type: 'segment_fetched',

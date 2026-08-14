@@ -14,9 +14,12 @@ export interface ArenaLease {
 /**
  * A pinned view of a cached segment. `data.body` is valid only until
  * {@link SharedSegment.release}; the scalar fields of `data` stay valid after
- * release, so metadata-only callers may release immediately. `owned: true`
- * marks a non-arena fallback body: `release` is a no-op and the body is safe
- * to retain.
+ * release, so metadata-only callers may release immediately. Direct callers
+ * may not retain a body view across asynchronous work. A storage adapter may
+ * deliberately hold the pin across its reader lifetime only when every byte
+ * exposed outside its synchronous copy step is independently owned.
+ * `owned: true` marks a non-arena fallback body: `release` is a no-op and the
+ * body is safe to retain.
  */
 export interface SharedSegment {
   readonly data: SegmentData;
@@ -38,7 +41,10 @@ export interface ArenaStats {
   evictions: number;
   /** checkout() exhaustions (degraded to owned allocation). */
   exhaustions: number;
-  /** Entries pinned longer than the leak threshold (should always be 0). */
+  /**
+   * Entries pinned longer than the diagnostic threshold. Artifact readers may
+   * account for a long pin, but that never permits an arena view to escape.
+   */
   longPins: number;
 }
 
@@ -74,8 +80,9 @@ const MIN_SLOT_BYTES = 1 << 20;
  * major GC, which otherwise dominates serve-path CPU).
  *
  * Contract (violations are silent corruption):
- * - a body may be read only between pin and release(), and only
- *   synchronously, never across an `await`;
+ * - direct consumers read a body only between pin and release(), synchronously
+ *   and never across an `await`; a reader adapter may retain the pin across its
+ *   lifetime but must expose only bounded owned copies;
  * - pins are granted only in synchronous blocks (acquire hit, or the
  *   coordinator's post-commit delivery loop) so no eviction can interleave;
  * - eviction touches only refs === 0 entries; leases are never evictable;

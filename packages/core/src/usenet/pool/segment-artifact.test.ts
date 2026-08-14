@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -6,7 +7,7 @@ import test from 'node:test';
 import type { Readable } from 'node:stream';
 import type { SegmentSpoolingPlan } from '../resource-plan.js';
 import { SpoolManager } from '../spool/manager.js';
-import type { SharedSegment } from './segment-arena.js';
+import { SegmentArena, type SharedSegment } from './segment-arena.js';
 import {
   ArenaSegmentArtifact,
   GrowingSpoolArtifactAdapter,
@@ -38,6 +39,13 @@ async function collect(readable: Readable): Promise<Buffer> {
     chunks.push(chunk);
   }
   return Buffer.concat(chunks);
+}
+
+async function collectEmittedChunks(readable: Readable): Promise<Buffer[]> {
+  const chunks: Buffer[] = [];
+  readable.on('data', (chunk: Buffer) => chunks.push(chunk));
+  await once(readable, 'end');
+  return chunks;
 }
 
 test('ArenaSegmentArtifact holds its pin through range reading and releases once', async () => {
@@ -166,4 +174,133 @@ test('ZeroSegmentArtifact applies range and abort contracts without large alloca
     signal: aborted.signal,
   });
   await assert.rejects(collect(abortedStream), { name: 'AbortError' });
+});
+
+test('ArenaSegmentArtifact chunks remain owned after the real arena slot is recycled', async () => {
+  const arena = new SegmentArena({ budgetBytes: MEBIBYTE_BYTES });
+  const lease = arena.checkout(MEBIBYTE_BYTES);
+  assert(lease);
+  const length = 2 * 64 * KIBIBYTE_BYTES;
+  lease.slot.fill(0x11, 0, length);
+  arena.commit(lease, 'first', {
+    body: lease.slot.subarray(0, length),
+    size: length,
+  });
+  const shared = arena.acquire('first');
+  assert(shared);
+  const artifact = new ArenaSegmentArtifact(shared);
+  assert.equal(arena.stats().pinned, 1);
+
+  const chunks = await collectEmittedChunks(
+    artifact.createReadStream({ highWaterMark: 64 * KIBIBYTE_BYTES })
+  );
+  await artifact.release();
+  assert.equal(arena.stats().pinned, 0);
+  assert.equal(chunks.length, 2);
+  assert.notEqual(chunks[0].buffer, lease.slot.buffer);
+
+  const recycled = arena.checkout(MEBIBYTE_BYTES);
+  assert(recycled);
+  assert.equal(recycled.slot, lease.slot);
+  recycled.slot.fill(0x22, 0, length);
+  assert.equal(
+    chunks[0].every((byte) => byte === 0x11),
+    true
+  );
+  assert.equal(
+    chunks[1].every((byte) => byte === 0x11),
+    true
+  );
+  arena.abandon(recycled);
+});
+
+test('aborting a slow ArenaSegmentArtifact reader releases one pin without mutating retained bytes', async () => {
+  const arena = new SegmentArena({ budgetBytes: MEBIBYTE_BYTES });
+  const lease = arena.checkout(MEBIBYTE_BYTES);
+  assert(lease);
+  const length = 4 * 64 * KIBIBYTE_BYTES;
+  lease.slot.fill(0x33, 0, length);
+  arena.commit(lease, 'slow', {
+    body: lease.slot.subarray(0, length),
+    size: length,
+  });
+  const shared = arena.acquire('slow');
+  assert(shared);
+  const artifact = new ArenaSegmentArtifact(shared);
+  const controller = new AbortController();
+  const firstChunk = Promise.withResolvers<Buffer>();
+  const reader = artifact.createReadStream({
+    highWaterMark: 64 * KIBIBYTE_BYTES,
+    signal: controller.signal,
+  });
+  const closed = new Promise<void>((resolve) => reader.once('close', resolve));
+  reader.once('error', () => undefined);
+  reader.once('data', (chunk: Buffer) => {
+    reader.pause();
+    firstChunk.resolve(chunk);
+  });
+  const retained = await firstChunk.promise;
+  assert.equal(arena.stats().pinned, 1);
+  controller.abort();
+  await closed;
+  await artifact.release();
+  assert.equal(arena.stats().pinned, 0);
+
+  const recycled = arena.checkout(MEBIBYTE_BYTES);
+  assert(recycled);
+  assert.equal(recycled.slot, lease.slot);
+  recycled.slot.fill(0x44, 0, length);
+  assert.equal(
+    retained.every((byte) => byte === 0x33),
+    true
+  );
+  arena.abandon(recycled);
+});
+
+test('ZeroSegmentArtifact emits independently owned zero chunks', async () => {
+  const artifact = new ZeroSegmentArtifact(3 * 64 * KIBIBYTE_BYTES);
+  const chunks = await collectEmittedChunks(
+    artifact.createReadStream({ highWaterMark: 64 * KIBIBYTE_BYTES })
+  );
+  assert.equal(chunks.length, 3);
+  assert.notEqual(chunks[0].buffer, chunks[1].buffer);
+  chunks[0].fill(0x7f);
+  assert.equal(
+    chunks[1].every((byte) => byte === 0),
+    true
+  );
+  assert.equal(
+    chunks[2].every((byte) => byte === 0),
+    true
+  );
+  await artifact.release();
+});
+
+test('SegmentArtifact reader highWaterMark has a safe cap compatible with the resource plan', async () => {
+  const plannedMaximum = 2 * MEBIBYTE_BYTES;
+  const accepted = new ZeroSegmentArtifact(64 * KIBIBYTE_BYTES);
+  const chunks = await collectEmittedChunks(
+    accepted.createReadStream({ highWaterMark: plannedMaximum })
+  );
+  assert.equal(
+    chunks.reduce((sum, chunk) => sum + chunk.length, 0),
+    64 * KIBIBYTE_BYTES
+  );
+  assert(chunks.every((chunk) => chunk.length <= 64 * KIBIBYTE_BYTES));
+  await accepted.release();
+
+  assert.throws(
+    () =>
+      new ZeroSegmentArtifact(1).createReadStream({
+        highWaterMark: plannedMaximum + 1,
+      }),
+    RangeError
+  );
+  assert.throws(
+    () =>
+      new ZeroSegmentArtifact(1).createReadStream({
+        highWaterMark: Number.MAX_SAFE_INTEGER + 1,
+      }),
+    RangeError
+  );
 });
