@@ -1,7 +1,7 @@
 import net from 'node:net';
 import tls from 'node:tls';
 import { createLogger } from '../../logging/logger.js';
-import { ProviderConfig } from '../types.js';
+import type { ProviderConfig } from '../types.js';
 import {
   NntpError,
   classifyNntpStatus,
@@ -26,6 +26,29 @@ export interface ConnectionOptions {
    * byte.
    */
   onLatencySample?: (ms: number) => void;
+  /** Injectable monotonic-enough wall clock for deterministic timeout tests. */
+  clock?: () => number;
+  /** Injectable single-shot scheduler used only for response timers. */
+  scheduleTimeout?: (
+    callback: () => void,
+    delayMs: number
+  ) => {
+    cancel(): void;
+    unref?(): void;
+  };
+}
+
+/**
+ * Lifecycle contract for a streamed NNTP BODY payload. `write(false)` follows
+ * Node writable semantics: the chunk was accepted, but the whole connection
+ * must pause until the one-shot drain callback fires. Implementations must not
+ * retain the raw chunk view beyond `write`; it aliases parser scratch.
+ */
+export interface BackpressuredBodyConsumer {
+  write(chunk: Buffer): boolean;
+  onceDrain(listener: () => void): void;
+  end(): Promise<void>;
+  fail(error: Error): void;
 }
 
 /**
@@ -64,7 +87,15 @@ interface PipelineRequest {
    * accumulates) and the request resolves with the total payload byte count once
    * the dot terminator is seen. Absent = buffer the whole payload into a slot.
    */
-  consumer?: (chunk: Buffer) => void;
+  consumer?: (chunk: Buffer) => boolean;
+  /** Full lifecycle consumer used only by the new streamed segment path. */
+  bodyConsumer?: BackpressuredBodyConsumer;
+  /** Terminator was consumed while waiting for the consumer's drain. */
+  payloadEnded?: boolean;
+  /** Guards the asynchronous consumer end operation against duplicate starts. */
+  consumerEndStarted?: boolean;
+  /** Start of the current local backpressure interval. */
+  localPauseStartedAt?: number;
 }
 
 let CONNECTION_SEQ = 0;
@@ -74,6 +105,11 @@ const RAW_POOL_CAP = 1 << 20;
 
 /** Per-connection reused socket-read buffer for the `onread` path (Node fills it, consumed synchronously). */
 const READ_BUF_SIZE = 256 * 1024;
+
+interface ConnectionTimer {
+  cancel(): void;
+  unref?(): void;
+}
 
 /**
  * A single NNTP connection over TCP or TLS. Supports **pipelining**: multiple
@@ -96,8 +132,20 @@ export class NntpConnection {
   private readBuf: Buffer;
   /** FIFO queue of in-flight requests; head is the one currently being read. */
   private queue: PipelineRequest[] = [];
-  /** Rolling "no progress" timer, (re)armed while the queue is non-empty. */
-  private stallTimer: NodeJS.Timeout | null = null;
+  /** Provider-progress/absolute timer, (re)armed while the queue is non-empty. */
+  private stallTimer: ConnectionTimer | null = null;
+  /** Current head paused by its local consumer; at most one can exist. */
+  private pausedHead: PipelineRequest | null = null;
+  /**
+   * Lazy, bounded owned carry for bytes following a paused response in one
+   * onread callback. Buffering-only connections never allocate it, and
+   * socket-buffer views are never retained after their callback.
+   */
+  private deferredRead: Buffer | undefined;
+  private deferredReadStart = 0;
+  private deferredReadEnd = 0;
+  private socketLocallyPaused = false;
+  private continuationScheduled = false;
   private destroyed = false;
   private fatalError: Error | null = null;
   /** Set when a protocol desync is detected: the connection must not be reused. */
@@ -150,7 +198,11 @@ export class NntpConnection {
    * must be usable and have fewer than `depth` requests already in flight.
    */
   canAccept(depth: number): boolean {
-    return this.isUsable && this.queue.length < Math.max(1, depth);
+    return (
+      this.isUsable &&
+      this.pausedHead === null &&
+      this.queue.length < Math.max(1, depth)
+    );
   }
 
   private attach(): void {
@@ -198,8 +250,7 @@ export class NntpConnection {
       onread: {
         buffer: readBuf,
         callback: (bytesRead: number, buf: Buffer): boolean => {
-          conn?.onRead(bytesRead, buf);
-          return true;
+          return conn?.onRead(bytesRead, buf) ?? true;
         },
       },
     };
@@ -401,8 +452,34 @@ export class NntpConnection {
       `BODY <${messageId}>`,
       signal,
       stallTimeoutMs,
-      onChunk,
+      (chunk) => {
+        onChunk(chunk);
+        return true;
+      },
       totalTimeoutMs
+    );
+  }
+
+  /**
+   * Stream one complete raw BODY into a lifecycle consumer with socket-level
+   * backpressure. The raw article is never accumulated; a false write pauses
+   * the entire pipelined connection until the consumer emits one drain.
+   */
+  bodyToConsumer(
+    messageId: string,
+    consumer: BackpressuredBodyConsumer,
+    signal: AbortSignal | undefined,
+    stallTimeoutMs: number,
+    totalTimeoutMs?: number
+  ): Promise<number> {
+    return this.submit<number>(
+      'body',
+      `BODY <${messageId}>`,
+      signal,
+      stallTimeoutMs,
+      (chunk) => consumer.write(chunk),
+      totalTimeoutMs,
+      consumer
     );
   }
 
@@ -471,11 +548,11 @@ export class NntpConnection {
 
   /** Refresh the idle stale deadline (called on release). */
   touch(): void {
-    this.staleAt = Date.now() + this.opts.idleConnectionMs;
+    this.staleAt = this.now() + this.opts.idleConnectionMs;
   }
 
   isStale(): boolean {
-    return this.staleAt > 0 && Date.now() > this.staleAt;
+    return this.staleAt > 0 && this.now() > this.staleAt;
   }
 
   // ---- internals -----------------------------------------------------------
@@ -505,30 +582,47 @@ export class NntpConnection {
     line: string,
     signal: AbortSignal | undefined,
     stallTimeoutMs: number,
-    consumer?: (chunk: Buffer) => void,
-    totalTimeoutMs?: number
+    consumer?: (chunk: Buffer) => boolean,
+    totalTimeoutMs?: number,
+    bodyConsumer?: BackpressuredBodyConsumer
   ): Promise<T> {
     if (!this.isUsable) {
-      return Promise.reject(
+      const error =
         this.fatalError ??
-          new NntpError('connection', 'connection not usable', {
-            provider: this.label,
-          })
-      );
+        new NntpError('connection', 'connection not usable', {
+          provider: this.label,
+        });
+      this.notifyConsumerFailure(bodyConsumer, error);
+      return Promise.reject(error);
     }
     if (signal?.aborted) {
+      const error = new NntpError('connection', 'aborted', {
+        provider: this.label,
+      });
+      this.notifyConsumerFailure(bodyConsumer, error);
+      this.fatalError = error;
       this.destroy();
-      return Promise.reject(
-        new NntpError('connection', 'aborted', { provider: this.label })
-      );
+      return Promise.reject(error);
     }
-    this.write(line);
+    try {
+      this.write(line);
+    } catch (cause) {
+      const error = new NntpError('connection', 'command write failed', {
+        provider: this.label,
+        cause,
+      });
+      this.notifyConsumerFailure(bodyConsumer, error);
+      this.fatalError = error;
+      this.destroy();
+      return Promise.reject(error);
+    }
     return this.queueRequest<T>(
       kind,
       signal,
       stallTimeoutMs,
       consumer,
-      totalTimeoutMs
+      totalTimeoutMs,
+      bodyConsumer
     );
   }
 
@@ -545,11 +639,12 @@ export class NntpConnection {
     kind: 'line' | 'body',
     signal: AbortSignal | undefined,
     stallTimeoutMs: number,
-    consumer?: (chunk: Buffer) => void,
-    totalTimeoutMs?: number
+    consumer?: (chunk: Buffer) => boolean,
+    totalTimeoutMs?: number,
+    bodyConsumer?: BackpressuredBodyConsumer
   ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      const now = Date.now();
+      const now = this.now();
       // A non-positive/absent total budget means "no wall-clock deadline"; only
       // the rolling stall timer bounds the request.
       const total =
@@ -564,6 +659,7 @@ export class NntpConnection {
         deadlineAt: total === Infinity ? Infinity : now + total,
         signal,
         consumer,
+        bodyConsumer,
         writtenAt: now,
         // The command was written immediately before this push, so an empty
         // queue here means it went out on an otherwise-silent connection.
@@ -574,6 +670,9 @@ export class NntpConnection {
         // safe response is to tear the whole connection down (the failover layer
         // resubmits). In practice the pipelined fetch path runs signal-free.
         req.onAbort = () => {
+          this.fatalError = new NntpError('connection', 'aborted', {
+            provider: this.label,
+          });
           this.destroy();
         };
         signal.addEventListener('abort', req.onAbort, { once: true });
@@ -603,40 +702,63 @@ export class NntpConnection {
    * destroying the connection makes the failover layer resubmit the work.
    */
   private armStallTimer(): void {
-    if (this.stallTimer) clearTimeout(this.stallTimer);
+    this.stallTimer?.cancel();
     const head = this.queue[0];
     if (!head) {
       this.stallTimer = null;
       return;
     }
     const stallMs = head.stallTimeoutMs;
-    const untilDeadline = head.deadlineAt - Date.now(); // Infinity when unbounded
-    const timeoutMs = Math.max(0, Math.min(stallMs, untilDeadline));
-    this.stallTimer = setTimeout(() => {
+    const locallyPaused = this.pausedHead === head;
+    const untilDeadline = head.deadlineAt - this.now(); // Infinity when unbounded
+    if (locallyPaused && untilDeadline === Infinity) {
+      this.stallTimer = null;
+      return;
+    }
+    const timeoutMs = Math.max(
+      0,
+      locallyPaused ? untilDeadline : Math.min(stallMs, untilDeadline)
+    );
+    this.stallTimer = this.scheduleTimeout(() => {
       this.stallTimer = null;
       // Distinguish the two causes for the log/error: the absolute deadline
-      // (transfer too slow overall) vs a full stall window of silence.
+      // (including a local sink pause) vs a full provider-silence window.
       const deadlineHit =
-        head.deadlineAt !== Infinity && Date.now() >= head.deadlineAt;
+        head.deadlineAt !== Infinity && this.now() >= head.deadlineAt;
+      const timeoutSource = locallyPaused
+        ? 'local_backpressure'
+        : deadlineHit
+          ? 'absolute'
+          : 'provider_stall';
       logger.warn(
         {
           provider: this.label,
           connId: this.id,
           inFlight: this.queue.length,
-          ...(deadlineHit
-            ? { totalTimeoutMs: head.totalTimeoutMs }
-            : { stallTimeoutMs: stallMs }),
+          ...(timeoutSource === 'local_backpressure'
+            ? {
+                totalTimeoutMs: head.totalTimeoutMs,
+                localBackpressureMs:
+                  this.now() - (head.localPauseStartedAt ?? this.now()),
+              }
+            : deadlineHit
+              ? { totalTimeoutMs: head.totalTimeoutMs }
+              : { stallTimeoutMs: stallMs }),
         },
-        deadlineHit
-          ? 'nntp segment exceeded its total time budget; destroying'
-          : 'nntp connection stalled; destroying'
+        timeoutSource === 'local_backpressure'
+          ? 'nntp segment exceeded its total time budget during local backpressure; destroying'
+          : deadlineHit
+            ? 'nntp segment exceeded its total time budget; destroying'
+            : 'nntp connection stalled; destroying'
       );
       this.fatalError = new NntpError(
         'timeout',
-        deadlineHit
-          ? `segment exceeded total budget of ${head.totalTimeoutMs}ms`
-          : `no response progress for ${stallMs}ms`,
-        { provider: this.label }
+        timeoutSource === 'local_backpressure'
+          ? `segment exceeded total budget of ${head.totalTimeoutMs}ms during local backpressure`
+          : deadlineHit
+            ? `segment exceeded total budget of ${head.totalTimeoutMs}ms`
+            : `no response progress for ${stallMs}ms`,
+        { provider: this.label, timeoutSource }
       );
       this.destroy();
     }, timeoutMs);
@@ -645,9 +767,27 @@ export class NntpConnection {
 
   private clearStallTimer(): void {
     if (this.stallTimer) {
-      clearTimeout(this.stallTimer);
+      this.stallTimer.cancel();
       this.stallTimer = null;
     }
+  }
+
+  private now(): number {
+    return this.opts.clock?.() ?? Date.now();
+  }
+
+  private scheduleTimeout(
+    callback: () => void,
+    delayMs: number
+  ): ConnectionTimer {
+    if (this.opts.scheduleTimeout) {
+      return this.opts.scheduleTimeout(callback, delayMs);
+    }
+    const timer = setTimeout(callback, delayMs);
+    return {
+      cancel: () => clearTimeout(timer),
+      unref: () => timer.unref?.(),
+    };
   }
 
   /** Re-entrancy guard for {@link onRead} (a synchronous `resolve` may enqueue). */
@@ -659,45 +799,274 @@ export class NntpConnection {
    * {@link NntpOnreadParser}; the window is only valid during this call, so
    * buffered bodies are copied into a pooled slot before resolving.
    */
-  private onRead(nread: number, buf: Buffer): void {
+  private onRead(nread: number, buf: Buffer): boolean {
     const parser = this.parser;
-    if (!parser || this.destroyed || this.processing) return;
+    if (!parser || this.destroyed) return false;
+    if (nread <= 0) return true;
+    if (this.processing || this.pausedHead) {
+      this.onDesync('socket delivered data during local backpressure');
+      return false;
+    }
     // Any byte from the peer is progress; push the rolling stall deadline out.
     this.armStallTimer();
     this.processing = true;
     try {
-      let off = 0;
-      while (off < nread && this.queue.length > 0) {
-        const head = this.queue[0];
-        if (head.stage === 'status') {
-          const step = parser.feedLine(buf, off, nread);
-          if (step.status === 'need-more') return;
-          if (step.status === 'desync') {
-            this.onDesync('non-line where a status line was expected');
-            return;
-          }
-          off = step.off;
-          if (!this.onStatusLine(head, step.text)) return; // desync handled inside
-          continue;
-        }
-        // payload stage
-        const step = parser.feedBody(buf, off, nread);
-        off = step.off;
-        if (!step.ended) return; // window exhausted; the carry is retained
-        if (head.consumer) {
-          const streamed = parser.streamed;
-          this.finishHead(() => head.resolve(streamed));
-        } else {
-          // A view of the pooled slot, valid until the ring recycles it (after
-          // `inFlight` more bodies); long enough for the synchronous decode that
-          // follows the resolve in the next microtask.
-          const body = parser.dest!.subarray(0, parser.bodyLen);
-          this.finishHead(() => head.resolve(body));
-        }
-      }
+      return this.processReadWindow(buf, 0, nread, false);
+    } catch (error) {
+      this.failFromConsumer(error);
+      return false;
     } finally {
       this.processing = false;
     }
+  }
+
+  private processReadWindow(
+    buf: Buffer,
+    initialOffset: number,
+    nread: number,
+    ownedWindow: boolean
+  ): boolean {
+    const parser = this.parser;
+    let off = initialOffset;
+    while (off < nread && this.queue.length > 0) {
+      const head = this.queue[0];
+      if (head.stage === 'status') {
+        const step = parser.feedLine(buf, off, nread);
+        if (step.status === 'need-more') return true;
+        if (step.status === 'desync') {
+          this.onDesync('non-line where a status line was expected');
+          return false;
+        }
+        off = step.off;
+        if (!this.onStatusLine(head, step.text)) return false;
+        continue;
+      }
+
+      const step = parser.feedBody(buf, off, nread);
+      off = step.off;
+      if (step.backpressured) {
+        this.pauseForConsumerDrain(
+          head,
+          step.ended,
+          buf,
+          off,
+          nread,
+          ownedWindow
+        );
+        return false;
+      }
+      if (!step.ended) return true;
+      if (head.bodyConsumer) {
+        this.pauseForConsumerEnd(head, buf, off, nread, ownedWindow);
+        return false;
+      }
+      if (head.consumer) {
+        const streamed = parser.streamed;
+        this.finishHead(() => head.resolve(streamed));
+      } else {
+        // A view of the pooled slot, valid until the ring recycles it (after
+        // `inFlight` more bodies); long enough for the synchronous decode that
+        // follows the resolve in the next microtask.
+        const body = parser.dest!.subarray(0, parser.bodyLen);
+        this.finishHead(() => head.resolve(body));
+      }
+    }
+    return true;
+  }
+
+  private pauseForConsumerDrain(
+    head: PipelineRequest,
+    payloadEnded: boolean,
+    buf: Buffer,
+    off: number,
+    nread: number,
+    ownedWindow: boolean
+  ): void {
+    const consumer = head.bodyConsumer;
+    if (!consumer) {
+      throw new NntpError(
+        'protocol',
+        'non-backpressured BODY consumer requested a pause',
+        { provider: this.label }
+      );
+    }
+    head.payloadEnded = payloadEnded;
+    this.establishLocalPause(head, buf, off, nread, ownedWindow);
+    consumer.onceDrain(() => {
+      queueMicrotask(() => {
+        try {
+          this.onConsumerDrain(head);
+        } catch (error) {
+          this.failFromConsumer(error);
+        }
+      });
+    });
+  }
+
+  private onConsumerDrain(head: PipelineRequest): void {
+    if (this.destroyed || this.pausedHead !== head || this.queue[0] !== head) {
+      return;
+    }
+    if (head.payloadEnded) {
+      this.startConsumerEnd(head);
+      return;
+    }
+    this.releaseLocalPause(head);
+    this.scheduleReadContinuation();
+  }
+
+  private pauseForConsumerEnd(
+    head: PipelineRequest,
+    buf: Buffer,
+    off: number,
+    nread: number,
+    ownedWindow: boolean
+  ): void {
+    head.payloadEnded = true;
+    this.establishLocalPause(head, buf, off, nread, ownedWindow);
+    this.startConsumerEnd(head);
+  }
+
+  private startConsumerEnd(head: PipelineRequest): void {
+    const consumer = head.bodyConsumer;
+    if (!consumer || head.consumerEndStarted) return;
+    head.consumerEndStarted = true;
+    const streamed = this.parser.streamed;
+    void Promise.resolve()
+      .then(() => consumer.end())
+      .then(() => {
+        if (
+          this.destroyed ||
+          this.pausedHead !== head ||
+          this.queue[0] !== head
+        ) {
+          return;
+        }
+        this.releaseLocalPause(head);
+        this.finishHead(() => head.resolve(streamed));
+        this.scheduleReadContinuation();
+      })
+      .catch((error: unknown) => this.failFromConsumer(error));
+  }
+
+  private establishLocalPause(
+    head: PipelineRequest,
+    buf: Buffer,
+    off: number,
+    nread: number,
+    ownedWindow: boolean
+  ): void {
+    if (this.pausedHead && this.pausedHead !== head) {
+      throw new NntpError('protocol', 'multiple local BODY pauses detected', {
+        provider: this.label,
+      });
+    }
+    this.storeDeferredRead(buf, off, nread, ownedWindow);
+    this.pausedHead = head;
+    head.localPauseStartedAt ??= this.now();
+    if (!this.socketLocallyPaused) {
+      this.socket.pause();
+      this.socketLocallyPaused = true;
+    }
+    this.armStallTimer();
+  }
+
+  private releaseLocalPause(head: PipelineRequest): void {
+    if (this.pausedHead !== head) return;
+    this.pausedHead = null;
+    head.localPauseStartedAt = undefined;
+    head.payloadEnded = false;
+    this.armStallTimer();
+  }
+
+  private storeDeferredRead(
+    buf: Buffer,
+    off: number,
+    nread: number,
+    ownedWindow: boolean
+  ): void {
+    if (off >= nread) {
+      this.deferredRead = undefined;
+      this.deferredReadStart = 0;
+      this.deferredReadEnd = 0;
+      return;
+    }
+    if (ownedWindow && this.deferredRead === buf) {
+      this.deferredReadStart = off;
+      this.deferredReadEnd = nread;
+      return;
+    }
+    const length = nread - off;
+    if (length > READ_BUF_SIZE) {
+      throw new NntpError(
+        'protocol',
+        'deferred NNTP read exceeds fixed carry',
+        {
+          provider: this.label,
+        }
+      );
+    }
+    const deferredRead = Buffer.allocUnsafe(length);
+    buf.copy(deferredRead, 0, off, nread);
+    this.deferredRead = deferredRead;
+    this.deferredReadStart = 0;
+    this.deferredReadEnd = length;
+  }
+
+  private scheduleReadContinuation(): void {
+    if (this.continuationScheduled) return;
+    this.continuationScheduled = true;
+    queueMicrotask(() => {
+      this.continuationScheduled = false;
+      try {
+        this.continueAfterLocalPause();
+      } catch (error) {
+        this.failFromConsumer(error);
+      }
+    });
+  }
+
+  private continueAfterLocalPause(): void {
+    if (this.destroyed || this.pausedHead || this.processing) return;
+    if (this.deferredReadStart < this.deferredReadEnd) {
+      const deferredRead = this.deferredRead;
+      if (!deferredRead) {
+        this.onDesync('missing owned NNTP carry after local backpressure');
+        return;
+      }
+      const start = this.deferredReadStart;
+      const end = this.deferredReadEnd;
+      this.deferredReadStart = 0;
+      this.deferredReadEnd = 0;
+      this.processing = true;
+      try {
+        if (!this.processReadWindow(deferredRead, start, end, true)) {
+          return;
+        }
+      } catch (error) {
+        this.failFromConsumer(error);
+        return;
+      } finally {
+        this.processing = false;
+      }
+    }
+    this.deferredRead = undefined;
+    if (!this.destroyed && !this.pausedHead && this.socketLocallyPaused) {
+      this.socketLocallyPaused = false;
+      this.socket.resume();
+    }
+  }
+
+  private failFromConsumer(error: unknown): void {
+    if (this.destroyed) return;
+    this.fatalError =
+      error instanceof Error
+        ? error
+        : new NntpError('protocol', 'BODY consumer failed', {
+            provider: this.label,
+            cause: error,
+          });
+    this.destroy();
   }
 
   /**
@@ -724,11 +1093,12 @@ export class NntpConnection {
         `command failed: ${status.code} ${status.message}`,
         { code: status.code, provider: this.label }
       );
+      this.failBodyConsumer(head, err);
       this.finishHead(() => head.reject(err));
       return true;
     }
     if (head.solo) {
-      this.opts.onLatencySample?.(Date.now() - head.writtenAt);
+      this.opts.onLatencySample?.(this.now() - head.writtenAt);
     }
     head.stage = 'payload';
     if (head.consumer) {
@@ -787,12 +1157,37 @@ export class NntpConnection {
   private rejectAll(err: Error): void {
     const pending = this.queue;
     this.queue = [];
+    this.pausedHead = null;
+    this.deferredRead = undefined;
+    this.deferredReadStart = 0;
+    this.deferredReadEnd = 0;
+    this.socketLocallyPaused = false;
     this.clearStallTimer();
     for (const req of pending) {
       if (req.signal && req.onAbort) {
         req.signal.removeEventListener('abort', req.onAbort);
       }
+      this.failBodyConsumer(req, err);
       req.reject(err);
+    }
+  }
+
+  private failBodyConsumer(req: PipelineRequest, error: Error): void {
+    this.notifyConsumerFailure(req.bodyConsumer, error);
+  }
+
+  private notifyConsumerFailure(
+    consumer: BackpressuredBodyConsumer | undefined,
+    error: Error
+  ): void {
+    if (!consumer) return;
+    try {
+      consumer.fail(error);
+    } catch {
+      logger.warn(
+        { provider: this.label, connId: this.id },
+        'nntp BODY consumer cleanup failed'
+      );
     }
   }
 }

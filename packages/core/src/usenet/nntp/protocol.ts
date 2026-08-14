@@ -52,6 +52,8 @@ export type LineStep =
 export interface BodyStep {
   /** True once the `\r\n.\r\n` terminator has been consumed. */
   ended: boolean;
+  /** True when the streamed consumer accepted bytes but requested a pause. */
+  backpressured: boolean;
   /** New offset into the socket buffer (past the terminator when `ended`). */
   off: number;
 }
@@ -87,7 +89,7 @@ export class NntpOnreadParser {
   private scanned = 0;
 
   // --- streaming body ---
-  private consumer: ((chunk: Buffer) => void) | null = null;
+  private consumer: ((chunk: Buffer) => boolean) | null = null;
   /** Reused scratch for the streaming-merge scan (sized lazily to the read buffer). */
   private streamScratch: Buffer | null = null;
   /** Held-back tail bytes that might begin the terminator (streaming mode). */
@@ -115,7 +117,7 @@ export class NntpOnreadParser {
   }
 
   /** Arm for a streamed BODY payload (probe path); body bytes go to `consumer`. */
-  beginStreamingBody(consumer: (chunk: Buffer) => void): void {
+  beginStreamingBody(consumer: (chunk: Buffer) => boolean): void {
     this.consumer = consumer;
     this.dest = null;
     this.tailLen = 0;
@@ -182,11 +184,15 @@ export class NntpOnreadParser {
     if (hit >= 0) {
       const windowConsumed = hit + TERM_LEN - start; // terminator end, in this read's bytes
       this.bodyLen = hit; // body ends at the terminator (rewinds if it straddled)
-      return { ended: true, off: off + windowConsumed };
+      return {
+        ended: true,
+        backpressured: false,
+        off: off + windowConsumed,
+      };
     }
     this.bodyLen = writtenEnd;
     this.scanned = Math.max(0, writtenEnd - TERM_OVERLAP);
-    return { ended: false, off: nread };
+    return { ended: false, backpressured: false, off: nread };
   }
 
   /** Streaming probe path: merge tail+window in scratch, emit all but the held tail. */
@@ -202,22 +208,28 @@ export class NntpOnreadParser {
     const total = this.tailLen + win;
     const hit = s.subarray(0, total).indexOf(DOT_TERMINATOR); // bounded: scratch tail is stale
     if (hit >= 0) {
+      let acceptsMore = true;
       if (hit > 0) {
-        this.consumer!(s.subarray(0, hit));
+        acceptsMore = this.consumer!(s.subarray(0, hit));
         this.streamed += hit;
       }
       const windowConsumed = hit + TERM_LEN - this.tailLen;
       this.tailLen = 0;
-      return { ended: true, off: off + windowConsumed };
+      return {
+        ended: true,
+        backpressured: !acceptsMore,
+        off: off + windowConsumed,
+      };
     }
     const keep = Math.min(TERM_OVERLAP, total);
     const emitLen = total - keep;
+    let acceptsMore = true;
     if (emitLen > 0) {
-      this.consumer!(s.subarray(0, emitLen));
+      acceptsMore = this.consumer!(s.subarray(0, emitLen));
       this.streamed += emitLen;
     }
     s.copy(this.tail, 0, emitLen, total);
     this.tailLen = keep;
-    return { ended: false, off: nread };
+    return { ended: false, backpressured: !acceptsMore, off: nread };
   }
 }

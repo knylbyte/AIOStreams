@@ -29,24 +29,38 @@ export type NntpErrorKind =
   /** No providers configured/available. */
   | 'no_providers';
 
+/** Stable timeout source for retry/log classification. */
+export type NntpTimeoutSource =
+  | 'provider_stall'
+  | 'absolute'
+  | 'local_backpressure';
+
 export class NntpError extends Error {
   readonly kind: NntpErrorKind;
   /** NNTP numeric status code, when one was received. */
   readonly code?: number;
   /** Human-friendly provider label (display name, falling back to the id). */
   readonly provider?: string;
+  /** Present only when {@link kind} is `timeout`. */
+  readonly timeoutSource?: NntpTimeoutSource;
   cause?: unknown;
 
   constructor(
     kind: NntpErrorKind,
     message: string,
-    opts: { code?: number; provider?: string; cause?: unknown } = {}
+    opts: {
+      code?: number;
+      provider?: string;
+      timeoutSource?: NntpTimeoutSource;
+      cause?: unknown;
+    } = {}
   ) {
     super(message);
     this.name = 'NntpError';
     this.kind = kind;
     this.code = opts.code;
     this.provider = opts.provider;
+    this.timeoutSource = opts.timeoutSource;
     if (opts.cause !== undefined) this.cause = opts.cause;
     if (Error.captureStackTrace) Error.captureStackTrace(this, NntpError);
   }
