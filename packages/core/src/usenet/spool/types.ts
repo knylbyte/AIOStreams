@@ -117,6 +117,8 @@ export interface GrowingFileReadOptions {
   readonly endExclusive?: number;
   readonly signal?: AbortSignal;
   readonly highWaterMark?: number;
+  /** Internal producer/decoder validation that must precede successful EOF. */
+  readonly completion?: Promise<void>;
 }
 
 /** Keeps a complete spool file alive while cache promotion is in progress. */

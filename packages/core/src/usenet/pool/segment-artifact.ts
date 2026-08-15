@@ -3,6 +3,7 @@ import { createLogger } from '../../logging/logger.js';
 import type { DecodedSegmentMetadata } from './streaming-yenc-article-decoder.js';
 import type { SharedSegment } from './segment-arena.js';
 import type { GrowingSpoolArtifact } from '../spool/growing-artifact.js';
+import { UsenetSpoolError } from '../spool/errors.js';
 
 const ARTIFACT_CHUNK_BYTES = 64 * 1024;
 const MEBIBYTE_BYTES = 1024 * 1024;
@@ -20,6 +21,26 @@ export interface SegmentArtifactReadOptions {
 
 /** Where the decoded bytes backing a {@link SegmentArtifact} currently live. */
 export type SegmentArtifactStorage = 'arena' | 'disk-cache' | 'spool' | 'zero';
+
+/** Scalar-only metadata used by the buffer-free direct spooling locator. */
+export interface SegmentRangeMetadata {
+  readonly byteRange?: readonly [number, number];
+  readonly fileSize?: number;
+  readonly totalParts?: number;
+  readonly name?: string;
+  readonly decodedSize?: number;
+}
+
+/** Delivery policy for one independently validated artifact waiter. */
+export interface SegmentArtifactFetchOptions {
+  /** Exact file-grid length asserted independently after producer completion. */
+  readonly expectedLength?: number;
+  /**
+   * Permit resolution after the first committed byte. Successful reader EOF
+   * still waits for BODY, decoder, sink and final-length validation.
+   */
+  readonly allowGrowing?: boolean;
+}
 
 /**
  * One independently owned reference to decoded segment bytes.
@@ -194,7 +215,6 @@ export class ArenaSegmentArtifact implements SegmentArtifact {
  * only after its final independently delivered handle is released.
  */
 export class GrowingSpoolArtifactAdapter implements SegmentArtifact {
-  readonly length: number;
   readonly storage = 'spool' as const;
 
   private reader: Readable | undefined;
@@ -203,10 +223,18 @@ export class GrowingSpoolArtifactAdapter implements SegmentArtifact {
 
   constructor(
     private readonly artifact: GrowingSpoolArtifact,
-    readonly metadata: DecodedSegmentMetadata,
-    private readonly releaseReference: () => Promise<void>
-  ) {
-    this.length = metadata.size;
+    private readonly initialMetadata: DecodedSegmentMetadata,
+    private readonly releaseReference: () => Promise<void>,
+    private readonly producerCompletion?: Promise<DecodedSegmentMetadata>,
+    private readonly currentMetadata?: () => DecodedSegmentMetadata
+  ) {}
+
+  get metadata(): DecodedSegmentMetadata {
+    return this.currentMetadata?.() ?? this.initialMetadata;
+  }
+
+  get length(): number {
+    return this.metadata.size;
   }
 
   createReadStream(options: SegmentArtifactReadOptions = {}): Readable {
@@ -216,8 +244,21 @@ export class GrowingSpoolArtifactAdapter implements SegmentArtifact {
     if (this.reader) {
       throw new Error('Segment artifact handles support one reader');
     }
-    validateReadRange(this.length, options);
-    const reader = this.artifact.createReadStream(options);
+    const lengthAtOpen = this.length;
+    validateReadRange(lengthAtOpen, options);
+    const completion = this.producerCompletion?.then((metadata) => {
+      if (metadata.size !== lengthAtOpen) {
+        throw new UsenetSpoolError(
+          'USENET_SPOOL_IO',
+          'Decoded segment length differs from the exact file range'
+        );
+      }
+    });
+    void completion?.catch(() => undefined);
+    const reader = this.artifact.createReadStream({
+      ...options,
+      completion,
+    });
     this.reader = reader;
     reader.once('close', () => {
       void this.release().catch((error: unknown) => {

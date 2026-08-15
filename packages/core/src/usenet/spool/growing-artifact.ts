@@ -223,6 +223,7 @@ export class GrowingSpoolArtifact implements GrowingReadableSource {
       endExclusive: options.endExclusive,
       highWaterMark,
       signal: options.signal,
+      completion: options.completion,
       onClosed: () => this.readerClosed(reader),
     });
     this.readers.add(reader);

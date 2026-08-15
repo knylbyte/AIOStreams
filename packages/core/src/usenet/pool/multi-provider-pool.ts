@@ -33,11 +33,16 @@ import {
 import {
   ArenaSegmentArtifact,
   GrowingSpoolArtifactAdapter,
+  type SegmentArtifactFetchOptions,
+  type SegmentRangeMetadata,
   type SegmentArtifact,
 } from './segment-artifact.js';
 import { SegmentSpoolingRuntime } from './segment-spooling-runtime.js';
 import { SpoolingSegmentSink } from './spooling-segment-sink.js';
-import type { DecodedSegmentMetadata } from './streaming-yenc-article-decoder.js';
+import type {
+  DecodedSegmentHeaderMetadata,
+  DecodedSegmentMetadata,
+} from './streaming-yenc-article-decoder.js';
 import type { GrowingSpoolArtifact } from '../spool/growing-artifact.js';
 import { UsenetSpoolError } from '../spool/errors.js';
 import { resolveEstimatedDecodedSegmentBytes } from '../resource-plan.js';
@@ -68,6 +73,7 @@ interface SharedFlight {
 /** One caller waiting for an independently releasable file-backed handle. */
 interface ArtifactWaiter {
   readonly expectedLength: number | undefined;
+  readonly allowGrowing: boolean;
   deliver(artifact: SegmentArtifact): void;
   fail(error: unknown): void;
 }
@@ -92,6 +98,9 @@ class SharedSpoolArtifactOwner {
   private disposePromise: Promise<void> | undefined;
   private producerActive: boolean;
   private metadataValue: DecodedSegmentMetadata;
+  private readonly producerCompletion =
+    Promise.withResolvers<DecodedSegmentMetadata>();
+  private producerSettled = false;
 
   constructor(
     private readonly artifact: GrowingSpoolArtifact,
@@ -100,6 +109,11 @@ class SharedSpoolArtifactOwner {
   ) {
     this.metadataValue = metadata;
     this.producerActive = producerActive;
+    if (!producerActive) {
+      this.producerSettled = true;
+      this.producerCompletion.resolve(metadata);
+    }
+    void this.producerCompletion.promise.catch(() => undefined);
   }
 
   get expectedLength(): number {
@@ -127,17 +141,25 @@ class SharedSpoolArtifactOwner {
         released = true;
         this.references--;
         return this.disposeIfUnused();
-      }
+      },
+      this.producerCompletion.promise,
+      () => this.metadataValue
     );
   }
 
   producerCompleted(metadata: DecodedSegmentMetadata): void {
+    if (this.producerSettled) return;
+    this.producerSettled = true;
     this.metadataValue = metadata;
     this.producerActive = false;
+    this.producerCompletion.resolve(metadata);
   }
 
-  producerFailed(): void {
+  producerFailed(error: Error): void {
+    if (this.producerSettled) return;
+    this.producerSettled = true;
     this.producerActive = false;
+    this.producerCompletion.reject(error);
   }
 
   disposeIfUnused(): Promise<void> {
@@ -386,9 +408,10 @@ export class MultiProviderPool {
     nzbHash: string,
     signal: AbortSignal | undefined,
     priority: CommandPriority = CommandPriority.High,
-    options: { readonly expectedLength?: number } = {}
+    options: SegmentArtifactFetchOptions = {}
   ): Promise<SegmentArtifact> {
     const expectedLength = options.expectedLength;
+    const allowGrowing = options.allowGrowing ?? false;
     if (
       expectedLength !== undefined &&
       (!Number.isSafeInteger(expectedLength) || expectedLength <= 0)
@@ -396,6 +419,12 @@ export class MultiProviderPool {
       throw new UsenetSpoolError(
         'USENET_SPOOL_INVALID_ARGUMENT',
         'Expected segment length must be a safe positive integer'
+      );
+    }
+    if (typeof allowGrowing !== 'boolean') {
+      throw new UsenetSpoolError(
+        'USENET_SPOOL_INVALID_ARGUMENT',
+        'Growing artifact delivery must be a boolean'
       );
     }
     const id = segment.messageId;
@@ -434,8 +463,83 @@ export class MultiProviderPool {
       nzbHash,
       priority,
       signal,
-      expectedLength
+      expectedLength,
+      allowGrowing
     );
+  }
+
+  /**
+   * Fetch only bounded scalar yEnc metadata for the direct spooling locator.
+   * Arena and file-backed hits reuse their already parsed metadata; a network
+   * miss retains at most the bounded yEnc head parser state and never calls the
+   * buffering cache/body APIs.
+   */
+  async fetchSegmentRangeMetadata(
+    segment: NzbSegmentRef,
+    nzbHash: string,
+    signal: AbortSignal | undefined,
+    priority: CommandPriority = CommandPriority.High
+  ): Promise<SegmentRangeMetadata> {
+    const id = segment.messageId;
+    const pinned = this.arena.acquire(id);
+    if (pinned) {
+      try {
+        return {
+          byteRange: pinned.data.byteRange,
+          fileSize: pinned.data.fileSize,
+          totalParts: pinned.data.totalParts,
+          name: pinned.data.name,
+          decodedSize: pinned.data.size,
+        };
+      } finally {
+        pinned.release();
+      }
+    }
+    if (signal?.aborted) throw new NntpError('connection', 'aborted');
+
+    const persistent = await this.spooling?.artifactCache?.acquire(id, signal);
+    if (persistent) {
+      try {
+        return {
+          byteRange: persistent.metadata.byteRange,
+          fileSize: persistent.metadata.fileSize,
+          totalParts: persistent.metadata.totalParts,
+          name: persistent.metadata.name,
+          decodedSize: persistent.metadata.size,
+        };
+      } finally {
+        await persistent.release();
+      }
+    }
+
+    const cached = this.cachedMiss(id);
+    if (cached !== undefined) throw this.cachedMissError(id, cached);
+    const releaseGlobal = await this.globalDownloads.acquire(priority, signal);
+    const wire = this.wireTracker();
+    try {
+      const head = await this.fetcher.fetchHead(
+        segment,
+        nzbHash,
+        priority,
+        0,
+        wire.start,
+        signal
+      );
+      return {
+        byteRange: head.byteRange,
+        fileSize: head.fileSize,
+        totalParts: head.totalParts,
+        name: head.name,
+        decodedSize: head.size,
+      };
+    } catch (error) {
+      const kind = definitiveLossKind(error);
+      if (kind) this.recordMiss(id, kind);
+      throw error;
+    } finally {
+      wire.end();
+      releaseGlobal();
+    }
   }
 
   private joinArtifactFlight(
@@ -443,7 +547,8 @@ export class MultiProviderPool {
     nzbHash: string,
     priority: CommandPriority,
     signal: AbortSignal | undefined,
-    expectedLength: number | undefined
+    expectedLength: number | undefined,
+    allowGrowing: boolean
   ): Promise<SegmentArtifact> {
     const id = segment.messageId;
     let flight = this.artifactInflight.get(id);
@@ -488,6 +593,7 @@ export class MultiProviderPool {
       };
       const waiter: ArtifactWaiter = {
         expectedLength,
+        allowGrowing,
         deliver: (artifact) => {
           if (!finish()) {
             void artifact.release().catch((releaseError: unknown) => {
@@ -525,7 +631,9 @@ export class MultiProviderPool {
         !settled &&
         joined.growingOwnerPublished &&
         owner !== undefined &&
-        owner?.expectedLength === expectedLength
+        allowGrowing &&
+        (expectedLength === undefined ||
+          owner.expectedLength === expectedLength)
       ) {
         joined.waiters.delete(waiter);
         waiter.deliver(owner.acquire());
@@ -590,11 +698,15 @@ export class MultiProviderPool {
             downloadMemoryLease.bytes,
             runtime.plan.decoderChunkBytes
           );
-          const earlyLength = this.resolveEarlyArtifactLength(flight);
-          if (earlyLength !== undefined) {
+          const prepareGrowingOwner = (
+            header: DecodedSegmentHeaderMetadata
+          ): void => {
+            if (flight.growingOwner?.owns(artifact)) return;
+            const metadata = this.resolveEarlyArtifactMetadata(flight, header);
+            if (!metadata) return;
             const owner = new SharedSpoolArtifactOwner(
               artifact,
-              { size: earlyLength },
+              metadata,
               true
             );
             flight.growingOwner = owner;
@@ -605,17 +717,18 @@ export class MultiProviderPool {
               .catch(() => {
                 // Attempt disposal/provider failover owns the typed failure.
               });
-          }
+          };
           return {
             sink,
             value: artifact,
+            onHeader: prepareGrowingOwner,
             dispose: async (error: Error) => {
               sink.fail(error);
               const owner = flight.growingOwner;
               if (owner?.owns(artifact)) {
                 flight.growingOwner = undefined;
                 flight.growingOwnerPublished = false;
-                owner.producerFailed();
+                owner.producerFailed(artifact.snapshot().error ?? error);
               }
               await artifact.dispose();
             },
@@ -630,12 +743,6 @@ export class MultiProviderPool {
       unownedArtifact = result.value;
       let owner = flight.growingOwner;
       if (owner?.owns(result.value)) {
-        if (owner.expectedLength !== result.metadata.size) {
-          throw new UsenetSpoolError(
-            'USENET_SPOOL_IO',
-            'Decoded segment length differs from the exact file range'
-          );
-        }
         owner.producerCompleted(result.metadata);
       } else {
         owner = new SharedSpoolArtifactOwner(result.value, result.metadata);
@@ -647,7 +754,16 @@ export class MultiProviderPool {
       }
       const waiters = [...flight.waiters];
       flight.waiters.clear();
-      for (const waiter of waiters) waiter.deliver(owner.acquire());
+      for (const waiter of waiters) {
+        if (
+          waiter.expectedLength !== undefined &&
+          waiter.expectedLength !== result.metadata.size
+        ) {
+          waiter.fail(this.segmentLengthMismatch());
+          continue;
+        }
+        waiter.deliver(owner.acquire());
+      }
       try {
         await owner.disposeIfUnused();
       } catch (cleanupError) {
@@ -667,12 +783,21 @@ export class MultiProviderPool {
           );
         }
       }
+      const normalized = flight.ctl.signal.aborted
+        ? new NntpError('connection', 'aborted')
+        : error instanceof Error
+          ? error
+          : new UsenetSpoolError(
+              'USENET_SPOOL_IO',
+              'Segment artifact fetch failed',
+              { cause: error }
+            );
       const owner = flight.growingOwner;
       if (owner) {
         flight.growingOwner = undefined;
         flight.growingOwnerPublished = false;
         try {
-          owner.producerFailed();
+          owner.producerFailed(normalized);
           await owner.disposeIfUnused();
         } catch (cleanupError) {
           logger.warn(
@@ -684,9 +809,6 @@ export class MultiProviderPool {
       if (this.artifactInflight.get(id) === flight) {
         this.artifactInflight.delete(id);
       }
-      const normalized = flight.ctl.signal.aborted
-        ? new NntpError('connection', 'aborted')
-        : error;
       const kind = definitiveLossKind(normalized);
       if (kind) this.recordMiss(id, kind);
       const waiters = [...flight.waiters];
@@ -716,18 +838,43 @@ export class MultiProviderPool {
     return runtime.acquireStreamMemory(priority, signal);
   }
 
-  private resolveEarlyArtifactLength(
-    flight: ArtifactFlight
-  ): number | undefined {
-    let resolved: number | undefined;
-    for (const waiter of flight.waiters) {
-      if (waiter.expectedLength === undefined) continue;
-      if (resolved !== undefined && resolved !== waiter.expectedLength) {
-        return undefined;
+  private resolveEarlyArtifactMetadata(
+    flight: ArtifactFlight,
+    header: DecodedSegmentHeaderMetadata
+  ): DecodedSegmentMetadata | undefined {
+    const growingWaiters = [...flight.waiters].filter(
+      (waiter) => waiter.allowGrowing
+    );
+    if (growingWaiters.length === 0) return undefined;
+
+    let expectedLength = header.expectedSize;
+    if (expectedLength !== undefined) {
+      const eligible = growingWaiters.some(
+        (waiter) =>
+          waiter.expectedLength === undefined ||
+          waiter.expectedLength === expectedLength
+      );
+      if (!eligible) return undefined;
+    } else {
+      for (const waiter of growingWaiters) {
+        if (waiter.expectedLength === undefined) continue;
+        if (
+          expectedLength !== undefined &&
+          expectedLength !== waiter.expectedLength
+        ) {
+          return undefined;
+        }
+        expectedLength = waiter.expectedLength;
       }
-      resolved = waiter.expectedLength;
     }
-    return resolved;
+    if (expectedLength === undefined) return undefined;
+    return {
+      byteRange: header.byteRange,
+      fileSize: header.fileSize,
+      totalParts: header.totalParts,
+      name: header.name,
+      size: expectedLength,
+    };
   }
 
   private publishGrowingArtifact(
@@ -737,7 +884,10 @@ export class MultiProviderPool {
     if (flight.growingOwner !== owner || flight.ctl.signal.aborted) return;
     flight.growingOwnerPublished = true;
     const matching = [...flight.waiters].filter(
-      (waiter) => waiter.expectedLength === owner.expectedLength
+      (waiter) =>
+        waiter.allowGrowing &&
+        (waiter.expectedLength === undefined ||
+          waiter.expectedLength === owner.expectedLength)
     );
     for (const waiter of matching) {
       flight.waiters.delete(waiter);
@@ -753,9 +903,13 @@ export class MultiProviderPool {
       return;
     }
     await artifact.release();
-    throw new UsenetSpoolError(
+    throw this.segmentLengthMismatch('Stored');
+  }
+
+  private segmentLengthMismatch(prefix = 'Decoded'): UsenetSpoolError {
+    return new UsenetSpoolError(
       'USENET_SPOOL_IO',
-      'Stored segment length differs from the exact file range'
+      `${prefix} segment length differs from the exact file range`
     );
   }
 

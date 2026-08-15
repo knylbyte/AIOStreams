@@ -17,7 +17,9 @@ import { FileStream, type FileStreamPool } from './file-stream.js';
 import type { SharedSegment } from './segment-arena.js';
 import type {
   SegmentArtifact,
+  SegmentArtifactFetchOptions,
   SegmentArtifactReadOptions,
+  SegmentRangeMetadata,
 } from './segment-artifact.js';
 import { createSegmentReadStream } from './segment-read-stream-factory.js';
 import { SegmentsStream } from './segments-stream.js';
@@ -31,6 +33,7 @@ interface FetchCall {
   readonly segment: NzbSegmentRef;
   readonly signal: AbortSignal | undefined;
   readonly expectedLength: number | undefined;
+  readonly allowGrowing: boolean;
 }
 
 type FetchHandler = (call: FetchCall) => Promise<SegmentArtifact>;
@@ -42,6 +45,7 @@ class TestArtifactSource implements FileStreamPool {
   bufferingCalls = 0;
   sharedCalls = 0;
   sharedReleases = 0;
+  metadataCalls = 0;
   activeStreamLeases = 0;
   peakStreamLeases = 0;
 
@@ -50,19 +54,26 @@ class TestArtifactSource implements FileStreamPool {
     readonly resolve: () => void;
   }>();
 
-  constructor(private readonly handler: FetchHandler) {}
+  constructor(
+    private readonly handler: FetchHandler,
+    private readonly metadataHandler?: (
+      segment: NzbSegmentRef,
+      signal: AbortSignal | undefined
+    ) => Promise<SegmentRangeMetadata>
+  ) {}
 
   fetchSegmentArtifact(
     segment: NzbSegmentRef,
     _nzbHash: string,
     signal: AbortSignal | undefined,
     _priority: CommandPriority,
-    options?: { readonly expectedLength?: number }
+    options?: SegmentArtifactFetchOptions
   ): Promise<SegmentArtifact> {
     const call = {
       segment,
       signal,
       expectedLength: options?.expectedLength,
+      allowGrowing: options?.allowGrowing ?? false,
     };
     this.calls.push(call);
     for (const waiter of [...this.callWaiters]) {
@@ -132,6 +143,27 @@ class TestArtifactSource implements FileStreamPool {
         released = true;
         this.sharedReleases++;
       },
+    });
+  }
+
+  fetchSegmentRangeMetadata(
+    segment: NzbSegmentRef,
+    _nzbHash: string,
+    signal: AbortSignal | undefined
+  ): Promise<SegmentRangeMetadata> {
+    this.metadataCalls++;
+    if (this.metadataHandler) return this.metadataHandler(segment, signal);
+    const body =
+      this.sharedBodies.get(segment.messageId) ??
+      this.bufferingBodies.get(segment.messageId);
+    if (!body) {
+      return Promise.reject(new Error('unexpected segment metadata lookup'));
+    }
+    return Promise.resolve({
+      byteRange: [0, body.length],
+      fileSize: body.length,
+      totalParts: 1,
+      decodedSize: body.length,
     });
   }
 
@@ -402,6 +434,162 @@ test('spooling mode leaves FileStream readAt on the shared buffering API', async
   assert.equal(source.calls.length, 0);
 });
 
+test('spooling FileStream starts at byte zero without a buffering locator and tails segment zero', async () => {
+  const first = new ControlledArtifact(4);
+  const second = new BufferArtifact(Buffer.from('bbbb'));
+  const source = new TestArtifactSource((call) =>
+    Promise.resolve(call.segment.messageId === 'segment-0' ? first : second)
+  );
+  const file = new FileStream(
+    source,
+    {
+      segments: [segment(0), segment(1)],
+      knownSize: 8,
+    },
+    'no-buffering-locator',
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      streamingMode: 'segment_spooling',
+      prefetchSegments: 2,
+    }
+  );
+  await file.open();
+  const stream = file.createReadStream();
+  const firstOutput = once(stream, 'data');
+  const output = collect(stream);
+  const firstReader = await first.readerReady.promise;
+  assert.equal(firstReader.writableEnded, false);
+  first.write(Buffer.from('aa'));
+  await firstOutput;
+
+  assert.equal(source.sharedCalls, 0);
+  assert.equal(source.bufferingCalls, 0);
+  assert.equal(source.metadataCalls, 0);
+  assert.equal(source.calls.length, 2);
+  assert.equal(source.calls[0].allowGrowing, true);
+  assert.equal(source.calls[1].allowGrowing, false);
+
+  first.write(Buffer.from('aa'));
+  first.end();
+  assert.equal((await output).toString(), 'aaaabbbb');
+  assert.equal(first.releaseCalls, 1);
+  assert.equal(second.releaseCalls, 1);
+  assert.equal(source.activeStreamLeases, 0);
+});
+
+test('spooling FileStream open without knownSize uses only bounded scalar metadata', async () => {
+  const bodies = new Map([
+    ['segment-0', Buffer.from('aaaa')],
+    ['segment-1', Buffer.from('bbbb')],
+  ]);
+  const source = new TestArtifactSource(
+    (call) => {
+      const body = bodies.get(call.segment.messageId);
+      if (!body) throw new Error('missing bounded metadata test body');
+      return Promise.resolve(new BufferArtifact(body));
+    },
+    (_segment, signal) => {
+      assert.notEqual(signal?.aborted, true);
+      return Promise.resolve({
+        byteRange: [0, 4],
+        fileSize: 8,
+        totalParts: 2,
+        decodedSize: 4,
+      });
+    }
+  );
+  const file = new FileStream(
+    source,
+    { segments: [segment(0), segment(1)] },
+    'bounded-open-metadata',
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      streamingMode: 'segment_spooling',
+      prefetchSegments: 2,
+    }
+  );
+
+  await file.open();
+  assert.equal(file.size(), 8);
+  assert.equal(source.metadataCalls, 1);
+  assert.equal(source.sharedCalls, 0);
+  assert.equal(source.bufferingCalls, 0);
+  assert.equal(source.calls.length, 0);
+
+  assert.equal((await collect(file.createReadStream())).toString(), 'aaaabbbb');
+  assert.equal(source.sharedCalls, 0);
+  assert.equal(source.bufferingCalls, 0);
+  assert.equal(source.metadataCalls, 1);
+  assert.equal(source.calls.length, 2);
+});
+
+test('nonzero spooling seek reuses its file-backed locator artifact', async () => {
+  const located = new BufferArtifact(Buffer.from('BBBB'));
+  const source = new TestArtifactSource((call) => {
+    assert.equal(call.segment.messageId, 'segment-1');
+    return Promise.resolve(located);
+  });
+  const file = new FileStream(
+    source,
+    {
+      segments: [segment(0), segment(1), segment(2)],
+      knownSize: 12,
+    },
+    'reuse-locator-artifact',
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      streamingMode: 'segment_spooling',
+      prefetchSegments: 1,
+    }
+  );
+  await file.open();
+
+  assert.equal(
+    (await collect(file.createReadStream({ start: 5, end: 7 }))).toString(),
+    'BB'
+  );
+  assert.equal(source.calls.length, 1);
+  assert.equal(source.calls[0].allowGrowing, false);
+  assert.equal(source.sharedCalls, 0);
+  assert.equal(source.bufferingCalls, 0);
+  assert.equal(source.metadataCalls, 0);
+  assert.equal(located.releaseCalls, 1);
+  assert.equal(source.activeStreamLeases, 0);
+});
+
+test('destroy during a spooling locator aborts it before stream admission', async () => {
+  const pending = Promise.withResolvers<SegmentArtifact>();
+  const source = new TestArtifactSource((call) =>
+    abortableArtifact(pending.promise, call.signal)
+  );
+  const file = new FileStream(
+    source,
+    {
+      segments: [segment(0), segment(1)],
+      knownSize: 8,
+    },
+    'abort-locator',
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      streamingMode: 'segment_spooling',
+      prefetchSegments: 1,
+    }
+  );
+  await file.open();
+  const stream = file.createReadStream({ start: 5, end: 7 });
+  stream.resume();
+  await source.waitForCalls(1);
+  const locatorSignal = source.calls[0].signal;
+  assert(locatorSignal);
+  stream.destroy();
+  await closeEvent(stream);
+
+  assert.equal(locatorSignal.aborted, true);
+  assert.equal(getEventListeners(locatorSignal, 'abort').length, 0);
+  assert.equal(source.calls.length, 1);
+  assert.equal(source.activeStreamLeases, 0);
+});
+
 test('out-of-order artifacts wait on disk references and emit strictly in order', async () => {
   const gates = Array.from({ length: 3 }, () =>
     Promise.withResolvers<SegmentArtifact>()
@@ -491,6 +679,38 @@ test('the first artifact emits committed bytes before its writer completes', asy
   assert.equal(Buffer.concat(chunks).toString(), 'abcdef');
   await closeEvent(stream);
   assert.equal(artifact.releaseCalls, 1);
+  assert.equal(source.activeStreamLeases, 0);
+});
+
+test('the next segment cannot advance before the growing first reader validates EOF', async () => {
+  const first = new ControlledArtifact(3);
+  const second = new BufferArtifact(Buffer.from('def'));
+  const source = new TestArtifactSource((call) =>
+    Promise.resolve(call.segment.messageId === 'segment-0' ? first : second)
+  );
+  const stream = new SpoolingSegmentsStream(streamOptions(source, 2));
+  const chunks: Buffer[] = [];
+  const firstData = Promise.withResolvers<void>();
+  stream.on('data', (chunk: Buffer) => {
+    chunks.push(chunk);
+    firstData.resolve();
+  });
+  const ended = Promise.withResolvers<void>();
+  stream.once('end', ended.resolve);
+  await first.readerReady.promise;
+  first.write(Buffer.from('abc'));
+  await firstData.promise;
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(Buffer.concat(chunks).toString(), 'abc');
+  assert.equal(second.releaseCalls, 0);
+
+  first.end();
+  await ended.promise;
+  assert.equal(Buffer.concat(chunks).toString(), 'abcdef');
+  await closeEvent(stream);
+  assert.equal(first.releaseCalls, 1);
+  assert.equal(second.releaseCalls, 1);
   assert.equal(source.activeStreamLeases, 0);
 });
 

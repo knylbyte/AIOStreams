@@ -22,6 +22,20 @@ export interface DecodedSegmentMetadata {
 }
 
 /**
+ * Scalar yEnc header fields available before the first decoded payload byte.
+ * `expectedSize` is present only when `=ypart` or a single-part `=ybegin`
+ * supplies an exact decoded length; it is not a substitute for final decoder
+ * validation.
+ */
+export interface DecodedSegmentHeaderMetadata {
+  readonly byteRange?: readonly [number, number];
+  readonly fileSize?: number;
+  readonly totalParts?: number;
+  readonly name?: string;
+  readonly expectedSize?: number;
+}
+
+/**
  * Bounded ownership boundary for decoded bytes. Before retaining or copying a
  * chunk, an implementation must synchronously acquire its exact memory lease
  * (for example with `ByteBudget.tryAcquire`). `write(false)` still means the
@@ -63,8 +77,13 @@ export class StreamingYencArticleDecoder {
   private fileSizeValue: number | undefined;
   private totalPartsValue: number | undefined;
   private nameValue: string | undefined;
+  private multipartDeclared = false;
+  private headerNotified = false;
 
-  constructor(private readonly sink: BackpressuredByteSink) {}
+  constructor(
+    private readonly sink: BackpressuredByteSink,
+    private readonly onHeader?: (metadata: DecodedSegmentHeaderMetadata) => void
+  ) {}
 
   /**
    * Consume a raw, still dot-stuffed BODY chunk synchronously. A false result
@@ -145,6 +164,7 @@ export class StreamingYencArticleDecoder {
         this.parsePartHeader();
         this.controlLineLength = 0;
         this.state = 'data';
+        this.notifyHeader();
         return off < raw.length ? this.decodeData(raw.subarray(off)) : true;
       }
 
@@ -155,6 +175,7 @@ export class StreamingYencArticleDecoder {
       raw.copy(transition, this.controlLineLength, off);
       this.controlLineLength = 0;
       this.state = 'data';
+      this.notifyHeader();
       return this.decodeData(transition);
     }
     return this.state === 'data' && off < raw.length
@@ -194,6 +215,9 @@ export class StreamingYencArticleDecoder {
     this.fileSizeValue = parseIntegerAttribute(attrs, 'size');
     this.totalPartsValue = parseIntegerAttribute(attrs, 'total');
     this.nameValue = /(?:^|\s)name=(.*)$/.exec(attrs)?.[1];
+    this.multipartDeclared =
+      parseIntegerAttribute(attrs, 'part') !== undefined ||
+      (this.totalPartsValue !== undefined && this.totalPartsValue > 1);
     return true;
   }
 
@@ -208,6 +232,29 @@ export class StreamingYencArticleDecoder {
     if (begin !== undefined && end !== undefined) {
       this.byteRangeValue = [begin - 1, end];
     }
+  }
+
+  private notifyHeader(): void {
+    if (this.headerNotified) return;
+    this.headerNotified = true;
+    const byteRange = this.byteRangeValue;
+    const expectedSize = byteRange
+      ? byteRange[1] - byteRange[0]
+      : !this.multipartDeclared &&
+          this.fileSizeValue !== undefined &&
+          this.fileSizeValue > 0
+        ? this.fileSizeValue
+        : undefined;
+    this.onHeader?.({
+      byteRange,
+      fileSize: this.fileSizeValue,
+      totalParts: this.totalPartsValue,
+      name: this.nameValue,
+      expectedSize:
+        expectedSize !== undefined && expectedSize > 0
+          ? expectedSize
+          : undefined,
+    });
   }
 
   private controlLineText(): string {

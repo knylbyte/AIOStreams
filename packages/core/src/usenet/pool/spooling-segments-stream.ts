@@ -6,6 +6,7 @@ import type { ByteLease } from './byte-budget.js';
 import {
   ZeroSegmentArtifact,
   type SegmentArtifact,
+  type SegmentArtifactFetchOptions,
 } from './segment-artifact.js';
 import type { CommandPriority, NzbSegmentRef } from '../types.js';
 
@@ -18,7 +19,7 @@ export interface SpoolingSegmentArtifactSource {
     nzbHash: string,
     signal: AbortSignal | undefined,
     priority: CommandPriority,
-    options?: { readonly expectedLength?: number }
+    options?: SegmentArtifactFetchOptions
   ): Promise<SegmentArtifact>;
   acquireSegmentStreamMemory(
     priority: CommandPriority,
@@ -47,6 +48,8 @@ export interface SpoolingSegmentsStreamOptions {
     kind: HoleKind
   ) => HoleDecision;
   readonly knownHoles?: ReadonlySet<number>;
+  /** Completed locator artifact for local segment zero; ownership transfers. */
+  readonly initialArtifact?: SegmentArtifact;
 }
 
 interface PlannedSegment {
@@ -84,6 +87,8 @@ function isPositiveSafeInteger(value: number): boolean {
  *
  * - `planned.size <= maxPrefetchSegments`; completed future artifacts retain
  *   only disk/file references and never complete segment Buffers;
+ * - only local segment zero may resolve as growing; every future task waits
+ *   for complete provider failover and producer validation;
  * - exactly one artifact reader may feed the outer Readable at a time;
  * - output order is monotonically increasing by local segment index;
  * - the stream-level memory lease covers the inner and outer Readable HWMs,
@@ -108,6 +113,7 @@ export class SpoolingSegmentsStream extends Readable {
   private readonly knownHoles: ReadonlySet<number> | undefined;
   private readonly controller = new AbortController();
   private readonly planned = new Map<number, PlannedSegment>();
+  private initialArtifact: SegmentArtifact | undefined;
 
   private onExternalAbort: (() => void) | undefined;
   private streamLease: ByteLease | undefined;
@@ -155,6 +161,7 @@ export class SpoolingSegmentsStream extends Readable {
     this.sizeForSegment = options.sizeForSegment;
     this.onHole = options.onHole;
     this.knownHoles = options.knownHoles;
+    this.initialArtifact = options.initialArtifact;
     this.skipRemaining = skipBytes;
     this.limitRemaining = limitBytes;
 
@@ -244,6 +251,13 @@ export class SpoolingSegmentsStream extends Readable {
       };
       this.planned.set(idx, task);
 
+      if (idx === 0 && this.initialArtifact) {
+        task.artifact = this.initialArtifact;
+        this.initialArtifact = undefined;
+        task.done = true;
+        continue;
+      }
+
       const knownHole = this.knownHoles?.has(idx)
         ? this.createHoleArtifact(idx, 'missing')
         : undefined;
@@ -260,7 +274,10 @@ export class SpoolingSegmentsStream extends Readable {
           this.nzbHash,
           this.controller.signal,
           this.priority,
-          expectedLength === undefined ? undefined : { expectedLength }
+          {
+            expectedLength,
+            allowGrowing: idx === 0,
+          }
         )
         .then(
           (artifact) => {
@@ -488,9 +505,12 @@ export class SpoolingSegmentsStream extends Readable {
       );
       const tasks = [...this.planned.values()];
       await Promise.allSettled(tasks.map((task) => task.settled));
-      const releases = await Promise.allSettled(
-        tasks.map((task) => task.artifact?.release())
-      );
+      const initialArtifact = this.initialArtifact;
+      this.initialArtifact = undefined;
+      const releases = await Promise.allSettled([
+        ...tasks.map((task) => task.artifact?.release()),
+        initialArtifact?.release(),
+      ]);
       this.planned.clear();
       this.streamLease?.release();
       this.streamLease = undefined;

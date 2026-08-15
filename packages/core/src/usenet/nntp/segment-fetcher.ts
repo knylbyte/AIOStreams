@@ -27,6 +27,7 @@ import {
   StreamingYencArticleDecoder,
   type BackpressuredByteSink,
   type DecodedSegmentMetadata,
+  type DecodedSegmentHeaderMetadata,
 } from '../pool/streaming-yenc-article-decoder.js';
 
 const logger = createLogger('usenet/segment-fetcher');
@@ -61,6 +62,8 @@ export interface SegmentHeadData {
 export interface StreamingSegmentAttempt<T> {
   readonly sink: BackpressuredByteSink;
   readonly value: T;
+  /** Called synchronously before the first decoded payload write. */
+  readonly onHeader?: (metadata: DecodedSegmentHeaderMetadata) => void;
   /** Roll back partial storage before another provider attempt may start. */
   dispose(error: Error): Promise<void>;
 }
@@ -111,7 +114,8 @@ export interface SegmentFetcher {
     nzbHash: string,
     priority: CommandPriority,
     want: number,
-    onWireStart?: () => void
+    onWireStart?: () => void,
+    signal?: AbortSignal
   ): Promise<SegmentHeadData>;
   /** STAT existence probe across providers (no download budget). */
   statSegment(
@@ -419,7 +423,10 @@ export class LocalSegmentFetcher implements SegmentFetcher {
             try {
               return {
                 attempt,
-                decoder: new StreamingYencArticleDecoder(attempt.sink),
+                decoder: new StreamingYencArticleDecoder(
+                  attempt.sink,
+                  attempt.onHeader
+                ),
               };
             } catch (error) {
               const failure =
@@ -468,24 +475,30 @@ export class LocalSegmentFetcher implements SegmentFetcher {
     nzbHash: string,
     priority: CommandPriority,
     want: number,
-    onWireStart?: () => void
+    onWireStart?: () => void,
+    signal?: AbortSignal
   ): Promise<SegmentHeadData> {
-    return this.submitWithFailover<SegmentHeadData>(segment, nzbHash, (pool) =>
-      pool.submit<SegmentHeadData>({
-        priority,
-        run: async (conn) => {
-          onWireStart?.();
-          const capture = new YencHeadCapture(want);
-          const rawBytes = await conn.bodyStreaming(
-            segment.messageId,
-            (chunk) => capture.push(chunk),
-            undefined,
-            this.opts.segmentStallTimeoutMs,
-            this.opts.segmentTimeoutMs
-          );
-          return { value: capture.finish(), bytes: rawBytes };
-        },
-      })
+    return this.submitWithFailover<SegmentHeadData>(
+      segment,
+      nzbHash,
+      (pool) =>
+        pool.submit<SegmentHeadData>({
+          priority,
+          signal,
+          run: async (conn) => {
+            onWireStart?.();
+            const capture = new YencHeadCapture(want);
+            const rawBytes = await conn.bodyStreaming(
+              segment.messageId,
+              (chunk) => capture.push(chunk),
+              signal,
+              this.opts.segmentStallTimeoutMs,
+              this.opts.segmentTimeoutMs
+            );
+            return { value: capture.finish(), bytes: rawBytes };
+          },
+        }),
+      signal
     );
   }
 

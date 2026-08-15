@@ -14,6 +14,7 @@ import {
   SpoolingSegmentsStream,
   type SpoolingSegmentArtifactSource,
 } from './spooling-segments-stream.js';
+import type { SegmentArtifact } from './segment-artifact.js';
 
 /** Mode-neutral inputs for the direct ordered segment read path. */
 export interface CommonSegmentReadOptions {
@@ -36,6 +37,8 @@ export interface CommonSegmentReadOptions {
     kind: HoleKind
   ) => HoleDecision;
   readonly knownHoles?: ReadonlySet<number>;
+  /** Completed first artifact retained by a buffer-free spooling locator. */
+  readonly initialSpoolingArtifact?: SegmentArtifact;
 }
 
 /**
@@ -84,5 +87,6 @@ export function createSegmentReadStream(
     sizeForSegment: options.sizeForSegment,
     onHole: options.onHole,
     knownHoles: options.knownHoles,
+    initialArtifact: options.initialSpoolingArtifact,
   });
 }

@@ -110,6 +110,28 @@ test('matches decodeArticle at every possible article split', async () => {
   }
 });
 
+test('publishes exact bounded yEnc header metadata before the first sink write', async () => {
+  const body = Buffer.from('header-before-payload');
+  const raw = multipartArticle(body);
+  const sink = new CollectingSink();
+  let headerCalls = 0;
+  const decoder = new StreamingYencArticleDecoder(sink, (metadata) => {
+    headerCalls++;
+    assert.equal(sink.chunks.length, 0);
+    assert.deepEqual(metadata.byteRange, [100, 100 + body.length]);
+    assert.equal(metadata.fileSize, 1234);
+    assert.equal(metadata.totalParts, 3);
+    assert.equal(metadata.name, 'name with spaces.bin');
+    assert.equal(metadata.expectedSize, body.length);
+  });
+
+  assert.equal(decoder.push(raw), true);
+  const metadata = await decoder.finish();
+  assert.equal(headerCalls, 1);
+  assert.equal(metadata.size, body.length);
+  assert.deepEqual(sink.decoded(), body);
+});
+
 test('preserves escape and NNTP dot-unstuffing state across byte boundaries', async () => {
   const raw = Buffer.from(
     [

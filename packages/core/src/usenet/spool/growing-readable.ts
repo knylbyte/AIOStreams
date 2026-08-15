@@ -12,6 +12,7 @@ export interface GrowingFileReaderOptions {
   readonly endExclusive?: number;
   readonly highWaterMark: number;
   readonly signal?: AbortSignal;
+  readonly completion?: Promise<void>;
   readonly onClosed: () => void;
 }
 
@@ -35,6 +36,7 @@ export class GrowingFileReader extends Readable {
   private readonly onClosed: () => void;
   private readonly controller = new AbortController();
   private readonly userSignal: AbortSignal | undefined;
+  private readonly completion: Promise<void> | undefined;
   private userAbort: (() => void) | undefined;
   private position: number;
   private reading = false;
@@ -72,6 +74,7 @@ export class GrowingFileReader extends Readable {
     this.readBytes = options.highWaterMark;
     this.onClosed = options.onClosed;
     this.userSignal = options.signal;
+    this.completion = options.completion;
 
     if (options.signal?.aborted) {
       queueMicrotask(() =>
@@ -130,7 +133,7 @@ export class GrowingFileReader extends Readable {
 
   private async pump(): Promise<void> {
     if (this.endExclusive !== undefined && this.position >= this.endExclusive) {
-      this.push(null);
+      await this.finishValidated();
       return;
     }
     const initialSnapshot = this.source.snapshot();
@@ -146,7 +149,7 @@ export class GrowingFileReader extends Readable {
       initialSnapshot.state === 'complete' &&
       this.position >= Math.min(initialSnapshot.committedBytes, initialRangeEnd)
     ) {
-      this.push(null);
+      await this.finishValidated();
       return;
     }
     await this.ensureFile();
@@ -190,11 +193,16 @@ export class GrowingFileReader extends Readable {
       }
 
       if (this.position >= rangeEnd || snapshot.state === 'complete') {
-        this.push(null);
+        await this.finishValidated();
         return;
       }
       await this.source.waitForChange(this.position, this.controller.signal);
     }
+  }
+
+  private async finishValidated(): Promise<void> {
+    await this.completion;
+    if (!this.destroyed) this.push(null);
   }
 
   private ensureFile(): Promise<ManagedSpoolFile> {

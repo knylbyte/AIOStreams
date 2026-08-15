@@ -4,6 +4,10 @@ import { createSegmentReadStream } from './segment-read-stream-factory.js';
 import type { SegmentBufferingSource } from './segments-stream.js';
 import type { SpoolingSegmentArtifactSource } from './spooling-segments-stream.js';
 import type { SharedSegment } from './segment-arena.js';
+import type {
+  SegmentArtifact,
+  SegmentRangeMetadata,
+} from './segment-artifact.js';
 import { isImplausibleYencFileSize } from './yenc.js';
 import { definitiveLossKind } from '../nntp/errors.js';
 import { CommandPriority, EngineOptions, NzbSegmentRef } from '../types.js';
@@ -37,6 +41,12 @@ export interface FileStreamPool
     signal: AbortSignal | undefined,
     priority: CommandPriority
   ): Promise<SharedSegment>;
+  fetchSegmentRangeMetadata(
+    segment: NzbSegmentRef,
+    nzbHash: string,
+    signal: AbortSignal | undefined,
+    priority: CommandPriority
+  ): Promise<SegmentRangeMetadata>;
 }
 
 /**
@@ -67,6 +77,12 @@ interface KnownRange {
   /** Half-open decoded byte range [begin, end) of this segment in the file. */
   begin: number;
   end: number;
+}
+
+interface LocatedSegment {
+  readonly segmentIndex: number;
+  readonly segmentStartByte: number;
+  readonly initialArtifact?: SegmentArtifact;
 }
 
 /**
@@ -168,20 +184,13 @@ export class FileStream implements SeekableStream {
       return;
     }
 
-    // Metadata-only: handles released immediately; the scalar fields stay
-    // valid after release (see SharedSegment).
-    const firstShared = await this.pool.fetchSegmentShared(
-      segments[0],
-      this.nzbHash,
-      signal,
-      CommandPriority.High
-    );
-    const first = firstShared.data;
-    firstShared.release();
+    // Spooling uses the bounded scalar probe; buffering preserves the existing
+    // shared-segment locator exactly. No body ownership escapes this helper.
+    const first = await this.fetchOpeningMetadata(0, signal);
     const firstBegin = first.byteRange?.[0] ?? 0;
-    const firstEnd = first.byteRange?.[1] ?? first.size;
+    const firstEnd = first.byteRange?.[1] ?? first.decodedSize ?? 0;
     this.knownRanges.set(0, { begin: firstBegin, end: firstEnd });
-    this.avgDecodedSize = firstEnd - firstBegin || first.size || 1;
+    this.avgDecodedSize = firstEnd - firstBegin || first.decodedSize || 1;
 
     const encodedSize = segments.reduce((acc, s) => acc + (s.bytes ?? 0), 0);
     const trustYencSize =
@@ -195,7 +204,7 @@ export class FileStream implements SeekableStream {
     if (segments.length === 1) {
       // A single part spans the whole file, so its decoded end IS the exact
       // size; prefer it over a (possibly bogus) `=ybegin size=`.
-      this._size = firstEnd || first.fileSize || first.size;
+      this._size = firstEnd || first.fileSize || first.decodedSize || 0;
       this.sizeExact = firstEnd > 0;
     } else if (trustYencSize) {
       // yEnc `=ybegin size=` is the exact total file size; no last fetch needed.
@@ -205,14 +214,7 @@ export class FileStream implements SeekableStream {
       // No (or implausible) yEnc size: fall back to the last segment's part end
       // (exact) or a ratio estimate.
       const lastIdx = segments.length - 1;
-      const lastShared = await this.pool.fetchSegmentShared(
-        segments[lastIdx],
-        this.nzbHash,
-        signal,
-        CommandPriority.High
-      );
-      const last = lastShared.data;
-      lastShared.release();
+      const last = await this.fetchOpeningMetadata(lastIdx, signal);
       if (last.byteRange) {
         this.knownRanges.set(lastIdx, {
           begin: last.byteRange[0],
@@ -394,11 +396,15 @@ export class FileStream implements SeekableStream {
     // once the start segment is located.
     let inner: Readable | undefined;
     let detachRelay: (() => void) | undefined;
+    const locatorController = new AbortController();
     const out = new Readable({
       read() {
         if (!out.isPaused()) inner?.resume();
       },
       destroy(error, callback) {
+        if (!locatorController.signal.aborted) {
+          locatorController.abort(error ?? new Error('Range stream closed'));
+        }
         detachRelay?.();
         detachRelay = undefined;
         const current = inner;
@@ -414,9 +420,12 @@ export class FileStream implements SeekableStream {
 
     const requestedAt = Date.now();
     let firstByteSeen = false;
-    void this.locateSegment(start)
-      .then(({ segmentIndex, segmentStartByte }) => {
-        if (out.destroyed) return;
+    void this.locateSegmentForDirectStream(start, locatorController.signal)
+      .then(async ({ segmentIndex, segmentStartByte, initialArtifact }) => {
+        if (out.destroyed || locatorController.signal.aborted) {
+          await initialArtifact?.release();
+          return;
+        }
         const segments = this.source.segments.slice(segmentIndex);
         // Playback hole handling: local task index → absolute segment index.
         const holes = this.holes;
@@ -430,50 +439,60 @@ export class FileStream implements SeekableStream {
               )
             : undefined;
         const spoolingPlan = this.resourcePlan.segmentSpooling;
-        inner = createSegmentReadStream(
-          {
-            pool: this.pool,
-            segments,
-            nzbHash: this.nzbHash,
-            sizeForSegment:
-              this.resourcePlan.mode === 'segment_spooling'
-                ? (local) => this.exactSpoolingSegmentSize(segmentIndex + local)
-                : holes
-                  ? (local) => this.exactSegmentSize(segmentIndex + local)
-                  : undefined,
-            onHole: holes
-              ? (local, bytes, kind) =>
-                  holes.hooks.onHole({
-                    nzbFileIndex: holes.fileIndex,
-                    segmentIndex: segmentIndex + local,
-                    targetOffset: this.segmentStartByte(segmentIndex + local),
-                    bytes,
-                    kind,
-                  })
-              : undefined,
-            knownHoles: knownLocal,
-            // The read-ahead window IS the per-stream parallelism: a stream keeps
-            // up to `prefetchSegments` segment fetches in flight ahead of the read
-            // cursor, and the global download semaphore (Σ provider connections)
-            // caps how many of those actually run at once. So a lone stream can use
-            // the whole account, while concurrent streams fair-share it via that
-            // semaphore; there is no separate per-stream connection cap.
-            maxPrefetchSegments: this.opts.prefetchSegments,
-            // Buffer sized to the same window so completed-but-not-yet-emitted
-            // segments can ride out per-segment latency jitter without stalling
-            // dispatch.
-            bufferingBufferSizeBytes: Math.max(
-              this.avgDecodedSize * this.opts.prefetchSegments,
-              1
-            ),
-            spoolingReaderHighWaterMarkBytes:
-              spoolingPlan?.readerHighWaterMarkBytes,
-            skipBytes: start - segmentStartByte,
-            limitBytes: length,
-            priority: CommandPriority.High,
-          },
-          this.resourcePlan.mode
-        );
+        let created: Readable;
+        try {
+          created = createSegmentReadStream(
+            {
+              pool: this.pool,
+              segments,
+              nzbHash: this.nzbHash,
+              sizeForSegment:
+                this.resourcePlan.mode === 'segment_spooling'
+                  ? (local) =>
+                      this.exactSpoolingSegmentSize(segmentIndex + local)
+                  : holes
+                    ? (local) => this.exactSegmentSize(segmentIndex + local)
+                    : undefined,
+              onHole: holes
+                ? (local, bytes, kind) =>
+                    holes.hooks.onHole({
+                      nzbFileIndex: holes.fileIndex,
+                      segmentIndex: segmentIndex + local,
+                      targetOffset: this.segmentStartByte(segmentIndex + local),
+                      bytes,
+                      kind,
+                    })
+                : undefined,
+              knownHoles: knownLocal,
+              // The read-ahead window IS the per-stream parallelism: a stream keeps
+              // up to `prefetchSegments` segment fetches in flight ahead of the read
+              // cursor, and the global download semaphore (Σ provider connections)
+              // caps how many of those actually run at once. So a lone stream can use
+              // the whole account, while concurrent streams fair-share it via that
+              // semaphore; there is no separate per-stream connection cap.
+              maxPrefetchSegments: this.opts.prefetchSegments,
+              // Buffer sized to the same window so completed-but-not-yet-emitted
+              // segments can ride out per-segment latency jitter without stalling
+              // dispatch.
+              bufferingBufferSizeBytes: Math.max(
+                this.avgDecodedSize * this.opts.prefetchSegments,
+                1
+              ),
+              spoolingReaderHighWaterMarkBytes:
+                spoolingPlan?.readerHighWaterMarkBytes,
+              initialSpoolingArtifact: initialArtifact,
+              skipBytes: start - segmentStartByte,
+              limitBytes: length,
+              priority: CommandPriority.High,
+              signal: locatorController.signal,
+            },
+            this.resourcePlan.mode
+          );
+        } catch (error) {
+          await initialArtifact?.release();
+          throw error;
+        }
+        inner = created;
         const current = inner;
         let terminal = false;
         const onData = (chunk: Buffer): void => {
@@ -528,11 +547,22 @@ export class FileStream implements SeekableStream {
         current.on('close', onClose);
         current.on('data', onData);
       })
-      .catch((err) =>
-        out.destroy(err instanceof Error ? err : new Error(String(err)))
-      );
+      .catch((err) => {
+        if (!out.destroyed) {
+          out.destroy(err instanceof Error ? err : new Error(String(err)));
+        }
+      });
 
     return out;
+  }
+
+  private locateSegmentForDirectStream(
+    targetByte: number,
+    signal: AbortSignal
+  ): Promise<LocatedSegment> {
+    return this.resourcePlan.mode === 'segment_spooling'
+      ? this.locateSpoolingSegment(targetByte, signal)
+      : this.locateSegment(targetByte, signal);
   }
 
   /**
@@ -540,8 +570,9 @@ export class FileStream implements SeekableStream {
    * decoded byte ranges. Returns the segment index and its decoded start byte.
    */
   private async locateSegment(
-    targetByte: number
-  ): Promise<{ segmentIndex: number; segmentStartByte: number }> {
+    targetByte: number,
+    signal?: AbortSignal
+  ): Promise<LocatedSegment> {
     const segments = this.source.segments;
     if (segments.length === 1) {
       return {
@@ -567,7 +598,7 @@ export class FileStream implements SeekableStream {
       let guess = Math.floor(targetByte / est);
       guess = Math.min(hi, Math.max(lo, guess));
 
-      const range = await this.rangeForSegment(guess);
+      const range = await this.rangeForSegment(guess, signal);
       if (targetByte < range.begin) {
         hi = guess - 1;
         // Refine avg estimate downward.
@@ -582,7 +613,7 @@ export class FileStream implements SeekableStream {
 
     // Fallback: linear clamp to the bounded region.
     const idx = Math.min(segments.length - 1, Math.max(0, lo));
-    const range = await this.rangeForSegment(idx);
+    const range = await this.rangeForSegment(idx, signal);
     return { segmentIndex: idx, segmentStartByte: range.begin };
   }
 
@@ -648,7 +679,135 @@ export class FileStream implements SeekableStream {
       : undefined;
   }
 
-  private async rangeForSegment(index: number): Promise<KnownRange> {
+  /** Buffer-free locator used only by the direct segment-spooling stream. */
+  private async locateSpoolingSegment(
+    targetByte: number,
+    signal: AbortSignal
+  ): Promise<LocatedSegment> {
+    const segments = this.source.segments;
+    if (targetByte === 0 || segments.length === 1) {
+      return {
+        segmentIndex: 0,
+        segmentStartByte: this.knownRanges.get(0)?.begin ?? 0,
+      };
+    }
+
+    let lo = 0;
+    let hi = segments.length - 1;
+    const firstRange = this.knownRanges.get(0);
+    if (firstRange && targetByte < firstRange.end) {
+      return { segmentIndex: 0, segmentStartByte: firstRange.begin };
+    }
+
+    let guard = 0;
+    while (lo <= hi && guard++ < segments.length + 8) {
+      const estimate = this.lockedPartSize ?? Math.max(1, this.avgDecodedSize);
+      const guess = Math.min(
+        hi,
+        Math.max(lo, Math.floor(targetByte / estimate))
+      );
+      const probed = await this.rangeForSpoolingSegment(guess, signal);
+      const { range } = probed;
+      if (targetByte < range.begin) {
+        await probed.artifact?.release();
+        hi = guess - 1;
+        this.avgDecodedSize = Math.max(1, range.begin / Math.max(1, guess));
+      } else if (targetByte >= range.end) {
+        await probed.artifact?.release();
+        lo = guess + 1;
+        this.avgDecodedSize = Math.max(1, range.end / Math.max(1, guess + 1));
+      } else {
+        return {
+          segmentIndex: guess,
+          segmentStartByte: range.begin,
+          initialArtifact: probed.artifact,
+        };
+      }
+    }
+
+    const index = Math.min(segments.length - 1, Math.max(0, lo));
+    const probed = await this.rangeForSpoolingSegment(index, signal);
+    return {
+      segmentIndex: index,
+      segmentStartByte: probed.range.begin,
+      initialArtifact: probed.artifact,
+    };
+  }
+
+  private async rangeForSpoolingSegment(
+    index: number,
+    signal: AbortSignal
+  ): Promise<{
+    readonly range: KnownRange;
+    readonly artifact?: SegmentArtifact;
+  }> {
+    const cached = this.knownRanges.get(index);
+    if (cached) return { range: cached };
+    const start = this.segmentStartByte(index);
+    const exactLength = this.exactSpoolingSegmentSize(index);
+    if (start !== undefined && exactLength !== undefined) {
+      const range = { begin: start, end: start + exactLength };
+      this.knownRanges.set(index, range);
+      return { range };
+    }
+
+    let artifact: SegmentArtifact | undefined;
+    try {
+      artifact = await this.pool.fetchSegmentArtifact(
+        this.source.segments[index],
+        this.nzbHash,
+        signal,
+        CommandPriority.High,
+        exactLength === undefined ? undefined : { expectedLength: exactLength }
+      );
+      const range = this.recordMeasuredRange(index, {
+        byteRange: artifact.metadata.byteRange,
+        decodedSize: artifact.length,
+      });
+      return { range, artifact };
+    } catch (error) {
+      await artifact?.release();
+      const synthesized = this.synthesizeHoleRange(index, error);
+      if (synthesized) return { range: synthesized };
+      throw error;
+    }
+  }
+
+  private async fetchOpeningMetadata(
+    index: number,
+    signal?: AbortSignal
+  ): Promise<SegmentRangeMetadata> {
+    if (this.resourcePlan.mode === 'segment_spooling') {
+      return this.pool.fetchSegmentRangeMetadata(
+        this.source.segments[index],
+        this.nzbHash,
+        signal,
+        CommandPriority.High
+      );
+    }
+    const shared = await this.pool.fetchSegmentShared(
+      this.source.segments[index],
+      this.nzbHash,
+      signal,
+      CommandPriority.High
+    );
+    try {
+      return {
+        byteRange: shared.data.byteRange,
+        fileSize: shared.data.fileSize,
+        totalParts: shared.data.totalParts,
+        name: shared.data.name,
+        decodedSize: shared.data.size,
+      };
+    } finally {
+      shared.release();
+    }
+  }
+
+  private async rangeForSegment(
+    index: number,
+    signal?: AbortSignal
+  ): Promise<KnownRange> {
     const cached = this.knownRanges.get(index);
     if (cached) return cached;
     // Metadata-only; released immediately.
@@ -657,7 +816,7 @@ export class FileStream implements SeekableStream {
       const h = await this.pool.fetchSegmentShared(
         this.source.segments[index],
         this.nzbHash,
-        undefined,
+        signal,
         CommandPriority.High
       );
       data = h.data;
@@ -666,27 +825,25 @@ export class FileStream implements SeekableStream {
       // A seek landing ON a hole must not kill the locate: with a proven part
       // grid the segment's range is known without its bytes. The actual read
       // of the hole is then the padding policy's problem, not the seek's.
-      const kind = definitiveLossKind(err);
-      if (kind !== undefined) {
-        const part = this.partGridSize();
-        if (part !== undefined) {
-          const begin = index * part;
-          const end = this.exactSegmentSize(index)
-            ? begin + this.exactSegmentSize(index)!
-            : Math.min(begin + part, this._size || begin + part);
-          const range = { begin, end };
-          this.knownRanges.set(index, range);
-          logger.debug(
-            { nzbHash: this.nzbHash, index, begin, end, kind },
-            'segment unservable on all providers; synthesized grid range for seek'
-          );
-          return range;
-        }
-      }
+      const synthesized = this.synthesizeHoleRange(index, err);
+      if (synthesized) return synthesized;
       throw err;
     }
+    return this.recordMeasuredRange(index, {
+      byteRange: data.byteRange,
+      decodedSize: data.size,
+    });
+  }
+
+  private recordMeasuredRange(
+    index: number,
+    data: {
+      readonly byteRange?: readonly [number, number];
+      readonly decodedSize: number;
+    }
+  ): KnownRange {
     const begin = data.byteRange?.[0] ?? index * this.avgDecodedSize;
-    const end = data.byteRange?.[1] ?? begin + data.size;
+    const end = data.byteRange?.[1] ?? begin + data.decodedSize;
     const range = { begin, end };
     this.knownRanges.set(index, range);
     // Lock the uniform part size when a measured non-first range lands exactly
@@ -704,6 +861,28 @@ export class FileStream implements SeekableStream {
         this.lockedPartSize = len;
       }
     }
+    return range;
+  }
+
+  private synthesizeHoleRange(
+    index: number,
+    error: unknown
+  ): KnownRange | undefined {
+    const kind = definitiveLossKind(error);
+    if (kind === undefined) return undefined;
+    const part = this.partGridSize();
+    if (part === undefined) return undefined;
+    const begin = index * part;
+    const exact = this.exactSegmentSize(index);
+    const end = exact
+      ? begin + exact
+      : Math.min(begin + part, this._size || begin + part);
+    const range = { begin, end };
+    this.knownRanges.set(index, range);
+    logger.debug(
+      { nzbHash: this.nzbHash, index, begin, end, kind },
+      'segment unservable on all providers; synthesized grid range for seek'
+    );
     return range;
   }
 }
