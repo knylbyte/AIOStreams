@@ -221,6 +221,13 @@ function toInt(value: string | undefined): number | undefined {
 /** Cap on raw bytes searched for the `=ybegin`/`=ypart` header lines. */
 const HEAD_CAPTURE_HEADER_CAP = 4096;
 
+export interface YencHeadCaptureOptions {
+  /** Reject absent or structurally invalid yEnc control metadata. */
+  readonly strictYencMetadata?: boolean;
+  /** Require a valid multipart `=ypart begin/end` range. */
+  readonly requireByteRange?: boolean;
+}
+
 /**
  * Streaming "head-only" article consumer for import probes: decodes just the
  * leading `want` bytes (plus the yEnc header fields) and then stops decoding
@@ -245,23 +252,38 @@ export class YencHeadCapture {
   private decoding = true;
   private countToEnd = false;
   private decodedCount = 0;
+  private headerFailure: YencDecodeError | undefined;
 
   byteRange?: [number, number];
   fileSize?: number;
   totalParts?: number;
   name?: string;
 
-  constructor(private want: number) {}
+  constructor(
+    private want: number,
+    private readonly options: YencHeadCaptureOptions = {}
+  ) {}
 
   push(raw: Buffer): void {
     if (this.headerParsed) {
       this.feed(raw);
       return;
     }
-    // Copy: the reader may hand over views into reused socket chunks.
-    this.pendingRaw.push(Buffer.from(raw));
-    this.pendingLen += raw.length;
-    this.tryParseHeader();
+    // Copy only the fixed header window: the reader may hand over views into
+    // reused socket chunks, but an arbitrarily large BODY chunk must never
+    // become locator-owned memory.
+    const retained = Math.min(
+      raw.length,
+      Math.max(0, HEAD_CAPTURE_HEADER_CAP - this.pendingLen)
+    );
+    if (retained > 0) {
+      this.pendingRaw.push(Buffer.from(raw.subarray(0, retained)));
+      this.pendingLen += retained;
+    }
+    this.tryParseHeader(false);
+    if (this.headerParsed && retained < raw.length) {
+      this.feed(raw.subarray(retained));
+    }
   }
 
   /** Assemble the result once the article's payload has fully drained. */
@@ -273,6 +295,35 @@ export class YencHeadCapture {
     name?: string;
     size?: number;
   } {
+    if (!this.headerParsed) this.tryParseHeader(true);
+    if (this.headerFailure) throw this.headerFailure;
+    if (this.options.strictYencMetadata) {
+      if (
+        !Number.isSafeInteger(this.fileSize) ||
+        this.fileSize === undefined ||
+        this.fileSize <= 0
+      ) {
+        throw new YencDecodeError(
+          'invalid_header',
+          'yEnc metadata probe failed: invalid =ybegin size',
+          { terminal: true }
+        );
+      }
+      if (this.options.requireByteRange && !this.byteRange) {
+        throw new YencDecodeError(
+          'invalid_header',
+          'yEnc metadata probe failed: valid =ypart range required',
+          { terminal: true }
+        );
+      }
+      if (this.byteRange && this.byteRange[1] > this.fileSize) {
+        throw new YencDecodeError(
+          'invalid_header',
+          'yEnc metadata probe failed: =ypart exceeds =ybegin size',
+          { terminal: true }
+        );
+      }
+    }
     const head = Buffer.concat(this.headChunks).subarray(0, this.want);
     let size: number | undefined;
     if (this.byteRange) {
@@ -309,7 +360,7 @@ export class YencHeadCapture {
     }
   }
 
-  private tryParseHeader(): void {
+  private tryParseHeader(final: boolean): void {
     const joined =
       this.pendingRaw.length === 1
         ? this.pendingRaw[0]
@@ -319,7 +370,23 @@ export class YencHeadCapture {
       0,
       Math.min(joined.length, HEAD_CAPTURE_HEADER_CAP)
     );
-    const giveUp = (): void => {
+    const giveUp = (
+      code: 'no_start_found' | 'invalid_header' = 'no_start_found'
+    ): void => {
+      if (this.options.strictYencMetadata) {
+        this.headerFailure = new YencDecodeError(
+          code,
+          code === 'no_start_found'
+            ? 'yEnc metadata probe failed: no_start_found'
+            : 'yEnc metadata probe failed: invalid_header',
+          { terminal: true }
+        );
+        this.headerParsed = true;
+        this.decoding = false;
+        this.pendingRaw = [];
+        this.pendingLen = 0;
+        return;
+      }
       // Not yEnc-shaped within the cap: decode-from-start to the end so size
       // falls back to whatever the decoder makes of it. Best-effort only.
       this.headerParsed = true;
@@ -331,31 +398,73 @@ export class YencHeadCapture {
     // (from_post tolerates this too).
     const begin = text.match(/(?:^|\r?\n)(=ybegin ([^\r\n]*))\r?\n/);
     if (!begin) {
-      if (joined.length >= HEAD_CAPTURE_HEADER_CAP) giveUp();
+      if (final || joined.length >= HEAD_CAPTURE_HEADER_CAP) giveUp();
       return;
     }
     const attrs = begin[2].replace(/\r$/, '');
     let dataStart = begin.index! + begin[0].length;
-    const isMultipart = / part=\d+/.test(` ${attrs}`);
+    const declaredPart = toInt(attrs.match(/(?:^| )part=(\d+)/)?.[1]);
+    const declaredTotal = toInt(attrs.match(/(?:^| )total=(\d+)/)?.[1]);
+    if (
+      this.options.strictYencMetadata &&
+      ((declaredPart !== undefined &&
+        (!Number.isSafeInteger(declaredPart) || declaredPart <= 0)) ||
+        (declaredTotal !== undefined &&
+          (!Number.isSafeInteger(declaredTotal) || declaredTotal <= 0)))
+    ) {
+      giveUp('invalid_header');
+      return;
+    }
+    const isMultipart =
+      declaredPart !== undefined ||
+      (declaredTotal !== undefined && declaredTotal > 1);
+    const requirePart = isMultipart || this.options.requireByteRange === true;
     let byteRange: [number, number] | undefined;
-    if (isMultipart) {
+    if (requirePart) {
       const part = text.slice(dataStart).match(/^=ypart ([^\r\n]*)\r?\n/);
       if (!part) {
-        if (joined.length >= HEAD_CAPTURE_HEADER_CAP) giveUp();
+        const nextLineComplete = /\r?\n/.test(text.slice(dataStart));
+        if (
+          final ||
+          joined.length >= HEAD_CAPTURE_HEADER_CAP ||
+          nextLineComplete
+        ) {
+          giveUp('invalid_header');
+        }
         return;
       }
       const partBegin = toInt(part[1].match(/(?:^| )begin=(\d+)/)?.[1]);
       const partEnd = toInt(part[1].match(/(?:^| )end=(\d+)/)?.[1]);
-      if (partBegin !== undefined && partEnd !== undefined) {
+      if (
+        partBegin !== undefined &&
+        partEnd !== undefined &&
+        Number.isSafeInteger(partBegin) &&
+        Number.isSafeInteger(partEnd) &&
+        partBegin > 0 &&
+        partEnd >= partBegin
+      ) {
         byteRange = [partBegin - 1, partEnd];
       } else {
+        if (this.options.strictYencMetadata) {
+          giveUp('invalid_header');
+          return;
+        }
         this.countToEnd = true;
       }
       dataStart += part[0].length;
     }
     this.fileSize = toInt(attrs.match(/(?:^| )size=(\d+)/)?.[1]);
-    this.totalParts = toInt(attrs.match(/(?:^| )total=(\d+)/)?.[1]);
+    this.totalParts = declaredTotal;
     this.name = attrs.match(/(?:^| )name=(.*)$/)?.[1];
+    if (
+      this.options.strictYencMetadata &&
+      (!Number.isSafeInteger(this.fileSize) ||
+        this.fileSize === undefined ||
+        this.fileSize <= 0)
+    ) {
+      giveUp('invalid_header');
+      return;
+    }
     this.byteRange = byteRange;
     this.headerParsed = true;
     // Hand everything past the header lines to the decoder (latin1 keeps a

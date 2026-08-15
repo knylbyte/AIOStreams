@@ -31,6 +31,12 @@ export interface SegmentRangeMetadata {
   readonly decodedSize?: number;
 }
 
+/** Strictness required by a file-offset locator using scalar yEnc metadata. */
+export interface SegmentRangeMetadataFetchOptions {
+  /** Multipart files require an exact `=ypart` range for offset arithmetic. */
+  readonly requireByteRange?: boolean;
+}
+
 /** Delivery policy for one independently validated artifact waiter. */
 export interface SegmentArtifactFetchOptions {
   /** Exact file-grid length asserted independently after producer completion. */

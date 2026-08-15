@@ -16,6 +16,7 @@ import {
 import type { StatsEvent } from '../stats/types.js';
 import { UsenetSpoolError } from '../spool/errors.js';
 import { NntpError } from './errors.js';
+import { YencDecodeError } from '../pool/yenc.js';
 import {
   ProviderWorkerPool,
   type WorkerPoolOptions,
@@ -276,6 +277,25 @@ function articleResponse(name: string, body: Buffer): Buffer {
   return Buffer.concat([
     Buffer.from('222 article follows\r\n', 'latin1'),
     yencode.post(name, body, 128),
+    Buffer.from('\r\n.\r\n', 'latin1'),
+  ]);
+}
+
+function multipartArticleResponse(body: Buffer): Buffer {
+  const single = yencode.post('ignored.bin', body, 128);
+  const firstLineEnd = single.indexOf('\r\n');
+  assert(firstLineEnd >= 0);
+  return Buffer.concat([
+    Buffer.from(
+      [
+        '222 article follows',
+        '=ybegin part=2 total=3 line=128 size=1234 name=range.bin',
+        `=ypart begin=101 end=${100 + body.length}`,
+        '',
+      ].join('\r\n'),
+      'latin1'
+    ),
+    single.subarray(firstLineEnd + 2),
     Buffer.from('\r\n.\r\n', 'latin1'),
   ]);
 }
@@ -1279,4 +1299,99 @@ test('pool close cancels every deferred command turn and releases listeners', as
   await disposed.promise;
   assert.equal(disposeCalls, 1);
   fetcher.close();
+});
+
+test('strict range metadata fails over from malformed yEnc to a valid provider', async (context) => {
+  const malformed = await AutomaticNntpServer.create(
+    context,
+    Buffer.from('222 article follows\r\nnot-yenc\r\n.\r\n', 'latin1')
+  );
+  const valid = await AutomaticNntpServer.create(
+    context,
+    multipartArticleResponse(Buffer.from('range'))
+  );
+  const fetcher = new LocalSegmentFetcher(
+    [
+      provider('malformed-metadata', malformed.port, 0),
+      provider('valid-metadata', valid.port, 1),
+    ],
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      dialTimeoutMs: 1000,
+      segmentStallTimeoutMs: 1000,
+      segmentTimeoutMs: 5000,
+    },
+    new NoopStats()
+  );
+  context.after(() => fetcher.close());
+
+  const metadata = await fetcher.fetchHead(
+    { messageId: 'strict-range-failover' },
+    'strict-range-nzb',
+    CommandPriority.High,
+    0,
+    undefined,
+    undefined,
+    { strictYencMetadata: true, requireByteRange: true }
+  );
+
+  assert.deepEqual(metadata.byteRange, [100, 105]);
+  assert.equal(metadata.fileSize, 1234);
+  assert.equal(metadata.size, 5);
+  assert.deepEqual(malformed.commands, ['BODY <strict-range-failover>']);
+  assert.deepEqual(valid.commands, ['BODY <strict-range-failover>']);
+});
+
+test('strict range metadata rejects when every provider response is unusable', async (context) => {
+  const first = await AutomaticNntpServer.create(
+    context,
+    Buffer.from('222 article follows\r\nplain body\r\n.\r\n', 'latin1')
+  );
+  const second = await AutomaticNntpServer.create(
+    context,
+    Buffer.from(
+      [
+        '222 article follows',
+        '=ybegin part=1 total=2 line=128 size=12 name=broken.bin',
+        'payload-without-ypart',
+        '=yend size=12',
+        '.',
+        '',
+      ].join('\r\n'),
+      'latin1'
+    )
+  );
+  const fetcher = new LocalSegmentFetcher(
+    [
+      provider('missing-ybegin', first.port, 0),
+      provider('missing-ypart', second.port, 1),
+    ],
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      dialTimeoutMs: 1000,
+      segmentStallTimeoutMs: 1000,
+      segmentTimeoutMs: 5000,
+    },
+    new NoopStats()
+  );
+  context.after(() => fetcher.close());
+
+  await assert.rejects(
+    fetcher.fetchHead(
+      { messageId: 'strict-range-invalid' },
+      'strict-invalid-nzb',
+      CommandPriority.High,
+      0,
+      undefined,
+      undefined,
+      { strictYencMetadata: true, requireByteRange: true }
+    ),
+    (error: unknown) => {
+      assert(error instanceof YencDecodeError);
+      assert.match(error.message, /undecodable on all providers/);
+      return true;
+    }
+  );
+  assert.deepEqual(first.commands, ['BODY <strict-range-invalid>']);
+  assert.deepEqual(second.commands, ['BODY <strict-range-invalid>']);
 });

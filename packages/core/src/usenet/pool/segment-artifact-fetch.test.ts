@@ -7,6 +7,7 @@ import test, { type TestContext } from 'node:test';
 import type { BackpressuredByteSink } from './streaming-yenc-article-decoder.js';
 import type {
   SegmentFetcher,
+  SegmentHeadFetchOptions,
   SegmentHeadData,
   StatDetail,
   StreamingSegmentAttempt,
@@ -65,6 +66,7 @@ class FakeSegmentFetcher implements SegmentFetcher {
   streamingCalls = 0;
   bufferingCalls = 0;
   headCalls = 0;
+  lastHeadOptions: SegmentHeadFetchOptions | undefined;
   closed = false;
 
   async fetchBody(
@@ -166,10 +168,12 @@ class FakeSegmentFetcher implements SegmentFetcher {
     _priority: CommandPriority,
     want: number,
     onWireStart?: () => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    options?: SegmentHeadFetchOptions
   ): Promise<SegmentHeadData> {
     if (signal?.aborted) throw new NntpError('connection', 'aborted');
     this.headCalls++;
+    this.lastHeadOptions = options;
     onWireStart?.();
     const body = this.behaviors.get(segment.messageId)?.body ?? Buffer.alloc(0);
     return {
@@ -935,6 +939,10 @@ test('range metadata probes retain only scalar fields and honor abort', async (c
     decodedSize: body.length,
   });
   assert.equal(fetcher.headCalls, 1);
+  assert.deepEqual(fetcher.lastHeadOptions, {
+    strictYencMetadata: true,
+    requireByteRange: undefined,
+  });
   assert.equal(fetcher.streamingCalls, 0);
   assert.equal(fetcher.bufferingCalls, 0);
   assert.equal(cache.stats().misses, 0);

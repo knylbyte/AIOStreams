@@ -48,7 +48,7 @@ export interface SpoolingSegmentsStreamOptions {
     kind: HoleKind
   ) => HoleDecision;
   readonly knownHoles?: ReadonlySet<number>;
-  /** Completed locator artifact for local segment zero; ownership transfers. */
+  /** Located complete or growing artifact for local segment zero; ownership transfers. */
   readonly initialArtifact?: SegmentArtifact;
 }
 
@@ -92,8 +92,11 @@ function isPositiveSafeInteger(value: number): boolean {
  * - exactly one artifact reader may feed the outer Readable at a time;
  * - output order is monotonically increasing by local segment index;
  * - the stream-level memory lease covers the inner and outer Readable HWMs,
- *   is acquired before dispatch, and is released exactly once after every
- *   reader, artifact and fetch waiter is detached;
+ *   is acquired before dispatch, and remains held until producer resources
+ *   are detached AND every retained output queue is drained or destroyed;
+ * - satisfying a finite byte range stops further output immediately, but
+ *   successful EOF is linearized only by the active artifact reader's
+ *   producer-validated `end` event;
  * - every normal EOF, abort and error path removes all cross-stream listeners.
  */
 export class SpoolingSegmentsStream extends Readable {
@@ -123,9 +126,12 @@ export class SpoolingSegmentsStream extends Readable {
   private skipRemaining: number;
   private limitRemaining: number;
   private startPromise: Promise<void> | undefined;
-  private cleanupPromise: Promise<void> | undefined;
+  private producerCleanupPromise: Promise<void> | undefined;
   private ending = false;
   private backpressured = false;
+  private rangeSatisfied = false;
+  private streamLifecycleEnded = false;
+  private streamLeaseRetained = false;
 
   constructor(options: SpoolingSegmentsStreamOptions) {
     if (!isPositiveSafeInteger(options.maxPrefetchSegments)) {
@@ -201,16 +207,37 @@ export class SpoolingSegmentsStream extends Readable {
     error: Error | null,
     callback: (error?: Error | null) => void
   ): void {
-    void this.cleanup(error)
-      .then(() => callback(error))
-      .catch((cleanupError: unknown) => {
-        callback(
+    void this.cleanupProducer(error).then(
+      () => this.finishDestroy(error, callback),
+      (cleanupError: unknown) => {
+        this.finishDestroy(
           error ??
             (cleanupError instanceof Error
               ? cleanupError
-              : new Error(String(cleanupError)))
+              : new Error(String(cleanupError))),
+          callback
         );
-      });
+      }
+    );
+  }
+
+  /**
+   * Keep the stream-memory lease alive for a bounded relay queue which takes
+   * ownership of emitted chunks. The returned release callback is idempotent;
+   * it must be called only after that queue is drained or destroyed.
+   */
+  retainStreamMemoryLease(): () => void {
+    if (this.streamLeaseRetained) {
+      throw new Error('Spooling stream memory lease already has a relay owner');
+    }
+    this.streamLeaseRetained = true;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.streamLeaseRetained = false;
+      this.releaseStreamLeaseIfUnused();
+    };
   }
 
   private async startOnce(): Promise<void> {
@@ -401,7 +428,12 @@ export class SpoolingSegmentsStream extends Readable {
       this.backpressured = true;
       active.reader.pause();
     }
-    if (this.limitRemaining === 0) this.finishNormally();
+    if (this.limitRemaining === 0) {
+      // The reader's endExclusive matches the satisfied range. It may already
+      // have emitted every requested byte while its producer-completion gate
+      // is still pending, so only its validated `end` may finish this stream.
+      this.rangeSatisfied = true;
+    }
   }
 
   private onArtifactEnd(active: ActiveArtifactReader): void {
@@ -411,7 +443,7 @@ export class SpoolingSegmentsStream extends Readable {
       this.destroy(new Error('Segment artifact reader ended before its range'));
       return;
     }
-    void this.releaseCurrent(active.task);
+    void this.releaseCurrent(active.task, this.rangeSatisfied);
   }
 
   private onArtifactError(active: ActiveArtifactReader, error: Error): void {
@@ -426,7 +458,10 @@ export class SpoolingSegmentsStream extends Readable {
     this.destroy(new Error('Segment artifact reader closed before end'));
   }
 
-  private async releaseCurrent(task: PlannedSegment): Promise<void> {
+  private async releaseCurrent(
+    task: PlannedSegment,
+    finishAfterRelease = false
+  ): Promise<void> {
     if (task.releasing) return;
     task.releasing = true;
     const active = this.active;
@@ -444,6 +479,10 @@ export class SpoolingSegmentsStream extends Readable {
     }
     if (this.ending || this.destroyed) return;
     this.planned.delete(task.idx);
+    if (finishAfterRelease) {
+      this.finishNormally();
+      return;
+    }
     this.nextEmit++;
     this.planMore();
     this.pump();
@@ -473,7 +512,7 @@ export class SpoolingSegmentsStream extends Readable {
   private finishNormally(): void {
     if (this.ending || this.destroyed) return;
     this.ending = true;
-    void this.cleanup()
+    void this.cleanupProducer()
       .then(() => {
         if (!this.destroyed) this.push(null);
       })
@@ -486,20 +525,21 @@ export class SpoolingSegmentsStream extends Readable {
       });
   }
 
-  private cleanup(reason?: Error | null): Promise<void> {
-    if (this.cleanupPromise) return this.cleanupPromise;
+  private cleanupProducer(reason?: Error | null): Promise<void> {
+    if (this.producerCleanupPromise) return this.producerCleanupPromise;
     this.ending = true;
     this.removeExternalAbortListener();
+    if (!this.controller.signal.aborted) this.controller.abort(reason);
     const active = this.active;
     if (active) {
       active.terminal = true;
       this.detachActiveReader(active);
       this.active = undefined;
+      this.discardReadableQueue(active.reader);
       if (!active.reader.destroyed) active.reader.destroy();
     }
-    if (!this.controller.signal.aborted) this.controller.abort(reason);
 
-    this.cleanupPromise = (async () => {
+    this.producerCleanupPromise = (async () => {
       await Promise.allSettled(
         this.startPromise === undefined ? [] : [this.startPromise]
       );
@@ -512,15 +552,41 @@ export class SpoolingSegmentsStream extends Readable {
         initialArtifact?.release(),
       ]);
       this.planned.clear();
-      this.streamLease?.release();
-      this.streamLease = undefined;
       const failedRelease = releases.find(
         (result): result is PromiseRejectedResult =>
           result.status === 'rejected'
       );
       if (failedRelease) throw failedRelease.reason;
     })();
-    return this.cleanupPromise;
+    return this.producerCleanupPromise;
+  }
+
+  private finishDestroy(
+    error: Error | null,
+    callback: (error?: Error | null) => void
+  ): void {
+    // On normal auto-destroy, `end` proves the queue was consumed. Explicit
+    // destroy/error may leave queued Buffers behind, so discard them in chunks
+    // no larger than the configured HWM before returning their budget.
+    if (!this.readableEnded) this.discardReadableQueue(this);
+    this.streamLifecycleEnded = true;
+    this.releaseStreamLeaseIfUnused();
+    callback(error);
+  }
+
+  private discardReadableQueue(reader: Readable): void {
+    reader.pause();
+    while (reader.readableLength > 0) {
+      const before = reader.readableLength;
+      reader.read(Math.min(before, reader.readableHighWaterMark));
+      if (reader.readableLength >= before) break;
+    }
+  }
+
+  private releaseStreamLeaseIfUnused(): void {
+    if (!this.streamLifecycleEnded || this.streamLeaseRetained) return;
+    this.streamLease?.release();
+    this.streamLease = undefined;
   }
 
   private detachActiveReader(active: ActiveArtifactReader): void {

@@ -34,6 +34,7 @@ import {
   ArenaSegmentArtifact,
   GrowingSpoolArtifactAdapter,
   type SegmentArtifactFetchOptions,
+  type SegmentRangeMetadataFetchOptions,
   type SegmentRangeMetadata,
   type SegmentArtifact,
 } from './segment-artifact.js';
@@ -478,19 +479,21 @@ export class MultiProviderPool {
     segment: NzbSegmentRef,
     nzbHash: string,
     signal: AbortSignal | undefined,
-    priority: CommandPriority = CommandPriority.High
+    priority: CommandPriority = CommandPriority.High,
+    options: SegmentRangeMetadataFetchOptions = {}
   ): Promise<SegmentRangeMetadata> {
     const id = segment.messageId;
     const pinned = this.arena.acquire(id);
     if (pinned) {
       try {
-        return {
+        const metadata = {
           byteRange: pinned.data.byteRange,
           fileSize: pinned.data.fileSize,
           totalParts: pinned.data.totalParts,
           name: pinned.data.name,
           decodedSize: pinned.data.size,
         };
+        if (this.isUsableRangeMetadata(metadata, options)) return metadata;
       } finally {
         pinned.release();
       }
@@ -500,13 +503,14 @@ export class MultiProviderPool {
     const persistent = await this.spooling?.artifactCache?.acquire(id, signal);
     if (persistent) {
       try {
-        return {
+        const metadata = {
           byteRange: persistent.metadata.byteRange,
           fileSize: persistent.metadata.fileSize,
           totalParts: persistent.metadata.totalParts,
           name: persistent.metadata.name,
           decodedSize: persistent.metadata.size,
         };
+        if (this.isUsableRangeMetadata(metadata, options)) return metadata;
       } finally {
         await persistent.release();
       }
@@ -523,15 +527,27 @@ export class MultiProviderPool {
         priority,
         0,
         wire.start,
-        signal
+        signal,
+        {
+          strictYencMetadata: true,
+          requireByteRange: options.requireByteRange,
+        }
       );
-      return {
+      const metadata = {
         byteRange: head.byteRange,
         fileSize: head.fileSize,
         totalParts: head.totalParts,
         name: head.name,
         decodedSize: head.size,
       };
+      if (!this.isUsableRangeMetadata(metadata, options)) {
+        throw new YencDecodeError(
+          'invalid_header',
+          'yEnc metadata probe returned unusable range metadata',
+          { terminal: true }
+        );
+      }
+      return metadata;
     } catch (error) {
       const kind = definitiveLossKind(error);
       if (kind) this.recordMiss(id, kind);
@@ -540,6 +556,37 @@ export class MultiProviderPool {
       wire.end();
       releaseGlobal();
     }
+  }
+
+  private isUsableRangeMetadata(
+    metadata: SegmentRangeMetadata,
+    options: SegmentRangeMetadataFetchOptions
+  ): boolean {
+    const fileSize = metadata.fileSize;
+    if (
+      fileSize === undefined ||
+      !Number.isSafeInteger(fileSize) ||
+      fileSize <= 0
+    ) {
+      return false;
+    }
+    const range = metadata.byteRange;
+    const validRange =
+      range !== undefined &&
+      Number.isSafeInteger(range[0]) &&
+      Number.isSafeInteger(range[1]) &&
+      range[0] >= 0 &&
+      range[1] > range[0] &&
+      range[1] <= fileSize;
+    if (options.requireByteRange) return validRange;
+    const decodedSize = metadata.decodedSize;
+    return (
+      validRange ||
+      (range === undefined &&
+        decodedSize !== undefined &&
+        Number.isSafeInteger(decodedSize) &&
+        decodedSize > 0)
+    );
   }
 
   private joinArtifactFlight(

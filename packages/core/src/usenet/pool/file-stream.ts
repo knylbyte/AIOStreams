@@ -2,14 +2,19 @@ import { Readable } from 'node:stream';
 import { createLogger } from '../../logging/logger.js';
 import { createSegmentReadStream } from './segment-read-stream-factory.js';
 import type { SegmentBufferingSource } from './segments-stream.js';
-import type { SpoolingSegmentArtifactSource } from './spooling-segments-stream.js';
+import {
+  SpoolingSegmentsStream,
+  type SpoolingSegmentArtifactSource,
+} from './spooling-segments-stream.js';
 import type { SharedSegment } from './segment-arena.js';
 import type {
   SegmentArtifact,
+  SegmentRangeMetadataFetchOptions,
   SegmentRangeMetadata,
 } from './segment-artifact.js';
+import { ZeroSegmentArtifact } from './segment-artifact.js';
 import { isImplausibleYencFileSize } from './yenc.js';
-import { definitiveLossKind } from '../nntp/errors.js';
+import { definitiveLossKind, NntpError } from '../nntp/errors.js';
 import { CommandPriority, EngineOptions, NzbSegmentRef } from '../types.js';
 import type { HoleHooks } from '../holes.js';
 import {
@@ -45,7 +50,8 @@ export interface FileStreamPool
     segment: NzbSegmentRef,
     nzbHash: string,
     signal: AbortSignal | undefined,
-    priority: CommandPriority
+    priority: CommandPriority,
+    options?: SegmentRangeMetadataFetchOptions
   ): Promise<SegmentRangeMetadata>;
 }
 
@@ -396,8 +402,16 @@ export class FileStream implements SeekableStream {
     // once the start segment is located.
     let inner: Readable | undefined;
     let detachRelay: (() => void) | undefined;
+    let releaseRelayLease: (() => void) | undefined;
     const locatorController = new AbortController();
+    const relayHighWaterMark =
+      this.resourcePlan.mode === 'segment_spooling'
+        ? this.resourcePlan.segmentSpooling?.readerHighWaterMarkBytes
+        : undefined;
     const out = new Readable({
+      ...(relayHighWaterMark === undefined
+        ? {}
+        : { highWaterMark: relayHighWaterMark }),
       read() {
         if (!out.isPaused()) inner?.resume();
       },
@@ -407,6 +421,16 @@ export class FileStream implements SeekableStream {
         }
         detachRelay?.();
         detachRelay = undefined;
+        // A destroyed relay no longer exposes queued chunks. Discard its
+        // bounded queue before returning the shared stream-memory lease.
+        out.pause();
+        while (out.readableLength > 0) {
+          const before = out.readableLength;
+          out.read(Math.min(before, out.readableHighWaterMark));
+          if (out.readableLength >= before) break;
+        }
+        releaseRelayLease?.();
+        releaseRelayLease = undefined;
         const current = inner;
         inner = undefined;
         if (!current || current.closed) {
@@ -494,6 +518,12 @@ export class FileStream implements SeekableStream {
         }
         inner = created;
         const current = inner;
+        if (current instanceof SpoolingSegmentsStream) {
+          // Chunks move from the inner queue into this relay. Keep the same
+          // hard stream-memory reservation until the relay itself drains or
+          // discards those chunks, even if the inner producer has closed.
+          releaseRelayLease = current.retainStreamMemoryLease();
+        }
         let terminal = false;
         const onData = (chunk: Buffer): void => {
           if (!firstByteSeen) {
@@ -706,51 +736,65 @@ export class FileStream implements SeekableStream {
         hi,
         Math.max(lo, Math.floor(targetByte / estimate))
       );
-      const probed = await this.rangeForSpoolingSegment(guess, signal);
-      const { range } = probed;
+      const range = await this.rangeForSpoolingSegment(guess, signal);
       if (targetByte < range.begin) {
-        await probed.artifact?.release();
         hi = guess - 1;
         this.avgDecodedSize = Math.max(1, range.begin / Math.max(1, guess));
       } else if (targetByte >= range.end) {
-        await probed.artifact?.release();
         lo = guess + 1;
         this.avgDecodedSize = Math.max(1, range.end / Math.max(1, guess + 1));
       } else {
-        return {
-          segmentIndex: guess,
-          segmentStartByte: range.begin,
-          initialArtifact: probed.artifact,
-        };
+        return this.fetchLocatedSpoolingArtifact(guess, range, signal);
       }
     }
 
     const index = Math.min(segments.length - 1, Math.max(0, lo));
-    const probed = await this.rangeForSpoolingSegment(index, signal);
-    return {
-      segmentIndex: index,
-      segmentStartByte: probed.range.begin,
-      initialArtifact: probed.artifact,
-    };
+    const range = await this.rangeForSpoolingSegment(index, signal);
+    return this.fetchLocatedSpoolingArtifact(index, range, signal);
   }
 
   private async rangeForSpoolingSegment(
     index: number,
     signal: AbortSignal
-  ): Promise<{
-    readonly range: KnownRange;
-    readonly artifact?: SegmentArtifact;
-  }> {
+  ): Promise<KnownRange> {
     const cached = this.knownRanges.get(index);
-    if (cached) return { range: cached };
+    if (cached) return cached;
     const start = this.segmentStartByte(index);
     const exactLength = this.exactSpoolingSegmentSize(index);
     if (start !== undefined && exactLength !== undefined) {
       const range = { begin: start, end: start + exactLength };
       this.knownRanges.set(index, range);
-      return { range };
+      return range;
     }
 
+    try {
+      const metadata = await this.pool.fetchSegmentRangeMetadata(
+        this.source.segments[index],
+        this.nzbHash,
+        signal,
+        CommandPriority.High,
+        { requireByteRange: this.source.segments.length > 1 }
+      );
+      return this.recordMeasuredRange(index, {
+        byteRange: metadata.byteRange,
+        decodedSize: metadata.decodedSize ?? 0,
+      });
+    } catch (error) {
+      const synthesized = this.synthesizeHoleRange(index, error);
+      if (synthesized) return synthesized;
+      throw error;
+    }
+  }
+
+  private async fetchLocatedSpoolingArtifact(
+    index: number,
+    range: KnownRange,
+    signal: AbortSignal
+  ): Promise<LocatedSegment> {
+    const expectedLength = range.end - range.begin;
+    if (!Number.isSafeInteger(expectedLength) || expectedLength <= 0) {
+      throw new Error('Spooling locator resolved an invalid segment range');
+    }
     let artifact: SegmentArtifact | undefined;
     try {
       artifact = await this.pool.fetchSegmentArtifact(
@@ -758,19 +802,59 @@ export class FileStream implements SeekableStream {
         this.nzbHash,
         signal,
         CommandPriority.High,
-        exactLength === undefined ? undefined : { expectedLength: exactLength }
+        { expectedLength, allowGrowing: true }
       );
-      const range = this.recordMeasuredRange(index, {
-        byteRange: artifact.metadata.byteRange,
-        decodedSize: artifact.length,
-      });
-      return { range, artifact };
+      if (signal.aborted) {
+        const abandoned = artifact;
+        artifact = undefined;
+        await abandoned.release();
+        throw new NntpError('connection', 'aborted');
+      }
+      return {
+        segmentIndex: index,
+        segmentStartByte: range.begin,
+        initialArtifact: artifact,
+      };
     } catch (error) {
       await artifact?.release();
-      const synthesized = this.synthesizeHoleRange(index, error);
-      if (synthesized) return { range: synthesized };
+      const kind = definitiveLossKind(error);
+      if (kind !== undefined) {
+        const zero = this.createLocatedHoleArtifact(
+          index,
+          expectedLength,
+          kind
+        );
+        if (zero) {
+          return {
+            segmentIndex: index,
+            segmentStartByte: range.begin,
+            initialArtifact: zero,
+          };
+        }
+      }
       throw error;
     }
+  }
+
+  private createLocatedHoleArtifact(
+    index: number,
+    bytes: number,
+    kind: 'missing' | 'undecodable'
+  ): ZeroSegmentArtifact | undefined {
+    const holes = this.holes;
+    if (
+      !holes ||
+      holes.hooks.onHole({
+        nzbFileIndex: holes.fileIndex,
+        segmentIndex: index,
+        targetOffset: this.segmentStartByte(index),
+        bytes,
+        kind,
+      }) !== 'pad'
+    ) {
+      return undefined;
+    }
+    return new ZeroSegmentArtifact(bytes);
   }
 
   private async fetchOpeningMetadata(
@@ -782,7 +866,8 @@ export class FileStream implements SeekableStream {
         this.source.segments[index],
         this.nzbHash,
         signal,
-        CommandPriority.High
+        CommandPriority.High,
+        { requireByteRange: this.source.segments.length > 1 }
       );
     }
     const shared = await this.pool.fetchSegmentShared(

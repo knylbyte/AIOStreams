@@ -37,7 +37,7 @@ export interface CommonSegmentReadOptions {
     kind: HoleKind
   ) => HoleDecision;
   readonly knownHoles?: ReadonlySet<number>;
-  /** Completed first artifact retained by a buffer-free spooling locator. */
+  /** Complete or growing first artifact retained by the bounded locator. */
   readonly initialSpoolingArtifact?: SegmentArtifact;
 }
 

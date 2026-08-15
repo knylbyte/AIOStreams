@@ -13,12 +13,14 @@ import {
   type SegmentData,
 } from '../types.js';
 import type { ByteLease } from './byte-budget.js';
+import { ByteBudget } from './byte-budget.js';
 import { FileStream, type FileStreamPool } from './file-stream.js';
 import type { SharedSegment } from './segment-arena.js';
 import type {
   SegmentArtifact,
   SegmentArtifactFetchOptions,
   SegmentArtifactReadOptions,
+  SegmentRangeMetadataFetchOptions,
   SegmentRangeMetadata,
 } from './segment-artifact.js';
 import { createSegmentReadStream } from './segment-read-stream-factory.js';
@@ -28,6 +30,7 @@ import {
   type SpoolingSegmentArtifactSource,
 } from './spooling-segments-stream.js';
 import { reapIdleStreams } from './tracked-stream.js';
+import { YencDecodeError } from './yenc.js';
 
 interface FetchCall {
   readonly segment: NzbSegmentRef;
@@ -36,10 +39,17 @@ interface FetchCall {
   readonly allowGrowing: boolean;
 }
 
+interface MetadataCall {
+  readonly segment: NzbSegmentRef;
+  readonly signal: AbortSignal | undefined;
+  readonly requireByteRange: boolean;
+}
+
 type FetchHandler = (call: FetchCall) => Promise<SegmentArtifact>;
 
 class TestArtifactSource implements FileStreamPool {
   readonly calls: FetchCall[] = [];
+  readonly metadataRequests: MetadataCall[] = [];
   readonly bufferingBodies = new Map<string, Buffer>();
   readonly sharedBodies = new Map<string, Buffer>();
   bufferingCalls = 0;
@@ -48,6 +58,7 @@ class TestArtifactSource implements FileStreamPool {
   metadataCalls = 0;
   activeStreamLeases = 0;
   peakStreamLeases = 0;
+  streamLeaseReleases = 0;
 
   private readonly callWaiters = new Set<{
     readonly count: number;
@@ -58,7 +69,8 @@ class TestArtifactSource implements FileStreamPool {
     private readonly handler: FetchHandler,
     private readonly metadataHandler?: (
       segment: NzbSegmentRef,
-      signal: AbortSignal | undefined
+      signal: AbortSignal | undefined,
+      options: SegmentRangeMetadataFetchOptions
     ) => Promise<SegmentRangeMetadata>
   ) {}
 
@@ -96,6 +108,7 @@ class TestArtifactSource implements FileStreamPool {
       release: () => {
         if (released) return;
         released = true;
+        this.streamLeaseReleases++;
         this.activeStreamLeases--;
       },
     });
@@ -149,10 +162,19 @@ class TestArtifactSource implements FileStreamPool {
   fetchSegmentRangeMetadata(
     segment: NzbSegmentRef,
     _nzbHash: string,
-    signal: AbortSignal | undefined
+    signal: AbortSignal | undefined,
+    _priority: CommandPriority,
+    options: SegmentRangeMetadataFetchOptions = {}
   ): Promise<SegmentRangeMetadata> {
     this.metadataCalls++;
-    if (this.metadataHandler) return this.metadataHandler(segment, signal);
+    this.metadataRequests.push({
+      segment,
+      signal,
+      requireByteRange: options.requireByteRange ?? false,
+    });
+    if (this.metadataHandler) {
+      return this.metadataHandler(segment, signal, options);
+    }
     const body =
       this.sharedBodies.get(segment.messageId) ??
       this.bufferingBodies.get(segment.messageId);
@@ -265,6 +287,85 @@ class ControlledArtifact implements SegmentArtifact {
   }
 }
 
+/** Test artifact that exposes range bytes before a controlled validation gate. */
+class GatedRangeArtifact implements SegmentArtifact {
+  readonly metadata;
+  readonly storage: 'spool' = 'spool';
+  readonly readerReady = Promise.withResolvers<PassThrough>();
+  releaseCalls = 0;
+
+  private reader: PassThrough | undefined;
+  private released = false;
+  private committedBytes = 0;
+  private rangeStart = 0;
+  private rangeEnd: number;
+
+  constructor(readonly length: number) {
+    this.metadata = { size: length };
+    this.rangeEnd = length;
+  }
+
+  createReadStream(options: SegmentArtifactReadOptions = {}): Readable {
+    assert.equal(this.reader, undefined);
+    this.rangeStart = options.start ?? 0;
+    this.rangeEnd = options.endExclusive ?? this.length;
+    const reader = new PassThrough({ highWaterMark: options.highWaterMark });
+    if (options.signal) addAbortSignal(options.signal, reader);
+    this.reader = reader;
+    this.readerReady.resolve(reader);
+    return reader;
+  }
+
+  commit(chunk: Buffer): boolean {
+    assert(this.reader);
+    const begin = this.committedBytes;
+    const end = begin + chunk.length;
+    this.committedBytes = end;
+    const overlapBegin = Math.max(begin, this.rangeStart);
+    const overlapEnd = Math.min(end, this.rangeEnd);
+    if (overlapEnd <= overlapBegin) return true;
+    return this.reader.write(
+      chunk.subarray(overlapBegin - begin, overlapEnd - begin)
+    );
+  }
+
+  complete(): void {
+    assert(this.reader);
+    this.reader.end();
+  }
+
+  fail(error: Error): void {
+    assert(this.reader);
+    this.reader.destroy(error);
+  }
+
+  async release(): Promise<void> {
+    if (this.released) return;
+    this.released = true;
+    this.releaseCalls++;
+    const reader = this.reader;
+    if (reader && !reader.destroyed) reader.destroy();
+    if (reader && !reader.closed) await once(reader, 'close');
+  }
+}
+
+class BudgetedArtifactSource extends TestArtifactSource {
+  constructor(
+    handler: FetchHandler,
+    readonly budget: ByteBudget,
+    private readonly leaseBytes: number
+  ) {
+    super(handler);
+  }
+
+  override acquireSegmentStreamMemory(
+    priority: CommandPriority,
+    signal?: AbortSignal
+  ): Promise<ByteLease> {
+    return this.budget.acquire(this.leaseBytes, { priority, signal });
+  }
+}
+
 function segment(index: number): NzbSegmentRef {
   return { messageId: `segment-${index}`, bytes: 4 };
 }
@@ -332,6 +433,35 @@ function abortableArtifact(
       }
     );
   });
+}
+
+function abortablePromise<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined
+): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener('abort', onAbort);
+      reject(signal.reason);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      }
+    );
+  });
+}
+
+function immediate(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 async function closeEvent(stream: Readable): Promise<void> {
@@ -523,17 +653,37 @@ test('spooling FileStream open without knownSize uses only bounded scalar metada
   assert.equal(source.calls.length, 2);
 });
 
-test('nonzero spooling seek reuses its file-backed locator artifact', async () => {
-  const located = new BufferArtifact(Buffer.from('BBBB'));
-  const source = new TestArtifactSource((call) => {
-    assert.equal(call.segment.messageId, 'segment-1');
-    return Promise.resolve(located);
-  });
+test('nonzero spooling seek probes only scalar metadata and reuses one target artifact', async () => {
+  const ranges = new Map<string, readonly [number, number]>([
+    ['segment-0', [0, 2]],
+    ['segment-1', [2, 5]],
+    ['segment-2', [5, 11]],
+    ['segment-3', [11, 20]],
+  ]);
+  const located = new BufferArtifact(Buffer.from('DDDDDDDDD'));
+  const source = new TestArtifactSource(
+    (call) => {
+      assert.equal(call.segment.messageId, 'segment-3');
+      return Promise.resolve(located);
+    },
+    (candidate, signal, options) => {
+      assert.equal(signal?.aborted, false);
+      assert.equal(options.requireByteRange, true);
+      const range = ranges.get(candidate.messageId);
+      assert(range);
+      return Promise.resolve({
+        byteRange: range,
+        fileSize: 20,
+        totalParts: 4,
+        decodedSize: range[1] - range[0],
+      });
+    }
+  );
   const file = new FileStream(
     source,
     {
-      segments: [segment(0), segment(1), segment(2)],
-      knownSize: 12,
+      segments: [segment(0), segment(1), segment(2), segment(3)],
+      knownSize: 20,
     },
     'reuse-locator-artifact',
     {
@@ -545,22 +695,32 @@ test('nonzero spooling seek reuses its file-backed locator artifact', async () =
   await file.open();
 
   assert.equal(
-    (await collect(file.createReadStream({ start: 5, end: 7 }))).toString(),
-    'BB'
+    (await collect(file.createReadStream({ start: 12, end: 15 }))).toString(),
+    'DDD'
   );
   assert.equal(source.calls.length, 1);
-  assert.equal(source.calls[0].allowGrowing, false);
+  assert.equal(source.calls[0].segment.messageId, 'segment-3');
+  assert.equal(source.calls[0].allowGrowing, true);
+  assert.equal(source.calls[0].expectedLength, 9);
   assert.equal(source.sharedCalls, 0);
   assert.equal(source.bufferingCalls, 0);
-  assert.equal(source.metadataCalls, 0);
+  assert.deepEqual(
+    source.metadataRequests.map((request) => request.segment.messageId),
+    ['segment-2', 'segment-3']
+  );
   assert.equal(located.releaseCalls, 1);
   assert.equal(source.activeStreamLeases, 0);
 });
 
-test('destroy during a spooling locator aborts it before stream admission', async () => {
-  const pending = Promise.withResolvers<SegmentArtifact>();
-  const source = new TestArtifactSource((call) =>
-    abortableArtifact(pending.promise, call.signal)
+test('destroy during bounded metadata search aborts before target-artifact admission', async () => {
+  const pending = Promise.withResolvers<SegmentRangeMetadata>();
+  const metadataStarted = Promise.withResolvers<void>();
+  const source = new TestArtifactSource(
+    () => Promise.reject(new Error('target artifact must not be admitted')),
+    (_candidate, signal) => {
+      metadataStarted.resolve();
+      return abortablePromise(pending.promise, signal);
+    }
   );
   const file = new FileStream(
     source,
@@ -578,15 +738,52 @@ test('destroy during a spooling locator aborts it before stream admission', asyn
   await file.open();
   const stream = file.createReadStream({ start: 5, end: 7 });
   stream.resume();
-  await source.waitForCalls(1);
-  const locatorSignal = source.calls[0].signal;
+  await metadataStarted.promise;
+  const locatorSignal = source.metadataRequests[0].signal;
   assert(locatorSignal);
   stream.destroy();
   await closeEvent(stream);
 
   assert.equal(locatorSignal.aborted, true);
   assert.equal(getEventListeners(locatorSignal, 'abort').length, 0);
-  assert.equal(source.calls.length, 1);
+  assert.equal(source.metadataCalls, 1);
+  assert.equal(source.calls.length, 0);
+  assert.equal(source.activeStreamLeases, 0);
+});
+
+test('unusable locator metadata fails typed before creating a target artifact', async () => {
+  const decodeFailure = new YencDecodeError(
+    'invalid_header',
+    'article undecodable on all providers: invalid_header',
+    { terminal: true }
+  );
+  const source = new TestArtifactSource(
+    () => Promise.reject(new Error('target artifact must not be admitted')),
+    () => Promise.reject(decodeFailure)
+  );
+  const file = new FileStream(
+    source,
+    {
+      segments: [segment(0), segment(1), segment(2)],
+      knownSize: 12,
+    },
+    'invalid-locator-metadata',
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      streamingMode: 'segment_spooling',
+      prefetchSegments: 1,
+    }
+  );
+  await file.open();
+  const stream = file.createReadStream({ start: 5, end: 7 });
+  const streamError = Promise.withResolvers<Error>();
+  stream.once('error', streamError.resolve);
+  stream.resume();
+
+  assert.equal(await streamError.promise, decodeFailure);
+  await closeEvent(stream);
+  assert.equal(source.metadataCalls, 1);
+  assert.equal(source.calls.length, 0);
   assert.equal(source.activeStreamLeases, 0);
 });
 
@@ -714,6 +911,129 @@ test('the next segment cannot advance before the growing first reader validates 
   assert.equal(source.activeStreamLeases, 0);
 });
 
+test('a satisfied partial range emits bytes but waits for producer-validated EOF', async () => {
+  const artifact = new GatedRangeArtifact(6);
+  const source = new TestArtifactSource(() => Promise.resolve(artifact));
+  const stream = new SpoolingSegmentsStream(
+    streamOptions(source, 1, { limitBytes: 3 })
+  );
+  const chunks: Buffer[] = [];
+  const firstData = Promise.withResolvers<void>();
+  let ended = false;
+  stream.on('data', (chunk: Buffer) => {
+    chunks.push(chunk);
+    firstData.resolve();
+  });
+  stream.once('end', () => {
+    ended = true;
+  });
+
+  await artifact.readerReady.promise;
+  artifact.commit(Buffer.from('abc'));
+  await firstData.promise;
+  await immediate();
+  assert.equal(Buffer.concat(chunks).toString(), 'abc');
+  assert.equal(ended, false);
+  assert.equal(stream.closed, false);
+  assert.equal(artifact.releaseCalls, 0);
+  assert.equal(source.calls.length, 1);
+
+  const completed = once(stream, 'end');
+  artifact.complete();
+  await completed;
+  await closeEvent(stream);
+  assert.equal(artifact.releaseCalls, 1);
+  assert.equal(source.activeStreamLeases, 0);
+});
+
+test('a late producer failure rejects a partial range after its bytes were emitted', async () => {
+  const artifact = new GatedRangeArtifact(6);
+  const source = new TestArtifactSource(() => Promise.resolve(artifact));
+  const stream = new SpoolingSegmentsStream(
+    streamOptions(source, 1, { limitBytes: 3 })
+  );
+  const chunks: Buffer[] = [];
+  let ended = false;
+  stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+  stream.once('end', () => {
+    ended = true;
+  });
+  const streamError = Promise.withResolvers<Error>();
+  stream.once('error', streamError.resolve);
+
+  await artifact.readerReady.promise;
+  artifact.commit(Buffer.from('abc'));
+  await immediate();
+  const failure = new Error('producer validation failed after range bytes');
+  artifact.fail(failure);
+  assert.equal(await streamError.promise, failure);
+  await closeEvent(stream);
+  assert.equal(Buffer.concat(chunks).toString(), 'abc');
+  assert.equal(ended, false);
+  assert.equal(artifact.releaseCalls, 1);
+  assert.equal(source.activeStreamLeases, 0);
+});
+
+test('an exact final-segment range cannot hide a late yend validation failure', async () => {
+  const artifact = new GatedRangeArtifact(3);
+  const source = new TestArtifactSource(() => Promise.resolve(artifact));
+  const stream = new SpoolingSegmentsStream(
+    streamOptions(source, 1, { limitBytes: 3 })
+  );
+  const chunks: Buffer[] = [];
+  let ended = false;
+  stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+  stream.once('end', () => {
+    ended = true;
+  });
+  const streamError = Promise.withResolvers<Error>();
+  stream.once('error', streamError.resolve);
+
+  await artifact.readerReady.promise;
+  artifact.commit(Buffer.from('xyz'));
+  await immediate();
+  assert.equal(ended, false);
+  const failure = new Error('yEnc decode failed: no_end_found');
+  artifact.fail(failure);
+  assert.equal(await streamError.promise, failure);
+  await closeEvent(stream);
+  assert.equal(Buffer.concat(chunks).toString(), 'xyz');
+  assert.equal(ended, false);
+  assert.equal(artifact.releaseCalls, 1);
+});
+
+test('a range ending in a later segment waits for that segment validation', async () => {
+  const first = new BufferArtifact(Buffer.from('aaaa'));
+  const second = new GatedRangeArtifact(6);
+  const source = new TestArtifactSource((call) =>
+    Promise.resolve(call.segment.messageId === 'segment-0' ? first : second)
+  );
+  const stream = new SpoolingSegmentsStream(
+    streamOptions(source, 2, { limitBytes: 7 })
+  );
+  const chunks: Buffer[] = [];
+  let ended = false;
+  stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+  stream.once('end', () => {
+    ended = true;
+  });
+
+  await second.readerReady.promise;
+  second.commit(Buffer.from('bbbbbb'));
+  await immediate();
+  assert.equal(Buffer.concat(chunks).toString(), 'aaaabbb');
+  assert.equal(ended, false);
+  assert.equal(second.releaseCalls, 0);
+
+  const completed = once(stream, 'end');
+  second.complete();
+  await completed;
+  await closeEvent(stream);
+  assert.equal(first.releaseCalls, 1);
+  assert.equal(second.releaseCalls, 1);
+  assert.equal(source.activeStreamLeases, 0);
+});
+
 test('skip and exact byte limit span segment boundaries without over-read', async () => {
   const bodies = ['abcd', 'efgh', 'ijkl'].map((value) => Buffer.from(value));
   const artifacts = bodies.map((body) => new BufferArtifact(body));
@@ -772,6 +1092,127 @@ test('outer backpressure and explicit pause/resume control the active reader', a
   artifact.end();
   assert.equal((await collect(stream)).toString(), 'efgh');
   assert.equal(source.activeStreamLeases, 0);
+});
+
+test('stream memory lease remains held while unread output is queued', async () => {
+  const artifact = new BufferArtifact(Buffer.from('unread!!'));
+  const source = new TestArtifactSource(() => Promise.resolve(artifact));
+  const stream = new SpoolingSegmentsStream(streamOptions(source, 1));
+  stream.read(0);
+  await once(stream, 'readable');
+  await immediate();
+
+  assert(stream.readableLength > 0);
+  assert.equal(source.activeStreamLeases, 1);
+  assert.equal(source.streamLeaseReleases, 0);
+
+  assert.equal((await collect(stream)).toString(), 'unread!!');
+  await closeEvent(stream);
+  assert.equal(source.activeStreamLeases, 0);
+  assert.equal(source.streamLeaseReleases, 1);
+});
+
+test('stream memory lease survives producer completion during backpressure', async () => {
+  const artifact = new ControlledArtifact(8);
+  const source = new TestArtifactSource(() => Promise.resolve(artifact));
+  const stream = new SpoolingSegmentsStream(streamOptions(source, 1));
+  stream.read(0);
+  const readable = once(stream, 'readable');
+  await artifact.readerReady.promise;
+  artifact.write(Buffer.from('abcdefgh'));
+  artifact.end();
+  await readable;
+  await immediate();
+
+  assert(stream.readableLength > 0);
+  assert.equal(source.activeStreamLeases, 1);
+  assert.equal(source.streamLeaseReleases, 0);
+
+  assert.equal((await collect(stream)).toString(), 'abcdefgh');
+  await closeEvent(stream);
+  assert.equal(source.activeStreamLeases, 0);
+  assert.equal(source.streamLeaseReleases, 1);
+});
+
+test('client destroy discards queued output before releasing its lease once', async () => {
+  const artifact = new BufferArtifact(Buffer.from('discard'));
+  const source = new TestArtifactSource(() => Promise.resolve(artifact));
+  const stream = new SpoolingSegmentsStream(streamOptions(source, 1));
+  stream.read(0);
+  await once(stream, 'readable');
+  assert(stream.readableLength > 0);
+  assert.equal(source.activeStreamLeases, 1);
+
+  stream.destroy();
+  await closeEvent(stream);
+  assert.equal(stream.readableLength, 0);
+  assert.equal(source.activeStreamLeases, 0);
+  assert.equal(source.streamLeaseReleases, 1);
+  stream.destroy();
+  assert.equal(source.streamLeaseReleases, 1);
+});
+
+test('two queued streams cannot overbook the shared byte budget', async () => {
+  const budget = new ByteBudget(8, { maxWaiters: 2 });
+  const source = new BudgetedArtifactSource(
+    () => Promise.resolve(new BufferArtifact(Buffer.from('data'))),
+    budget,
+    8
+  );
+  const first = new SpoolingSegmentsStream(streamOptions(source, 1));
+  first.read(0);
+  await once(first, 'readable');
+  assert(first.readableLength > 0);
+
+  const second = new SpoolingSegmentsStream(streamOptions(source, 1));
+  second.read(0);
+  assert.deepEqual(budget.stats(), {
+    maxBytes: 8,
+    usedBytes: 8,
+    waiting: 1,
+    peakBytes: 8,
+  });
+
+  assert.equal((await collect(first)).toString(), 'data');
+  await closeEvent(first);
+  await once(second, 'readable');
+  assert.equal(budget.stats().usedBytes, 8);
+  assert.equal((await collect(second)).toString(), 'data');
+  await closeEvent(second);
+  assert.equal(budget.stats().usedBytes, 0);
+  assert.equal(budget.stats().peakBytes, 8);
+  budget.close();
+});
+
+test('FileStream relay retains the stream lease until its outer queue drains', async () => {
+  const body = Buffer.from('relay-buffer');
+  const artifact = new BufferArtifact(body);
+  const source = new TestArtifactSource(() => Promise.resolve(artifact));
+  const file = new FileStream(
+    source,
+    { segments: [segment(0)], knownSize: body.length },
+    'relay-lease',
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      streamingMode: 'segment_spooling',
+      prefetchSegments: 1,
+    }
+  );
+  await file.open();
+  const outer = file.createReadStream();
+  outer.read(0);
+  await once(outer, 'readable');
+  await immediate();
+
+  assert(outer.readableLength > 0);
+  assert.equal(source.activeStreamLeases, 1);
+  assert.equal(source.streamLeaseReleases, 0);
+
+  assert.deepEqual(await collect(outer), body);
+  await closeEvent(outer);
+  assert.equal(source.activeStreamLeases, 0);
+  assert.equal(source.streamLeaseReleases, 1);
+  assert.equal(artifact.releaseCalls, 1);
 });
 
 test('client destruction aborts every planned fetch and leaves no lease', async () => {

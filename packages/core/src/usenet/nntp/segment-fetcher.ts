@@ -58,6 +58,12 @@ export interface SegmentHeadData {
   size?: number;
 }
 
+/** Validation required by an authoritative file-offset metadata probe. */
+export interface SegmentHeadFetchOptions {
+  readonly strictYencMetadata?: boolean;
+  readonly requireByteRange?: boolean;
+}
+
 /** One provider-attempt-local sink and the resource it is filling. */
 export interface StreamingSegmentAttempt<T> {
   readonly sink: BackpressuredByteSink;
@@ -115,7 +121,8 @@ export interface SegmentFetcher {
     priority: CommandPriority,
     want: number,
     onWireStart?: () => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    options?: SegmentHeadFetchOptions
   ): Promise<SegmentHeadData>;
   /** STAT existence probe across providers (no download budget). */
   statSegment(
@@ -476,7 +483,8 @@ export class LocalSegmentFetcher implements SegmentFetcher {
     priority: CommandPriority,
     want: number,
     onWireStart?: () => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    options: SegmentHeadFetchOptions = {}
   ): Promise<SegmentHeadData> {
     return this.submitWithFailover<SegmentHeadData>(
       segment,
@@ -487,7 +495,7 @@ export class LocalSegmentFetcher implements SegmentFetcher {
           signal,
           run: async (conn) => {
             onWireStart?.();
-            const capture = new YencHeadCapture(want);
+            const capture = new YencHeadCapture(want, options);
             const rawBytes = await conn.bodyStreaming(
               segment.messageId,
               (chunk) => capture.push(chunk),
