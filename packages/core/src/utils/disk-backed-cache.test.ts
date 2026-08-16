@@ -40,6 +40,7 @@ function createCache(
   root: string,
   options: {
     readonly maxDiskBytes: number;
+    readonly maxMemBytes?: number;
     readonly renameFile?: (
       source: string,
       destination: string
@@ -51,7 +52,7 @@ function createCache(
   const cache = new DiskBackedCache<Buffer>({
     name: options.name ?? 'test-cache',
     dir: root,
-    maxMemBytes: 0,
+    maxMemBytes: options.maxMemBytes ?? 0,
     maxDiskBytes: options.maxDiskBytes,
     serialize: (value) => Buffer.from(value),
     deserialize: (value) => Buffer.from(value),
@@ -147,6 +148,190 @@ test('the existing set/getAsync buffering path remains compatible', async (conte
   assert.deepEqual(await cache.getAsync('buffered'), Buffer.from('body'));
   assert.equal(cache.stats().diskBytes, 4);
   assert.equal(cache.stats().diskCount, 1);
+});
+
+test('getAsync crossing clear cannot publish an older disk generation', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-read-clear-'));
+  const readEntered = deferred();
+  const continueRead = deferred();
+  const target = path.join(root, 'test-cache', fileKey('cross-clear'));
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    maxMemBytes: 16,
+    fileSystem: {
+      readFile: async (candidate, options) => {
+        const result = await readFile(candidate, options);
+        if (String(candidate) === target) {
+          readEntered.resolve();
+          await continueRead.promise;
+        }
+        return result;
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  assert.equal(
+    await cache.installPreparedFile(
+      'cross-clear',
+      await prepared(cache, Buffer.from('data')),
+      4
+    ),
+    true
+  );
+
+  const lookup = cache.getAsync('cross-clear');
+  await readEntered.promise;
+  await cache.clear();
+  assert.deepEqual(cache.stats(), {
+    memBytes: 0,
+    memCount: 0,
+    diskBytes: 0,
+    diskCount: 0,
+    hits: 0,
+    misses: 0,
+    diskHits: 0,
+    hitRate: 0,
+  });
+  continueRead.resolve();
+
+  assert.equal(await lookup, undefined);
+  assert.deepEqual(cache.stats(), {
+    memBytes: 0,
+    memCount: 0,
+    diskBytes: 0,
+    diskCount: 0,
+    hits: 0,
+    misses: 0,
+    diskHits: 0,
+    hitRate: 0,
+  });
+  assert.equal(cache.get('cross-clear'), undefined);
+});
+
+test('an old getAsync cannot overwrite a same-key value installed after clear', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-read-replace-'));
+  const readEntered = deferred();
+  const continueRead = deferred();
+  const target = path.join(root, 'test-cache', fileKey('same-key'));
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    maxMemBytes: 16,
+    fileSystem: {
+      readFile: async (candidate, options) => {
+        const result = await readFile(candidate, options);
+        if (String(candidate) === target) {
+          readEntered.resolve();
+          await continueRead.promise;
+        }
+        return result;
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  assert.equal(
+    await cache.installPreparedFile(
+      'same-key',
+      await prepared(cache, Buffer.from('old!')),
+      4
+    ),
+    true
+  );
+
+  const oldLookup = cache.getAsync('same-key');
+  await readEntered.promise;
+  await cache.clear();
+  cache.set('same-key', Buffer.from('new!'), { skipDisk: true });
+  continueRead.resolve();
+
+  assert.equal(await oldLookup, undefined);
+  assert.deepEqual(
+    {
+      memBytes: cache.stats().memBytes,
+      memCount: cache.stats().memCount,
+      hits: cache.stats().hits,
+      diskHits: cache.stats().diskHits,
+      misses: cache.stats().misses,
+    },
+    { memBytes: 4, memCount: 1, hits: 0, diskHits: 0, misses: 0 }
+  );
+  assert.deepEqual(cache.get('same-key'), Buffer.from('new!'));
+});
+
+test('getAsync crossing close releases without publishing or finalizing stats', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-read-close-'));
+  const readEntered = deferred();
+  const continueRead = deferred();
+  const target = path.join(root, 'test-cache', fileKey('cross-close'));
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    maxMemBytes: 16,
+    fileSystem: {
+      readFile: async (candidate, options) => {
+        const result = await readFile(candidate, options);
+        if (String(candidate) === target) {
+          readEntered.resolve();
+          await continueRead.promise;
+        }
+        return result;
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  assert.equal(
+    await cache.installPreparedFile(
+      'cross-close',
+      await prepared(cache, Buffer.from('data')),
+      4
+    ),
+    true
+  );
+
+  const lookup = cache.getAsync('cross-close');
+  await readEntered.promise;
+  await cache.close();
+  continueRead.resolve();
+
+  assert.equal(await lookup, undefined);
+  assert.deepEqual(
+    {
+      memBytes: cache.stats().memBytes,
+      memCount: cache.stats().memCount,
+      hits: cache.stats().hits,
+      diskHits: cache.stats().diskHits,
+      misses: cache.stats().misses,
+    },
+    { memBytes: 0, memCount: 0, hits: 0, diskHits: 0, misses: 0 }
+  );
+});
+
+test('ordinary getAsync still promotes one byte-identical hit into L1', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-read-normal-'));
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    maxMemBytes: 16,
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const body = Buffer.from('data');
+  assert.equal(
+    await cache.installPreparedFile(
+      'normal-buffering',
+      await prepared(cache, body),
+      body.length
+    ),
+    true
+  );
+
+  assert.deepEqual(await cache.getAsync('normal-buffering'), body);
+  assert.deepEqual(
+    {
+      memBytes: cache.stats().memBytes,
+      memCount: cache.stats().memCount,
+      hits: cache.stats().hits,
+      diskHits: cache.stats().diskHits,
+      misses: cache.stats().misses,
+    },
+    { memBytes: 4, memCount: 1, hits: 1, diskHits: 1, misses: 0 }
+  );
 });
 
 test('an active file lease defers physical eviction until its final release', async (context) => {
@@ -381,6 +566,320 @@ test('clear with a file lease removes the index before deferred physical cleanup
   await access(lease.path);
   await lease.release();
   await assert.rejects(access(lease.path), { code: 'ENOENT' });
+});
+
+test('a foreign lease wins atomically and wakes exactly one deferred delete', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-fence-lease-'));
+  const { dataPath } = await writePersistentEntry(
+    root,
+    'foreign-lease',
+    Buffer.from('data')
+  );
+  let deleteCalls = 0;
+  const clearingCache = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath) deleteCalls++;
+        return rm(candidate, options);
+      },
+    },
+  });
+  const readingCache = createCache(context, root, { maxDiskBytes: 16 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await Promise.all([clearingCache.whenReady(), readingCache.whenReady()]);
+
+  const lease = await readingCache.acquireDiskFile('foreign-lease');
+  assert(lease);
+  // Both logical generations may request the same physical cleanup; the
+  // process-wide pending slot still wakes one rm after the final lease.
+  await Promise.all([clearingCache.clear(), readingCache.clear()]);
+  await access(dataPath);
+  assert.equal(deleteCalls, 0);
+
+  await lease.release();
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  assert.equal(deleteCalls, 1);
+  assert.deepEqual(
+    {
+      diskBytes: clearingCache.stats().diskBytes,
+      diskCount: clearingCache.stats().diskCount,
+    },
+    { diskBytes: 0, diskCount: 0 }
+  );
+});
+
+test('a delete claim prevents a cross-instance lease without lookup stats', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-fence-delete-'));
+  const { dataPath } = await writePersistentEntry(
+    root,
+    'claimed-delete',
+    Buffer.from('data')
+  );
+  const deleteEntered = deferred();
+  const continueDelete = deferred();
+  let deleteCalls = 0;
+  const guardedRm: DiskBackedCacheFileSystem['rm'] = async (
+    candidate,
+    options
+  ) => {
+    if (String(candidate) === dataPath) {
+      deleteCalls++;
+      deleteEntered.resolve();
+      await continueDelete.promise;
+    }
+    return rm(candidate, options);
+  };
+  const clearingCache = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: { rm: guardedRm },
+  });
+  const readingCache = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: { rm: guardedRm },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await Promise.all([clearingCache.whenReady(), readingCache.whenReady()]);
+
+  const clearing = clearingCache.clear();
+  await deleteEntered.promise;
+  assert.equal(await readingCache.acquireDiskFile('claimed-delete'), undefined);
+  assert.deepEqual(
+    {
+      hits: readingCache.stats().hits,
+      misses: readingCache.stats().misses,
+      diskHits: readingCache.stats().diskHits,
+    },
+    { hits: 0, misses: 0, diskHits: 0 }
+  );
+  // A second logical delete coalesces with the already active process claim.
+  await readingCache.clear();
+  assert.equal(deleteCalls, 1);
+
+  continueDelete.resolve();
+  await clearing;
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  assert.equal(deleteCalls, 1);
+});
+
+test('a foreign lease rejects prepared replacement before Windows fallback', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-fence-install-'));
+  let renameCalls = 0;
+  const installingCache = createCache(context, root, {
+    maxDiskBytes: 16,
+    renameFile: async () => {
+      renameCalls++;
+      throw codedError('EPERM');
+    },
+  });
+  await installingCache.whenReady();
+  const { dataPath } = await writePersistentEntry(
+    root,
+    'foreign-install',
+    Buffer.from('old!')
+  );
+  const readingCache = createCache(context, root, { maxDiskBytes: 16 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await readingCache.whenReady();
+  const lease = await readingCache.acquireDiskFile('foreign-install');
+  assert(lease);
+
+  assert.equal(
+    await installingCache.installPreparedFile(
+      'foreign-install',
+      await prepared(installingCache, Buffer.from('new!')),
+      4
+    ),
+    false
+  );
+  assert.equal(renameCalls, 0);
+  assert.deepEqual(await readFile(lease.path), Buffer.from('old!'));
+  assert.deepEqual(await readFile(dataPath), Buffer.from('old!'));
+  assert.equal(
+    (await readdir(path.join(root, 'test-cache'))).some((entry) =>
+      entry.startsWith('.prepared-')
+    ),
+    false
+  );
+  await lease.release();
+  await readingCache.clear();
+});
+
+test('a Windows replacement claim excludes a lease acquired at the rm boundary', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-fence-win-rm-'));
+  const replaceEntered = deferred();
+  const continueReplace = deferred();
+  let renameCalls = 0;
+  const installingCache = createCache(context, root, {
+    maxDiskBytes: 16,
+    renameFile: async (source, destination) => {
+      renameCalls++;
+      if (renameCalls === 1) throw codedError('EPERM');
+      await rename(source, destination);
+    },
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (
+          String(candidate) ===
+          path.join(root, 'test-cache', fileKey('windows-race'))
+        ) {
+          replaceEntered.resolve();
+          await continueReplace.promise;
+        }
+        return rm(candidate, options);
+      },
+    },
+  });
+  await installingCache.whenReady();
+  const { dataPath } = await writePersistentEntry(
+    root,
+    'windows-race',
+    Buffer.from('old!')
+  );
+  const readingCache = createCache(context, root, { maxDiskBytes: 16 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await readingCache.whenReady();
+
+  const install = installingCache.installPreparedFile(
+    'windows-race',
+    await prepared(installingCache, Buffer.from('new!')),
+    4
+  );
+  await replaceEntered.promise;
+  assert.equal(await readingCache.acquireDiskFile('windows-race'), undefined);
+  assert.deepEqual(
+    {
+      hits: readingCache.stats().hits,
+      misses: readingCache.stats().misses,
+      diskHits: readingCache.stats().diskHits,
+    },
+    { hits: 0, misses: 0, diskHits: 0 }
+  );
+
+  continueReplace.resolve();
+  assert.equal(await install, true);
+  assert.equal(renameCalls, 2);
+  assert.deepEqual(await readFile(dataPath), Buffer.from('new!'));
+  await readingCache.clear();
+});
+
+test('startup orphan cleanup defers to an already acquired foreign lease', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-orphan-lease-'));
+  const { dataPath, indexPath } = await writePersistentEntry(
+    root,
+    'startup-lease',
+    Buffer.from('data')
+  );
+  const readingCache = createCache(context, root, { maxDiskBytes: 16 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await readingCache.whenReady();
+  const lease = await readingCache.acquireDiskFile('startup-lease');
+  assert(lease);
+  await rm(indexPath, { force: true });
+
+  let deleteCalls = 0;
+  const recoveringCache = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath) deleteCalls++;
+        return rm(candidate, options);
+      },
+    },
+  });
+  await recoveringCache.whenReady();
+  await access(dataPath);
+  assert.equal(deleteCalls, 0);
+  assert.equal(recoveringCache.stats().diskCount, 0);
+
+  await lease.release();
+  assert.equal(deleteCalls, 1);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  await readingCache.clear();
+});
+
+test('startup orphan cleanup claim rejects a simultaneous foreign lease', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-orphan-claim-'));
+  const { dataPath, indexPath } = await writePersistentEntry(
+    root,
+    'startup-claim',
+    Buffer.from('data')
+  );
+  const readingCache = createCache(context, root, { maxDiskBytes: 16 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await readingCache.whenReady();
+  await rm(indexPath, { force: true });
+  const deleteEntered = deferred();
+  const continueDelete = deferred();
+  const recoveringCache = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath) {
+          deleteEntered.resolve();
+          await continueDelete.promise;
+        }
+        return rm(candidate, options);
+      },
+    },
+  });
+
+  await deleteEntered.promise;
+  assert.equal(await readingCache.acquireDiskFile('startup-claim'), undefined);
+  assert.deepEqual(
+    {
+      hits: readingCache.stats().hits,
+      misses: readingCache.stats().misses,
+      diskHits: readingCache.stats().diskHits,
+    },
+    { hits: 0, misses: 0, diskHits: 0 }
+  );
+  continueDelete.resolve();
+  await recoveringCache.whenReady();
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  await readingCache.clear();
+});
+
+test('a failed foreign-lease wakeup remains retryable without double accounting', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-fence-retry-'));
+  const { dataPath } = await writePersistentEntry(
+    root,
+    'foreign-retry',
+    Buffer.from('data')
+  );
+  let deleteCalls = 0;
+  const clearingCache = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath && ++deleteCalls === 1) {
+          throw codedError('EBUSY');
+        }
+        return rm(candidate, options);
+      },
+    },
+  });
+  const readingCache = createCache(context, root, { maxDiskBytes: 16 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await Promise.all([clearingCache.whenReady(), readingCache.whenReady()]);
+  const lease = await readingCache.acquireDiskFile('foreign-retry');
+  assert(lease);
+  await clearingCache.clear();
+
+  await assert.rejects(lease.release(), { code: 'EBUSY' });
+  await access(dataPath);
+  assert.equal(deleteCalls, 1);
+  await clearingCache.flush();
+  assert.equal(deleteCalls, 2);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  assert.deepEqual(
+    {
+      diskBytes: clearingCache.stats().diskBytes,
+      diskCount: clearingCache.stats().diskCount,
+    },
+    { diskBytes: 0, diskCount: 0 }
+  );
+  await readingCache.clear();
 });
 
 test('prepared creation reserves at most 64 slots before async I/O', async (context) => {

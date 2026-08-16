@@ -160,6 +160,7 @@ interface FileLeaseState {
   leases: number;
   pendingDelete: boolean;
   deletePromise?: Promise<void>;
+  processDeleteRequest?: ProcessPathDeleteRequest;
 }
 
 interface PreparedFileState {
@@ -198,31 +199,167 @@ interface RegisteredDiskCache {
 }
 
 const diskCacheRegistry = new Set<RegisteredDiskCache>();
+interface ProcessPathDeleteRequest {
+  run(): Promise<void>;
+  onStart(operation: Promise<void>): void;
+}
+
+interface ProcessPathOwnershipState {
+  leases: number;
+  mutationClaimed: boolean;
+  activeDelete: boolean;
+  pendingDelete?: ProcessPathDeleteRequest;
+}
+
+interface ProcessPathMutationClaim {
+  release(): Promise<void>;
+}
+
+interface ProcessPathLeaseRelease {
+  readonly deletionStarted: boolean;
+  readonly completion: Promise<void>;
+}
+
+type ProcessPathDeleteDisposition =
+  | { readonly status: 'pending' | 'existing' }
+  | { readonly status: 'started'; readonly operation: Promise<void> };
+
 /**
- * Process-local physical-file pins shared across cache re-instantiation. A
- * cleared/closed cache may keep an issued lease valid while its replacement
- * reconciles the same namespace; the replacement must not delete or overwrite
- * that path until the final old lease releases it.
+ * Process-local ownership shared across cache re-instantiation. Synchronous
+ * lease/mutation claims are the linearization points; async filesystem work is
+ * only started while the matching path remains exclusively mutation-claimed.
+ * A path owns at most one active or pending delete; no waiter queue is kept.
  */
-const activeDiskFileLeases = new Map<string, number>();
+const processPathOwnership = new Map<string, ProcessPathOwnershipState>();
 
-function activeFileLeaseCount(filePath: string): number {
-  return activeDiskFileLeases.get(path.resolve(filePath)) ?? 0;
+function resolvedFilePath(filePath: string): string {
+  return path.resolve(filePath);
 }
 
-function addActiveFileLease(filePath: string): void {
-  const resolved = path.resolve(filePath);
-  activeDiskFileLeases.set(resolved, activeFileLeaseCount(resolved) + 1);
+function getProcessPathState(filePath: string): ProcessPathOwnershipState {
+  const resolved = resolvedFilePath(filePath);
+  const existing = processPathOwnership.get(resolved);
+  if (existing) return existing;
+  const created: ProcessPathOwnershipState = {
+    leases: 0,
+    mutationClaimed: false,
+    activeDelete: false,
+  };
+  processPathOwnership.set(resolved, created);
+  return created;
 }
 
-function removeActiveFileLease(filePath: string): void {
-  const resolved = path.resolve(filePath);
-  const count = activeFileLeaseCount(resolved);
-  if (count <= 0) {
+function cleanupProcessPathState(
+  resolved: string,
+  state: ProcessPathOwnershipState
+): void {
+  if (
+    state.leases === 0 &&
+    !state.mutationClaimed &&
+    !state.activeDelete &&
+    !state.pendingDelete &&
+    processPathOwnership.get(resolved) === state
+  ) {
+    processPathOwnership.delete(resolved);
+  }
+}
+
+function startPendingProcessPathDelete(
+  resolved: string,
+  state: ProcessPathOwnershipState
+): Promise<void> {
+  const request = state.pendingDelete;
+  if (!request || state.leases > 0 || state.mutationClaimed) {
+    return Promise.resolve();
+  }
+  state.pendingDelete = undefined;
+  state.mutationClaimed = true;
+  state.activeDelete = true;
+  const operation = Promise.resolve()
+    .then(() => request.run())
+    .finally(async () => {
+      state.activeDelete = false;
+      state.mutationClaimed = false;
+      if (state.pendingDelete && state.leases === 0) {
+        await startPendingProcessPathDelete(resolved, state);
+      }
+      cleanupProcessPathState(resolved, state);
+    });
+  request.onStart(operation);
+  return operation;
+}
+
+function tryAcquireProcessPathLease(filePath: string): boolean {
+  const state = getProcessPathState(filePath);
+  if (state.mutationClaimed || state.pendingDelete) return false;
+  state.leases++;
+  return true;
+}
+
+function releaseProcessPathLease(filePath: string): ProcessPathLeaseRelease {
+  const resolved = resolvedFilePath(filePath);
+  const state = processPathOwnership.get(resolved);
+  if (!state || state.leases <= 0) {
     throw new Error('Disk cache process lease accounting invariant violated');
   }
-  if (count === 1) activeDiskFileLeases.delete(resolved);
-  else activeDiskFileLeases.set(resolved, count - 1);
+  state.leases--;
+  if (state.leases === 0 && state.pendingDelete && !state.mutationClaimed) {
+    return {
+      deletionStarted: true,
+      completion: startPendingProcessPathDelete(resolved, state),
+    };
+  }
+  cleanupProcessPathState(resolved, state);
+  return { deletionStarted: false, completion: Promise.resolve() };
+}
+
+function tryClaimProcessPathMutation(
+  filePath: string
+): ProcessPathMutationClaim | undefined {
+  const resolved = resolvedFilePath(filePath);
+  const state = getProcessPathState(resolved);
+  if (
+    state.leases > 0 ||
+    state.mutationClaimed ||
+    state.activeDelete ||
+    state.pendingDelete
+  ) {
+    cleanupProcessPathState(resolved, state);
+    return undefined;
+  }
+  state.mutationClaimed = true;
+  let releasePromise: Promise<void> | undefined;
+  return {
+    release: () => {
+      if (releasePromise) return releasePromise;
+      state.mutationClaimed = false;
+      releasePromise =
+        state.pendingDelete && state.leases === 0
+          ? startPendingProcessPathDelete(resolved, state)
+          : Promise.resolve();
+      cleanupProcessPathState(resolved, state);
+      return releasePromise;
+    },
+  };
+}
+
+function requestProcessPathDelete(
+  filePath: string,
+  request: ProcessPathDeleteRequest
+): ProcessPathDeleteDisposition {
+  const resolved = resolvedFilePath(filePath);
+  const state = getProcessPathState(resolved);
+  if (state.activeDelete || state.pendingDelete) {
+    return { status: 'existing' };
+  }
+  state.pendingDelete = request;
+  if (state.leases > 0 || state.mutationClaimed) {
+    return { status: 'pending' };
+  }
+  return {
+    status: 'started',
+    operation: startPendingProcessPathDelete(resolved, state),
+  };
 }
 
 /** Snapshot every live disk-backed cache for the dashboard cache page. */
@@ -434,15 +571,10 @@ export class DiskBackedCache<V> {
       // Files → delete any not referenced by the index (StremThru cleanOrphaned).
       for (const fileKey of present) {
         if (!this.disk.has(fileKey)) {
-          if (activeFileLeaseCount(this.filePath(fileKey)) > 0) continue;
-          await this.fileSystem
-            .rm(this.filePath(fileKey), { force: true })
-            .catch((error: unknown) => {
-              logger.debug(
-                { name: this.opts.name, err: errorMessage(error) },
-                'disk cache orphan cleanup was deferred'
-              );
-            });
+          await this.scheduleUnindexedPathDelete(
+            fileKey,
+            'disk cache orphan cleanup was deferred'
+          );
         }
       }
       // The index may have shrunk; trim to budget.
@@ -526,15 +658,19 @@ export class DiskBackedCache<V> {
       return undefined;
     }
 
-    // No await between the logical index check and the reference increment.
+    const dataPath = this.filePath(fileKey);
+    // No await between the logical index check and both reference increments.
+    // This process-wide claim is the lease linearization point: a destructive
+    // mutation claimed before it makes this lookup fall through without stats;
+    // a lease claimed first keeps the immutable path alive through release.
+    if (!tryAcquireProcessPathLease(dataPath)) return undefined;
     const state = existingState ?? { leases: 0, pendingDelete: false };
     state.leases++;
     this.fileLeases.set(fileKey, state);
-    addActiveFileLease(this.filePath(fileKey));
 
     let serializedBytes: number;
     try {
-      const stats = await this.fileSystem.lstat(this.filePath(fileKey));
+      const stats = await this.fileSystem.lstat(dataPath);
       if (!stats.isFile() || !Number.isSafeInteger(stats.size)) {
         await this.releaseFileLease(fileKey, state);
         this.dropDisk(fileKey);
@@ -588,7 +724,7 @@ export class DiskBackedCache<V> {
     let released = false;
     let releasePromise: Promise<void> | undefined;
     return {
-      path: this.filePath(fileKey),
+      path: dataPath,
       serializedBytes,
       confirmHit: () => {
         if (outcome) return;
@@ -619,24 +755,45 @@ export class DiskBackedCache<V> {
       this.hits++;
       return hot;
     }
+    // Capture before the first async disk operation. Clear increments this
+    // token synchronously; close is covered by isCurrentGeneration().
+    const generation = this.generation;
     const lease = await this.acquireDiskFile(key);
     if (!lease) return undefined;
-    let buf: Buffer;
     try {
-      buf = await this.fileSystem.readFile(lease.path);
-    } catch (error) {
-      if (nodeErrorCode(error) === 'ENOENT') lease.invalidateAsMiss();
-      await lease.release();
-      return undefined;
-    }
-    try {
-      const value = this.opts.deserialize(buf);
-      this.addToMem(key, value, this.opts.sizeOf(value));
+      if (!this.isCurrentGeneration(generation)) return undefined;
+      let buf: Buffer;
+      try {
+        buf = await this.fileSystem.readFile(lease.path);
+      } catch (error) {
+        if (
+          this.isCurrentGeneration(generation) &&
+          nodeErrorCode(error) === 'ENOENT'
+        ) {
+          lease.invalidateAsMiss();
+        }
+        return undefined;
+      }
+      if (!this.isCurrentGeneration(generation)) return undefined;
+      let value: V;
+      let decodedSize: number;
+      try {
+        value = this.opts.deserialize(buf);
+        if (!this.isCurrentGeneration(generation)) return undefined;
+        decodedSize = this.opts.sizeOf(value);
+      } catch {
+        if (this.isCurrentGeneration(generation)) lease.invalidateAsMiss();
+        return undefined;
+      }
+      // Deserialization may be caller-supplied code. Re-check immediately
+      // before every publish action so an older lookup can never cross clear
+      // or close and repopulate L1 / finalize a hit in the new lifecycle.
+      if (!this.isCurrentGeneration(generation)) return undefined;
+      this.addToMem(key, value, decodedSize);
+      if (!this.isCurrentGeneration(generation)) return undefined;
       lease.confirmHit();
+      if (!this.isCurrentGeneration(generation)) return undefined;
       return value;
-    } catch {
-      lease.invalidateAsMiss();
-      return undefined;
     } finally {
       await lease.release();
     }
@@ -711,8 +868,7 @@ export class DiskBackedCache<V> {
     if (
       this.pendingWrites.has(fileKey) ||
       this.pendingWrites.size >= DiskBackedCache.MAX_PENDING_WRITES ||
-      this.fileLeases.has(fileKey) ||
-      activeFileLeaseCount(this.filePath(fileKey)) > 0
+      this.fileLeases.has(fileKey)
     ) {
       return;
     }
@@ -755,12 +911,20 @@ export class DiskBackedCache<V> {
           mode: 0o600,
         });
         if (!this.isCurrentMutationGeneration(generation)) return;
-        await this.replaceBackgroundFile(tempPath, this.filePath(fileKey));
-        if (!this.isCurrentMutationGeneration(generation)) {
-          await this.discardStaleDestination(fileKey);
-          return;
+        const destination = this.filePath(fileKey);
+        const mutation = tryClaimProcessPathMutation(destination);
+        if (!mutation) return;
+        try {
+          if (!this.isCurrentMutationGeneration(generation)) return;
+          await this.replaceBackgroundFile(tempPath, destination);
+          if (!this.isCurrentMutationGeneration(generation)) {
+            await this.fileSystem.rm(destination, { force: true });
+            return;
+          }
+          this.commitDiskEntry(fileKey, serializedBytes);
+        } finally {
+          await mutation.release();
         }
-        this.commitDiskEntry(fileKey, serializedBytes);
       } catch (err) {
         logger.debug(
           { name: this.opts.name, err: errorMessage(err) },
@@ -970,33 +1134,57 @@ export class DiskBackedCache<V> {
       this.pendingWrites.size >= DiskBackedCache.MAX_PENDING_WRITES ||
       this.pendingWriteBytes + serializedBytes >
         DiskBackedCache.MAX_PENDING_WRITE_BYTES ||
-      this.fileLeases.has(fileKey) ||
-      activeFileLeaseCount(this.filePath(fileKey)) > 0
+      this.fileLeases.has(fileKey)
     ) {
       return false;
     }
 
+    const destination = this.filePath(fileKey);
+    const mutation = tryClaimProcessPathMutation(destination);
+    if (!mutation) return false;
     this.pendingWriteBytes += serializedBytes;
     let install: Promise<void>;
     const run = async (): Promise<void> => {
+      let operationFailed = false;
+      let operationError: unknown;
       try {
         await this.movePreparedFile(
           preparedPath,
-          this.filePath(fileKey),
+          destination,
           serializedBytes,
           fileKey
         );
         if (!this.isCurrentGeneration(generation)) {
-          await this.discardStaleDestination(fileKey);
+          await this.fileSystem.rm(destination, { force: true });
           return;
         }
         this.commitDiskEntry(fileKey, serializedBytes);
+      } catch (error) {
+        operationFailed = true;
+        operationError = error;
+        throw error;
       } finally {
-        this.releasePendingWriteBytes(serializedBytes);
-        if (this.pendingWrites.get(fileKey) === install) {
-          this.pendingWrites.delete(fileKey);
+        let releaseError: unknown;
+        try {
+          await mutation.release();
+        } catch (error) {
+          releaseError = error;
+        } finally {
+          this.releasePendingWriteBytes(serializedBytes);
+          if (this.pendingWrites.get(fileKey) === install) {
+            this.pendingWrites.delete(fileKey);
+          }
+          this.evictDisk();
         }
-        this.evictDisk();
+        if (releaseError) {
+          if (operationFailed) {
+            throw new AggregateError(
+              [operationError, releaseError],
+              'Prepared disk cache install cleanup failed'
+            );
+          }
+          throw releaseError;
+        }
       }
     };
     install = run();
@@ -1067,11 +1255,7 @@ export class DiskBackedCache<V> {
     destination: string,
     fileKey: string
   ): Promise<void> {
-    if (
-      this.disk.has(fileKey) ||
-      this.fileLeases.has(fileKey) ||
-      activeFileLeaseCount(destination) > 0
-    ) {
+    if (this.disk.has(fileKey) || this.fileLeases.has(fileKey)) {
       throw new DiskBackedCacheError(
         'DISK_CACHE_PREPARED_INVALID',
         'Prepared cache destination is still owned'
@@ -1085,11 +1269,7 @@ export class DiskBackedCache<V> {
           'Prepared cache destination is not a safe regular file'
         );
       }
-      if (
-        this.disk.has(fileKey) ||
-        this.fileLeases.has(fileKey) ||
-        activeFileLeaseCount(destination) > 0
-      ) {
+      if (this.disk.has(fileKey) || this.fileLeases.has(fileKey)) {
         throw new DiskBackedCacheError(
           'DISK_CACHE_PREPARED_INVALID',
           'Prepared cache destination became owned'
@@ -1174,7 +1354,7 @@ export class DiskBackedCache<V> {
     }
   }
 
-  private releaseFileLease(
+  private async releaseFileLease(
     fileKey: string,
     state: FileLeaseState
   ): Promise<void> {
@@ -1183,12 +1363,43 @@ export class DiskBackedCache<V> {
       return state.deletePromise ?? Promise.resolve();
     }
     state.leases--;
-    removeActiveFileLease(this.filePath(fileKey));
-    if (state.leases === 0) {
-      if (state.pendingDelete) return this.startPhysicalDelete(fileKey, state);
-      this.fileLeases.delete(fileKey);
+    let processRelease: ProcessPathLeaseRelease | undefined;
+    let processReleaseError: unknown;
+    try {
+      processRelease = releaseProcessPathLease(this.filePath(fileKey));
+      await processRelease.completion;
+    } catch (error) {
+      processReleaseError = error;
     }
-    return Promise.resolve();
+    let localCleanupError: unknown;
+    if (state.leases === 0) {
+      if (state.pendingDelete) {
+        if (processRelease?.deletionStarted) {
+          // A process-shared delete won the final-release wakeup. Do not issue
+          // a duplicate rm. On success it satisfies this local logical delete;
+          // on failure retain our retryable state for a later flush/close.
+          if (!processReleaseError && this.fileLeases.get(fileKey) === state) {
+            this.fileLeases.delete(fileKey);
+          }
+        } else if (!processReleaseError) {
+          try {
+            await this.startPhysicalDelete(fileKey, state);
+          } catch (error) {
+            localCleanupError = error;
+          }
+        }
+      } else if (this.fileLeases.get(fileKey) === state) {
+        this.fileLeases.delete(fileKey);
+      }
+    }
+    if (processReleaseError && localCleanupError) {
+      throw new AggregateError(
+        [processReleaseError, localCleanupError],
+        'Disk cache file lease cleanup failed'
+      );
+    }
+    if (processReleaseError) throw processReleaseError;
+    if (localCleanupError) throw localCleanupError;
   }
 
   private startPhysicalDelete(
@@ -1196,55 +1407,95 @@ export class DiskBackedCache<V> {
     state: FileLeaseState
   ): Promise<void> {
     if (state.deletePromise) return state.deletePromise;
-    if (activeFileLeaseCount(this.filePath(fileKey)) > 0) {
-      // Another live cache generation/instance still owns the immutable path.
-      // Keep pendingDelete retryable; a later flush/install may retry safely.
+    if (state.processDeleteRequest) return Promise.resolve();
+    const dataPath = this.filePath(fileKey);
+    let deletion: Promise<void> | undefined;
+    const request: ProcessPathDeleteRequest = {
+      run: async () => {
+        let removed = false;
+        try {
+          await this.fileSystem.rm(dataPath, { force: true });
+          removed = true;
+        } catch (error) {
+          logger.debug(
+            { name: this.opts.name, err: errorMessage(error) },
+            'disk cache deferred delete failed'
+          );
+          if (nodeErrorCode(error) === 'ENOENT') {
+            removed = true;
+          } else {
+            throw error;
+          }
+        } finally {
+          state.deletePromise = undefined;
+          if (state.processDeleteRequest === request) {
+            state.processDeleteRequest = undefined;
+          }
+          if (
+            removed &&
+            this.fileLeases.get(fileKey) === state &&
+            state.leases === 0
+          ) {
+            this.fileLeases.delete(fileKey);
+          }
+          if (deletion) this.pendingDeletes.delete(deletion);
+        }
+      },
+      onStart: (operation) => {
+        deletion = operation;
+        state.deletePromise = operation;
+        this.pendingDeletes.add(operation);
+        // File-lease callers still observe the original rejection. This
+        // additional observer prevents a deferred cleanup started by a caller
+        // that intentionally ignores release() from becoming unhandled.
+        void operation.catch(() => undefined);
+      },
+    };
+    state.processDeleteRequest = request;
+    const disposition = requestProcessPathDelete(dataPath, request);
+    if (disposition.status === 'existing') {
+      state.processDeleteRequest = undefined;
+      // Exactly one process-local request owns physical deletion. This local
+      // zero-lease bookkeeping may be discarded; the registered owner retains
+      // retry state if its attempt fails.
+      if (this.fileLeases.get(fileKey) === state && state.leases === 0) {
+        this.fileLeases.delete(fileKey);
+      }
       return Promise.resolve();
     }
-    let deletion: Promise<void>;
-    const run = async (): Promise<void> => {
-      let removed = false;
-      try {
-        await this.fileSystem.rm(this.filePath(fileKey), { force: true });
-        removed = true;
-      } catch (error) {
-        logger.debug(
-          { name: this.opts.name, err: errorMessage(error) },
-          'disk cache deferred delete failed'
-        );
-        if (nodeErrorCode(error) === 'ENOENT') {
-          removed = true;
-        } else {
-          throw error;
-        }
-      } finally {
-        state.deletePromise = undefined;
-        if (
-          removed &&
-          this.fileLeases.get(fileKey) === state &&
-          state.leases === 0
-        ) {
-          this.fileLeases.delete(fileKey);
-        }
-        this.pendingDeletes.delete(deletion);
-      }
-    };
-    deletion = run();
-    state.deletePromise = deletion;
-    this.pendingDeletes.add(deletion);
-    return deletion;
+    return disposition.status === 'started'
+      ? disposition.operation
+      : Promise.resolve();
   }
 
-  private async discardStaleDestination(fileKey: string): Promise<void> {
-    if (this.disk.has(fileKey)) {
-      this.dropDisk(fileKey);
-      const state = this.fileLeases.get(fileKey);
-      if (state?.deletePromise) await state.deletePromise;
-      return;
-    }
-    await this.fileSystem
-      .rm(this.filePath(fileKey), { force: true })
-      .catch(() => undefined);
+  private scheduleUnindexedPathDelete(
+    fileKey: string,
+    logMessage: string
+  ): Promise<void> {
+    const dataPath = this.filePath(fileKey);
+    const reportFailure = (error: unknown): void => {
+      logger.debug(
+        { name: this.opts.name, err: errorMessage(error) },
+        logMessage
+      );
+    };
+    let handledOperation: Promise<void> | undefined;
+    const request: ProcessPathDeleteRequest = {
+      run: async () => {
+        try {
+          await this.fileSystem.rm(dataPath, { force: true });
+        } catch (error) {
+          if (nodeErrorCode(error) !== 'ENOENT') throw error;
+        }
+      },
+      onStart: (operation) => {
+        handledOperation = operation.catch(reportFailure);
+      },
+    };
+    const disposition = requestProcessPathDelete(dataPath, request);
+    return disposition.status === 'started'
+      ? (handledOperation ?? disposition.operation.catch(reportFailure))
+      : Promise.resolve();
   }
 
   private isCurrentGeneration(generation: number): boolean {
