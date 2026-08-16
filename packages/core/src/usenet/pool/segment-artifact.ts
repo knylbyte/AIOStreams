@@ -1,5 +1,7 @@
 import { addAbortSignal, Readable } from 'node:stream';
+import { createReadStream } from 'node:fs';
 import { createLogger } from '../../logging/logger.js';
+import type { DiskFileLease } from '../../utils/disk-backed-cache.js';
 import type { DecodedSegmentMetadata } from './streaming-yenc-article-decoder.js';
 import type { SharedSegment } from './segment-arena.js';
 import type { GrowingSpoolArtifact } from '../spool/growing-artifact.js';
@@ -86,10 +88,21 @@ export interface SegmentArtifact {
  * the decoded body in a Buffer.
  */
 export interface SegmentArtifactCacheLookup {
+  /** Explicit false lets the producer skip even a transient promotion lease. */
+  readonly promotionEnabled?: boolean;
   acquire(
     messageId: string,
     signal?: AbortSignal
   ): Promise<SegmentArtifact | undefined>;
+  /**
+   * Best-effort promotion of one complete transient spool file. Implementations
+   * must bound concurrency and must not retain `sourcePath` after settlement.
+   */
+  promote?(
+    messageId: string,
+    metadata: DecodedSegmentMetadata,
+    sourcePath: string
+  ): Promise<boolean>;
 }
 
 interface ValidatedReadRange {
@@ -229,6 +242,98 @@ export class ArenaSegmentArtifact implements SegmentArtifact {
     this.releaseDone?.();
     this.releaseDone = undefined;
     this.releasePromise ??= Promise.resolve();
+  }
+}
+
+class EmptyRangeReadable extends Readable {
+  override _read(): void {
+    this.push(null);
+  }
+}
+
+/**
+ * One-reader view over only the body range of a persistent serialized cache
+ * entry. The generic file lease keeps physical eviction deferred until the
+ * reader closes; neither construction nor range reads materialize the body.
+ */
+export class DiskSegmentArtifact implements SegmentArtifact {
+  readonly storage = 'disk-cache' as const;
+
+  private reader: Readable | undefined;
+  private readerClosed = false;
+  private released = false;
+  private releasePromise: Promise<void> | undefined;
+  private fileReleasePromise: Promise<void> | undefined;
+
+  constructor(
+    private readonly fileLease: DiskFileLease,
+    readonly metadata: DecodedSegmentMetadata,
+    private readonly bodyOffset: number,
+    readonly length: number
+  ) {
+    if (
+      !Number.isSafeInteger(bodyOffset) ||
+      bodyOffset < 0 ||
+      !Number.isSafeInteger(length) ||
+      length < 0 ||
+      bodyOffset + length !== fileLease.serializedBytes
+    ) {
+      throw new RangeError('Disk segment artifact body range is invalid');
+    }
+  }
+
+  createReadStream(options: SegmentArtifactReadOptions = {}): Readable {
+    if (this.released) {
+      throw new Error('Disk segment artifact has been released');
+    }
+    if (this.reader) {
+      throw new Error('Segment artifact handles support one reader');
+    }
+    const range = validateReadRange(this.length, options);
+    const rangeLength = range.endExclusive - range.start;
+    const reader =
+      rangeLength === 0
+        ? new EmptyRangeReadable({ highWaterMark: range.highWaterMark })
+        : createReadStream(this.fileLease.path, {
+            start: this.bodyOffset + range.start,
+            end: this.bodyOffset + range.endExclusive - 1,
+            highWaterMark: Math.min(
+              range.highWaterMark,
+              SEGMENT_STREAM_MAX_CHUNK_BYTES
+            ),
+          });
+    this.reader = reader;
+    reader.once('close', () => {
+      this.readerClosed = true;
+      this.released = true;
+      this.releasePromise ??= this.releaseFile();
+      void this.releasePromise.catch((error: unknown) => {
+        logger.warn({ err: error }, 'failed to release disk segment file');
+      });
+    });
+    if (options.signal) addAbortSignal(options.signal, reader);
+    return reader;
+  }
+
+  release(): Promise<void> {
+    if (this.releasePromise) return this.releasePromise;
+    this.released = true;
+    if (this.reader && !this.readerClosed) {
+      const done = Promise.withResolvers<void>();
+      this.releasePromise = done.promise;
+      this.reader.once('close', () => {
+        this.releaseFile().then(done.resolve, done.reject);
+      });
+      if (!this.reader.destroyed) this.reader.destroy();
+      return this.releasePromise;
+    }
+    this.releasePromise = this.releaseFile();
+    return this.releasePromise;
+  }
+
+  private releaseFile(): Promise<void> {
+    this.fileReleasePromise ??= this.fileLease.release();
+    return this.fileReleasePromise;
   }
 }
 

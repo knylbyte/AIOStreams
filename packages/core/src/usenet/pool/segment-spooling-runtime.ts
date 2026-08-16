@@ -43,8 +43,8 @@ function abortError(signal: AbortSignal): Error {
 
 /**
  * Engine-lifetime owners shared by every segment-spooling fetch. The optional
- * artifact cache is deliberately file-backed-only and remains unimplemented
- * until Block 8.
+ * artifact cache exposes persistent file leases and bounded best-effort
+ * promotion without materializing decoded bodies.
  */
 export class SegmentSpoolingRuntime {
   readonly plan: SegmentSpoolingPlan;

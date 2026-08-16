@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -10,9 +10,11 @@ import { SpoolManager } from '../spool/manager.js';
 import { SegmentArena, type SharedSegment } from './segment-arena.js';
 import {
   ArenaSegmentArtifact,
+  DiskSegmentArtifact,
   GrowingSpoolArtifactAdapter,
   ZeroSegmentArtifact,
 } from './segment-artifact.js';
+import type { DiskFileLease } from '../../utils/disk-backed-cache.js';
 
 const KIBIBYTE_BYTES = 1024;
 const MEBIBYTE_BYTES = KIBIBYTE_BYTES * KIBIBYTE_BYTES;
@@ -76,6 +78,45 @@ test('ArenaSegmentArtifact holds its pin through range reading and releases once
     '23456'
   );
   await artifact.release();
+  await artifact.release();
+  assert.equal(releases, 1);
+});
+
+test('DiskSegmentArtifact keeps its file lease through the actual reader close event', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-artifact-close-'));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const filePath = path.join(root, 'entry');
+  const body = Buffer.from('file-backed-body');
+  await writeFile(filePath, body);
+  let releases = 0;
+  const fileLease: DiskFileLease = {
+    path: filePath,
+    serializedBytes: body.length,
+    release: () => {
+      releases++;
+      return Promise.resolve();
+    },
+  };
+  const artifact = new DiskSegmentArtifact(
+    fileLease,
+    { size: body.length },
+    0,
+    body.length
+  );
+  const ended = Promise.withResolvers<void>();
+  let releasePromise: Promise<void> | undefined;
+  const reader = artifact.createReadStream();
+  const closed = once(reader, 'close');
+  reader.once('end', () => {
+    releasePromise = artifact.release();
+    assert.equal(releases, 0);
+    ended.resolve();
+  });
+  reader.resume();
+  await ended.promise;
+  assert(releasePromise);
+  await closed;
+  await releasePromise;
   await artifact.release();
   assert.equal(releases, 1);
 });

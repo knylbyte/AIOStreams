@@ -1,9 +1,40 @@
-import { createHash } from 'crypto';
-import { promises as fs } from 'fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { createReadStream, createWriteStream, promises as fs } from 'node:fs';
 import path from 'path';
+import { pipeline } from 'node:stream/promises';
 import { createLogger } from '../logging/logger.js';
 
 const logger = createLogger('disk-cache');
+
+function nodeErrorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null || !('code' in error)) {
+    return undefined;
+  }
+  return typeof error.code === 'string' ? error.code : undefined;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function parseDiskIndex(raw: string): Array<[string, DiskEntry]> {
+  const parsed: unknown = JSON.parse(raw);
+  if (!isRecord(parsed)) return [];
+  const entries: Array<[string, DiskEntry]> = [];
+  for (const [fileKey, value] of Object.entries(parsed)) {
+    if (!/^[a-f0-9]{40}$/.test(fileKey) || !isRecord(value)) continue;
+    const size = value.size;
+    if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) {
+      continue;
+    }
+    entries.push([fileKey, { size }]);
+  }
+  return entries;
+}
 
 /**
  * Codecs + budgets for a {@link DiskBackedCache}. Value-generic: the caller
@@ -35,6 +66,31 @@ export interface DiskBackedCacheOptions<V> {
   serializeInto?: (value: V, dst: Buffer) => number;
   /** Exact serialized byte length of `value`. Required iff {@link serializeInto} is set. */
   serializedSize?: (value: V) => number;
+  /** Testable cross-device seam; production defaults to `fs.rename`. */
+  renameFile?: (source: string, destination: string) => Promise<void>;
+}
+
+/**
+ * A counted reference to one immutable serialized cache file.
+ *
+ * Logical LRU eviction removes the entry from cache accounting immediately,
+ * while physical deletion is deferred until the final lease is released. This
+ * keeps open readers valid on Windows as well as POSIX. Release is idempotent.
+ */
+export interface DiskFileLease {
+  readonly path: string;
+  readonly serializedBytes: number;
+  release(): Promise<void>;
+}
+
+/**
+ * A bounded, cache-owned staging file for {@link installPreparedFile}.
+ * Callers write a serialized entry to {@link path}; install or release then
+ * consumes the handle exactly once.
+ */
+export interface DiskPreparedFile {
+  readonly path: string;
+  release(): Promise<void>;
 }
 
 interface MemEntry<V> {
@@ -44,6 +100,19 @@ interface MemEntry<V> {
 
 interface DiskEntry {
   size: number;
+}
+
+interface FileLeaseState {
+  leases: number;
+  pendingDelete: boolean;
+  deletePromise?: Promise<void>;
+}
+
+interface PreparedFileState {
+  readonly path: string;
+  status: 'active' | 'installing' | 'released';
+  operation?: Promise<unknown>;
+  releasePromise?: Promise<void>;
 }
 
 export interface DiskBackedCacheStats {
@@ -63,7 +132,16 @@ export interface DiskBackedCacheStats {
  * surface them alongside the Redis/SQL/memory caches. Instances register on
  * construction and unregister on {@link DiskBackedCache.close}.
  */
-const diskCacheRegistry = new Set<DiskBackedCache<unknown>>();
+interface RegisteredDiskCache {
+  readonly name: string;
+  readonly maxMemBytes: number;
+  readonly maxDiskBytes: number;
+  stats(): DiskBackedCacheStats;
+  clear(): Promise<void>;
+  flush(): Promise<void>;
+}
+
+const diskCacheRegistry = new Set<RegisteredDiskCache>();
 
 /** Snapshot every live disk-backed cache for the dashboard cache page. */
 export function describeDiskCaches(): {
@@ -108,6 +186,10 @@ export async function flushAllDiskCaches(): Promise<void> {
  * persists to disk in the background, so the hot path never awaits disk I/O.
  */
 export class DiskBackedCache<V> {
+  private static readonly MAX_PENDING_WRITES = 64;
+  private static readonly MAX_PENDING_WRITE_BYTES = 128 * 1024 * 1024;
+  private static readonly COPY_CHUNK_BYTES = 64 * 1024;
+
   private mem = new Map<string, MemEntry<V>>();
   private memBytes = 0;
   /** L2 index, insertion-order = LRU order (re-inserted on access). */
@@ -133,13 +215,27 @@ export class DiskBackedCache<V> {
   private flushTimer?: NodeJS.Timeout;
   private ready: Promise<void>;
   private closed = false;
+  /** File ownership states remain only while leased or awaiting deletion. */
+  private readonly fileLeases = new Map<string, FileLeaseState>();
+  /** Physical deletes currently running; bounded by the disk index/lease set. */
+  private readonly pendingDeletes = new Set<Promise<void>>();
+  /** Staging handles are bounded by the same admission cap as writes. */
+  private readonly preparedFiles = new Map<
+    DiskPreparedFile,
+    PreparedFileState
+  >();
+  private readonly renameFile: (
+    source: string,
+    destination: string
+  ) => Promise<void>;
 
   constructor(opts: DiskBackedCacheOptions<V>) {
     this.opts = opts;
     this.dir = path.join(opts.dir, opts.name);
     this.indexPath = path.join(opts.dir, `${opts.name}.index.json`);
+    this.renameFile = opts.renameFile ?? fs.rename;
     this.ready = this.load();
-    diskCacheRegistry.add(this as DiskBackedCache<unknown>);
+    diskCacheRegistry.add(this);
   }
 
   /** Namespace of this cache (drives the on-disk subdirectory + index file). */
@@ -182,17 +278,23 @@ export class DiskBackedCache<V> {
       let entries: Array<[string, DiskEntry]> = [];
       try {
         const raw = await fs.readFile(this.indexPath, 'utf8');
-        const parsed = JSON.parse(raw) as Record<string, DiskEntry>;
-        entries = Object.entries(parsed);
+        entries = parseDiskIndex(raw);
       } catch {
         // No index yet — first run or it was removed.
       }
-      // Index → drop entries whose file is missing.
+      // Index → keep only safe regular files and reconcile legacy index sizes
+      // against their actual serialized byte length.
       const present = new Set(await fs.readdir(this.dir).catch(() => []));
       for (const [fileKey, entry] of entries) {
-        if (present.has(fileKey) && typeof entry?.size === 'number') {
-          this.disk.set(fileKey, entry);
-          this.diskBytes += entry.size;
+        if (!present.has(fileKey) || typeof entry?.size !== 'number') continue;
+        try {
+          const stats = await fs.lstat(this.filePath(fileKey));
+          if (!stats.isFile() || !Number.isSafeInteger(stats.size)) continue;
+          this.disk.set(fileKey, { size: stats.size });
+          this.diskBytes += stats.size;
+          if (entry.size !== stats.size) this.indexDirty = true;
+        } catch {
+          // Missing or unsafe entries are omitted from the reconciled index.
         }
       }
       // Files → delete any not referenced by the index (StremThru cleanOrphaned).
@@ -203,6 +305,7 @@ export class DiskBackedCache<V> {
       }
       // The index may have shrunk; trim to budget.
       this.evictDisk();
+      if (this.indexDirty) this.scheduleIndexFlush();
       logger.debug(
         {
           name: this.opts.name,
@@ -213,7 +316,7 @@ export class DiskBackedCache<V> {
       );
     } catch (err) {
       logger.warn(
-        { name: this.opts.name, err: (err as Error).message },
+        { name: this.opts.name, err: errorMessage(err) },
         'disk cache load failed; continuing memory-only'
       );
     }
@@ -239,6 +342,85 @@ export class DiskBackedCache<V> {
     return entry.value;
   }
 
+  /**
+   * Acquire an immutable file-backed L2 hit without reading its payload.
+   * Acquisition touches LRU recency and increments hit counters. Logical
+   * eviction may proceed while leased, but physical unlink waits for release.
+   */
+  async acquireDiskFile(key: string): Promise<DiskFileLease | undefined> {
+    if (!this.diskEnabled() || this.closed) {
+      this.misses++;
+      return undefined;
+    }
+    await this.ready.catch(() => undefined);
+    const fileKey = this.fileKey(key);
+    const pending = this.pendingWrites.get(fileKey);
+    if (pending) await pending.catch(() => undefined);
+
+    const entry = this.disk.get(fileKey);
+    const existingState = this.fileLeases.get(fileKey);
+    if (!entry || existingState?.pendingDelete) {
+      this.misses++;
+      return undefined;
+    }
+
+    // No await between the logical index check and the reference increment.
+    const state = existingState ?? { leases: 0, pendingDelete: false };
+    state.leases++;
+    this.fileLeases.set(fileKey, state);
+
+    let serializedBytes: number;
+    try {
+      const stats = await fs.lstat(this.filePath(fileKey));
+      if (!stats.isFile() || !Number.isSafeInteger(stats.size)) {
+        throw new Error('Disk cache entry is not a safe regular file');
+      }
+      serializedBytes = stats.size;
+    } catch {
+      await this.releaseFileLease(fileKey, state);
+      this.dropDisk(fileKey);
+      this.misses++;
+      return undefined;
+    }
+
+    const current = this.disk.get(fileKey);
+    if (!current || state.pendingDelete) {
+      await this.releaseFileLease(fileKey, state);
+      this.misses++;
+      return undefined;
+    }
+    if (current.size !== serializedBytes) {
+      this.diskBytes += serializedBytes - current.size;
+      this.assertDiskAccounting();
+    }
+    this.disk.delete(fileKey);
+    this.disk.set(fileKey, { size: serializedBytes });
+    this.indexDirty = true;
+    this.evictDisk();
+    this.scheduleIndexFlush();
+    if (!this.disk.has(fileKey)) {
+      await this.releaseFileLease(fileKey, state);
+      this.misses++;
+      return undefined;
+    }
+
+    this.hits++;
+    this.diskHits++;
+    let released = false;
+    let releasePromise: Promise<void> | undefined;
+    return {
+      path: this.filePath(fileKey),
+      serializedBytes,
+      release: () => {
+        if (releasePromise) return releasePromise;
+        if (released) return Promise.resolve();
+        released = true;
+        releasePromise = this.releaseFileLease(fileKey, state);
+        return releasePromise;
+      },
+    };
+  }
+
   /** L1 → L2 lookup; promotes disk hits back into memory. */
   async getAsync(key: string): Promise<V | undefined> {
     const hot = this.peek(key);
@@ -246,34 +428,23 @@ export class DiskBackedCache<V> {
       this.hits++;
       return hot;
     }
-    if (!this.diskEnabled()) {
-      this.misses++;
-      return undefined;
-    }
-    await this.ready.catch(() => {});
-    const fileKey = this.fileKey(key);
-    if (!this.disk.has(fileKey)) {
-      this.misses++;
-      return undefined;
-    }
-    // Ensure any in-flight write for this key has settled before reading.
-    const pending = this.pendingWrites.get(fileKey);
-    if (pending) await pending.catch(() => {});
+    const lease = await this.acquireDiskFile(key);
+    if (!lease) return undefined;
     try {
-      const buf = await fs.readFile(this.filePath(fileKey));
+      const buf = await fs.readFile(lease.path);
       const value = this.opts.deserialize(buf);
-      this.hits++;
-      this.diskHits++;
-      // Refresh disk recency + promote to L1.
-      this.disk.delete(fileKey);
-      this.disk.set(fileKey, { size: buf.length });
       this.addToMem(key, value, this.opts.sizeOf(value));
       return value;
     } catch {
-      // File vanished or is corrupt — drop the index entry.
-      this.dropDisk(fileKey);
+      // File vanished or is corrupt. Convert the provisional file hit into a
+      // miss, then logically evict; unlink waits for this lease to release.
+      this.hits--;
+      this.diskHits--;
       this.misses++;
+      await this.delete(key);
       return undefined;
+    } finally {
+      await lease.release();
     }
   }
 
@@ -311,22 +482,14 @@ export class DiskBackedCache<V> {
     this.mem.set(key, { value, size });
     this.memBytes += size;
     while (this.memBytes > this.opts.maxMemBytes && this.mem.size > 0) {
-      const oldest = this.mem.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
+      const oldestEntry = this.mem.keys().next();
+      if (oldestEntry.done) break;
+      const oldest = oldestEntry.value;
       const e = this.mem.get(oldest);
       this.mem.delete(oldest);
       if (e) this.memBytes -= e.size;
     }
   }
-
-  /**
-   * Backpressure caps for the background write queue. When a burst of inserts
-   * outruns the disk, further persists are *dropped* (the disk tier is
-   * best-effort) instead of queueing serialized payloads without bound — an
-   * import-sized burst previously held hundreds of MB in `pendingWrites`.
-   */
-  private static readonly MAX_PENDING_WRITES = 64;
-  private static readonly MAX_PENDING_WRITE_BYTES = 128 * 1024 * 1024;
 
   /**
    * Recycled write-buffer ring for the zero-alloc serialize path. Bounded by the
@@ -347,26 +510,16 @@ export class DiskBackedCache<V> {
     }
   }
 
-  /** Update the disk index synchronously; write the file in the background. */
-  private persistToDisk(key: string, value: V, size: number): void {
-    if (
-      this.pendingWrites.size >= DiskBackedCache.MAX_PENDING_WRITES ||
-      this.pendingWriteBytes >= DiskBackedCache.MAX_PENDING_WRITE_BYTES
-    ) {
-      return; // saturated — skip this persist rather than queue it
-    }
+  /** Serialize synchronously, then atomically persist in a bounded background slot. */
+  private persistToDisk(key: string, value: V, _decodedSize: number): void {
     const fileKey = this.fileKey(key);
-    const existing = this.disk.get(fileKey);
-    if (existing) {
-      this.diskBytes -= existing.size;
-      this.disk.delete(fileKey);
+    if (
+      this.pendingWrites.has(fileKey) ||
+      this.pendingWrites.size >= DiskBackedCache.MAX_PENDING_WRITES ||
+      this.fileLeases.has(fileKey)
+    ) {
+      return;
     }
-    this.disk.set(fileKey, { size });
-    this.diskBytes += size;
-    this.indexDirty = true;
-    this.evictDisk();
-    this.scheduleIndexFlush();
-
     // Zero-alloc path: serialize SYNCHRONOUSLY into a pooled slot (capturing a
     // transient/pooled `value` body before it can be reused), then write the
     // slot's bytes and recycle it. Falls back to the allocating `serialize` when
@@ -381,35 +534,273 @@ export class DiskBackedCache<V> {
     } else {
       payload = this.opts.serialize(value);
     }
+    const serializedBytes = payload.length;
+    if (
+      serializedBytes <= 0 ||
+      serializedBytes > this.opts.maxDiskBytes ||
+      this.pendingWriteBytes + serializedBytes >
+        DiskBackedCache.MAX_PENDING_WRITE_BYTES
+    ) {
+      if (slot) this.releaseWriteBuf(slot);
+      return;
+    }
 
+    this.pendingWriteBytes += serializedBytes;
+    const tempPath = path.join(this.dir, `.write-${randomUUID()}`);
     let write: Promise<void>;
-    this.pendingWriteBytes += size;
     const run = async (): Promise<void> => {
       try {
-        await fs.writeFile(this.filePath(fileKey), payload);
+        await this.ready.catch(() => undefined);
+        if (this.closed || !this.diskEnabled()) return;
+        await fs.mkdir(this.dir, { recursive: true });
+        await fs.writeFile(tempPath, payload, { flag: 'wx', mode: 0o600 });
+        await this.replaceFile(tempPath, this.filePath(fileKey));
+        this.commitDiskEntry(fileKey, serializedBytes);
       } catch (err) {
-        // Roll back the index entry on write failure.
-        this.dropDisk(fileKey);
         logger.debug(
-          { name: this.opts.name, err: (err as Error).message },
+          { name: this.opts.name, err: errorMessage(err) },
           'disk cache write failed'
         );
       } finally {
+        await fs.rm(tempPath, { force: true }).catch(() => undefined);
         if (slot) this.releaseWriteBuf(slot);
-        this.pendingWriteBytes -= size;
+        this.releasePendingWriteBytes(serializedBytes);
         if (this.pendingWrites.get(fileKey) === write) {
           this.pendingWrites.delete(fileKey);
         }
+        this.evictDisk();
       }
     };
     write = run();
     this.pendingWrites.set(fileKey, write);
   }
 
+  private commitDiskEntry(fileKey: string, serializedBytes: number): void {
+    const existing = this.disk.get(fileKey);
+    if (existing) this.diskBytes -= existing.size;
+    this.disk.delete(fileKey);
+    this.disk.set(fileKey, { size: serializedBytes });
+    this.diskBytes += serializedBytes;
+    this.assertDiskAccounting();
+    this.indexDirty = true;
+    this.evictDisk();
+    this.scheduleIndexFlush();
+  }
+
+  private async replaceFile(
+    source: string,
+    destination: string
+  ): Promise<void> {
+    try {
+      await fs.rename(source, destination);
+    } catch (error) {
+      const code = nodeErrorCode(error);
+      if (code !== 'EEXIST' && code !== 'EPERM') throw error;
+      await fs.rm(destination, { force: true });
+      await fs.rename(source, destination);
+    }
+  }
+
+  /**
+   * Create one secure, bounded staging file inside the cache namespace.
+   */
+  async createPreparedFile(): Promise<DiskPreparedFile> {
+    await this.ready.catch(() => undefined);
+    if (this.closed || !this.diskEnabled()) {
+      throw new Error('Disk cache is not accepting prepared files');
+    }
+    if (this.preparedFiles.size >= DiskBackedCache.MAX_PENDING_WRITES) {
+      throw new Error('Disk cache prepared-file limit reached');
+    }
+    await fs.mkdir(this.dir, { recursive: true });
+    const preparedPath = path.join(this.dir, `.prepared-${randomUUID()}`);
+    const handle = await fs.open(preparedPath, 'wx', 0o600);
+    try {
+      await handle.close();
+    } catch (error) {
+      await fs.rm(preparedPath, { force: true }).catch(() => undefined);
+      throw error;
+    }
+
+    const state: PreparedFileState = {
+      path: preparedPath,
+      status: 'active',
+    };
+    const prepared: DiskPreparedFile = {
+      path: preparedPath,
+      release: () => this.releasePreparedFile(prepared, state),
+    };
+    this.preparedFiles.set(prepared, state);
+    return prepared;
+  }
+
+  /**
+   * Atomically install a fully serialized prepared file under `key`.
+   * Existing immutable entries win and merely receive an LRU touch. The
+   * prepared handle is consumed on every outcome.
+   */
+  async installPreparedFile(
+    key: string,
+    prepared: DiskPreparedFile,
+    serializedBytes: number
+  ): Promise<boolean> {
+    if (!Number.isSafeInteger(serializedBytes) || serializedBytes <= 0) {
+      throw new RangeError(
+        'Prepared disk cache size must be a safe positive integer'
+      );
+    }
+    const state = this.preparedFiles.get(prepared);
+    if (!state || state.status !== 'active') {
+      throw new Error('Prepared disk cache file is not active');
+    }
+    state.status = 'installing';
+    const operation = this.installPreparedFileOnce(
+      key,
+      state.path,
+      serializedBytes
+    );
+    state.operation = operation;
+    try {
+      return await operation;
+    } finally {
+      state.status = 'released';
+      this.preparedFiles.delete(prepared);
+      await fs.rm(state.path, { force: true }).catch(() => undefined);
+    }
+  }
+
+  private async installPreparedFileOnce(
+    key: string,
+    preparedPath: string,
+    serializedBytes: number
+  ): Promise<boolean> {
+    await this.ready.catch(() => undefined);
+    if (
+      this.closed ||
+      !this.diskEnabled() ||
+      serializedBytes > this.opts.maxDiskBytes
+    ) {
+      return false;
+    }
+    const stats = await fs.lstat(preparedPath);
+    if (!stats.isFile() || stats.size !== serializedBytes) {
+      throw new Error('Prepared disk cache file size is invalid');
+    }
+
+    const fileKey = this.fileKey(key);
+    const previous = this.pendingWrites.get(fileKey);
+    if (previous) await previous.catch(() => undefined);
+    if (this.closed || !this.diskEnabled()) return false;
+    const existing = this.disk.get(fileKey);
+    if (existing) {
+      this.disk.delete(fileKey);
+      this.disk.set(fileKey, existing);
+      this.indexDirty = true;
+      this.scheduleIndexFlush();
+      return false;
+    }
+    if (
+      this.pendingWrites.has(fileKey) ||
+      this.pendingWrites.size >= DiskBackedCache.MAX_PENDING_WRITES ||
+      this.pendingWriteBytes + serializedBytes >
+        DiskBackedCache.MAX_PENDING_WRITE_BYTES ||
+      this.fileLeases.has(fileKey)
+    ) {
+      return false;
+    }
+
+    this.pendingWriteBytes += serializedBytes;
+    let install: Promise<void>;
+    const run = async (): Promise<void> => {
+      try {
+        await this.movePreparedFile(
+          preparedPath,
+          this.filePath(fileKey),
+          serializedBytes
+        );
+        this.commitDiskEntry(fileKey, serializedBytes);
+      } finally {
+        this.releasePendingWriteBytes(serializedBytes);
+        if (this.pendingWrites.get(fileKey) === install) {
+          this.pendingWrites.delete(fileKey);
+        }
+        this.evictDisk();
+      }
+    };
+    install = run();
+    this.pendingWrites.set(fileKey, install);
+    await install;
+    return this.disk.has(fileKey);
+  }
+
+  private async movePreparedFile(
+    source: string,
+    destination: string,
+    serializedBytes: number
+  ): Promise<void> {
+    try {
+      await this.renameFile(source, destination);
+      return;
+    } catch (error) {
+      if (nodeErrorCode(error) !== 'EXDEV') throw error;
+    }
+
+    const copyPath = path.join(this.dir, `.install-${randomUUID()}`);
+    try {
+      await pipeline(
+        createReadStream(source, {
+          highWaterMark: DiskBackedCache.COPY_CHUNK_BYTES,
+        }),
+        createWriteStream(copyPath, {
+          flags: 'wx',
+          mode: 0o600,
+          highWaterMark: DiskBackedCache.COPY_CHUNK_BYTES,
+        })
+      );
+      const copied = await fs.lstat(copyPath);
+      if (!copied.isFile() || copied.size !== serializedBytes) {
+        throw new Error('Cross-device prepared-file copy was incomplete');
+      }
+      await this.replaceFile(copyPath, destination);
+    } finally {
+      await Promise.allSettled([
+        fs.rm(copyPath, { force: true }),
+        fs.rm(source, { force: true }),
+      ]);
+    }
+  }
+
+  private releasePreparedFile(
+    prepared: DiskPreparedFile,
+    state: PreparedFileState
+  ): Promise<void> {
+    if (state.releasePromise) return state.releasePromise;
+    if (state.status === 'installing') {
+      state.releasePromise = Promise.resolve(state.operation).then(
+        () => undefined,
+        () => undefined
+      );
+      return state.releasePromise;
+    }
+    if (state.status === 'released') return Promise.resolve();
+    state.status = 'released';
+    this.preparedFiles.delete(prepared);
+    state.releasePromise = fs
+      .rm(state.path, { force: true })
+      .then(() => undefined);
+    return state.releasePromise;
+  }
+
   /** Evict least-recently-used disk entries until within budget. */
   private evictDisk(): void {
     while (this.diskBytes > this.opts.maxDiskBytes && this.disk.size > 0) {
-      const oldest = this.disk.keys().next().value as string | undefined;
+      let oldest: string | undefined;
+      for (const fileKey of this.disk.keys()) {
+        if (!this.pendingWrites.has(fileKey)) {
+          oldest = fileKey;
+          break;
+        }
+      }
       if (oldest === undefined) break;
       this.dropDisk(oldest);
     }
@@ -420,9 +811,72 @@ export class DiskBackedCache<V> {
     if (!entry) return;
     this.disk.delete(fileKey);
     this.diskBytes -= entry.size;
+    this.assertDiskAccounting();
     this.indexDirty = true;
     this.scheduleIndexFlush();
-    fs.rm(this.filePath(fileKey), { force: true }).catch(() => {});
+    const state = this.fileLeases.get(fileKey) ?? {
+      leases: 0,
+      pendingDelete: false,
+    };
+    state.pendingDelete = true;
+    this.fileLeases.set(fileKey, state);
+    if (state.leases === 0) this.startPhysicalDelete(fileKey, state);
+  }
+
+  private releaseFileLease(
+    fileKey: string,
+    state: FileLeaseState
+  ): Promise<void> {
+    if (state.leases <= 0) return state.deletePromise ?? Promise.resolve();
+    state.leases--;
+    if (state.leases === 0) {
+      if (state.pendingDelete) return this.startPhysicalDelete(fileKey, state);
+      this.fileLeases.delete(fileKey);
+    }
+    return Promise.resolve();
+  }
+
+  private startPhysicalDelete(
+    fileKey: string,
+    state: FileLeaseState
+  ): Promise<void> {
+    if (state.deletePromise) return state.deletePromise;
+    let deletion: Promise<void>;
+    const run = async (): Promise<void> => {
+      try {
+        await fs.rm(this.filePath(fileKey), { force: true });
+      } catch (error) {
+        logger.debug(
+          { name: this.opts.name, err: errorMessage(error) },
+          'disk cache deferred delete failed'
+        );
+      } finally {
+        if (this.fileLeases.get(fileKey) === state && state.leases === 0) {
+          this.fileLeases.delete(fileKey);
+        }
+        this.pendingDeletes.delete(deletion);
+      }
+    };
+    deletion = run();
+    state.deletePromise = deletion;
+    this.pendingDeletes.add(deletion);
+    return deletion;
+  }
+
+  private assertDiskAccounting(): void {
+    if (!Number.isSafeInteger(this.diskBytes) || this.diskBytes < 0) {
+      throw new Error('Disk cache byte accounting invariant violated');
+    }
+  }
+
+  private releasePendingWriteBytes(bytes: number): void {
+    this.pendingWriteBytes -= bytes;
+    if (
+      !Number.isSafeInteger(this.pendingWriteBytes) ||
+      this.pendingWriteBytes < 0
+    ) {
+      throw new Error('Disk cache pending-write accounting invariant violated');
+    }
   }
 
   stats(): DiskBackedCacheStats {
@@ -448,6 +902,8 @@ export class DiskBackedCache<V> {
       removed = true;
     }
     const fileKey = this.fileKey(key);
+    const pending = this.pendingWrites.get(fileKey);
+    if (pending) await pending.catch(() => undefined);
     if (this.disk.has(fileKey)) {
       this.dropDisk(fileKey);
       removed = true;
@@ -458,13 +914,13 @@ export class DiskBackedCache<V> {
   async clear(): Promise<void> {
     this.mem.clear();
     this.memBytes = 0;
-    this.disk.clear();
-    this.diskBytes = 0;
-    this.indexDirty = true;
+    await this.ready.catch(() => undefined);
+    await Promise.allSettled([...this.pendingWrites.values()]);
+    for (const fileKey of [...this.disk.keys()]) this.dropDisk(fileKey);
+    await Promise.allSettled([...this.pendingDeletes]);
     if (this.diskEnabled()) {
-      await fs.rm(this.dir, { recursive: true, force: true }).catch(() => {});
-      await fs.mkdir(this.dir, { recursive: true }).catch(() => {});
       await fs.rm(this.indexPath, { force: true }).catch(() => {});
+      this.indexDirty = false;
     }
   }
 
@@ -473,8 +929,9 @@ export class DiskBackedCache<V> {
     this.opts.maxMemBytes = maxMemBytes;
     if (maxDiskBytes !== undefined) this.opts.maxDiskBytes = maxDiskBytes;
     while (this.memBytes > this.opts.maxMemBytes && this.mem.size > 0) {
-      const oldest = this.mem.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
+      const oldestEntry = this.mem.keys().next();
+      if (oldestEntry.done) break;
+      const oldest = oldestEntry.value;
       const e = this.mem.get(oldest);
       this.mem.delete(oldest);
       if (e) this.memBytes -= e.size;
@@ -513,7 +970,7 @@ export class DiskBackedCache<V> {
       } catch (err) {
         this.indexDirty = true;
         logger.debug(
-          { name: this.opts.name, err: (err as Error).message },
+          { name: this.opts.name, err: errorMessage(err) },
           'disk cache index flush failed'
         );
       }
@@ -527,6 +984,7 @@ export class DiskBackedCache<V> {
   async flush(): Promise<void> {
     await this.ready.catch(() => {});
     await Promise.allSettled([...this.pendingWrites.values()]);
+    await Promise.allSettled([...this.pendingDeletes]);
     await this.flushIndex();
   }
 
@@ -537,7 +995,12 @@ export class DiskBackedCache<V> {
       clearTimeout(this.flushTimer);
       this.flushTimer = undefined;
     }
-    diskCacheRegistry.delete(this as DiskBackedCache<unknown>);
+    diskCacheRegistry.delete(this);
+    await Promise.allSettled(
+      [...this.preparedFiles].map(([prepared, state]) =>
+        this.releasePreparedFile(prepared, state)
+      )
+    );
     await this.flush();
   }
 }

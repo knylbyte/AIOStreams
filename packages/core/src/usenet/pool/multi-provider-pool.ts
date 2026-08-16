@@ -193,6 +193,7 @@ class SharedSpoolArtifactOwner {
   private readonly producerCompletion =
     Promise.withResolvers<DecodedSegmentMetadata>();
   private producerSettled = false;
+  private promotionActive = false;
 
   constructor(
     private readonly artifact: GrowingSpoolArtifact,
@@ -267,10 +268,28 @@ class SharedSpoolArtifactOwner {
     this.producerCompletion.reject(error);
   }
 
+  /**
+   * A promotion lease keeps the spool file alive independently. Final reader
+   * release may therefore initiate disposal without awaiting the best-effort
+   * cache copy; GrowingSpoolArtifact performs the physical delete afterwards.
+   */
+  trackPromotion(promotion: Promise<unknown>): void {
+    this.promotionActive = true;
+    void promotion
+      .finally(() => {
+        this.promotionActive = false;
+      })
+      .catch(() => undefined);
+  }
+
   disposeIfUnused(): Promise<void> {
-    return !this.producerActive && this.references === 0
-      ? this.dispose()
-      : Promise.resolve();
+    if (this.producerActive || this.references !== 0) return Promise.resolve();
+    const disposal = this.dispose();
+    if (!this.promotionActive) return disposal;
+    void disposal.catch((error: unknown) => {
+      logger.warn({ err: error }, 'deferred spool artifact disposal failed');
+    });
+    return Promise.resolve();
   }
 
   private dispose(): Promise<void> {
@@ -908,6 +927,13 @@ export class MultiProviderPool {
         owner = new SharedSpoolArtifactOwner(result.value, result.metadata);
         flight.growingOwner = owner;
       }
+      this.startArtifactPromotion(
+        runtime,
+        id,
+        result.value,
+        result.metadata,
+        owner
+      );
       unownedArtifact = undefined;
       if (this.artifactInflight.get(id) === flight) {
         this.artifactInflight.delete(id);
@@ -976,6 +1002,45 @@ export class MultiProviderPool {
       releaseGlobal?.();
       memoryLease?.release();
     }
+  }
+
+  private startArtifactPromotion(
+    runtime: SegmentSpoolingRuntime,
+    messageId: string,
+    artifact: GrowingSpoolArtifact,
+    metadata: DecodedSegmentMetadata,
+    owner: SharedSpoolArtifactOwner
+  ): void {
+    if (runtime.artifactCache?.promotionEnabled === false) return;
+    const promote = runtime.artifactCache?.promote;
+    if (!promote) return;
+    let source: ReturnType<GrowingSpoolArtifact['acquirePromotion']>;
+    try {
+      source = artifact.acquirePromotion();
+    } catch (error) {
+      logger.debug({ err: error }, 'segment cache promotion was skipped');
+      return;
+    }
+    let promotion: Promise<boolean>;
+    try {
+      promotion = promote.call(
+        runtime.artifactCache,
+        messageId,
+        metadata,
+        source.path
+      );
+    } catch (error) {
+      source.release();
+      logger.debug({ err: error }, 'segment cache promotion failed to start');
+      return;
+    }
+    const protectedPromotion = promotion
+      .catch((error: unknown) => {
+        logger.debug({ err: error }, 'segment cache promotion failed');
+        return false;
+      })
+      .finally(() => source.release());
+    owner.trackPromotion(protectedPromotion);
   }
 
   /** Reserve one complete bounded output-stream memory window. */

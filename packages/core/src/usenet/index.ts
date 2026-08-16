@@ -250,6 +250,7 @@ export class UsenetEngine {
           plan: this.resourcePlan.segmentSpooling,
           engineId: this.fingerprint,
           cacheRoot: getCacheFolder(),
+          artifactCache: this.cache,
         })
       : undefined;
     this.pool = new MultiProviderPool(

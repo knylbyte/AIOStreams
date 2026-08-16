@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { getEventListeners } from 'node:events';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
@@ -1718,4 +1718,144 @@ test('arena artifacts and all existing buffering APIs remain on their original p
   assert.deepEqual(buffered.body, Buffer.from('buffered-result'));
   assert.equal(fetcher.streamingCalls, 0);
   assert.equal(fetcher.bufferingCalls, 1);
+});
+
+test(
+  'best-effort promotion protects the spool file without blocking final playback release',
+  { timeout: 5_000 },
+  async (context) => {
+    const fetcher = new FakeSegmentFetcher();
+    const body = Buffer.from('promotion-does-not-block-playback');
+    fetcher.behaviors.set('promoted-artifact', { body });
+    const started = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    const copied = Promise.withResolvers<void>();
+    const artifactCache: SegmentArtifactCacheLookup = {
+      promotionEnabled: true,
+      acquire: () => Promise.resolve(undefined),
+      promote: async (_messageId, metadata, sourcePath) => {
+        assert.equal(metadata.size, body.length);
+        started.resolve();
+        await gate.promise;
+        assert.deepEqual(await readFile(sourcePath), body);
+        copied.resolve();
+        return true;
+      },
+    };
+    const { pool, runtime } = await createHarness(context, fetcher, {
+      artifactCache,
+    });
+    const artifact = await pool.fetchSegmentArtifact(
+      { messageId: 'promoted-artifact', bytes: body.length },
+      'nzb',
+      undefined
+    );
+    await started.promise;
+    assert.deepEqual(await readArtifact(artifact), body);
+    assert.equal(runtime.spoolManager.stats().artifacts, 1);
+
+    gate.resolve();
+    await copied.promise;
+    await runtime.close();
+    assert.equal(runtime.spoolManager.stats().artifacts, 0);
+    assert.equal(runtime.spoolManager.stats().budget.reservedBytes, 0);
+    assert.equal(runtime.spoolManager.stats().files.openFiles, 0);
+  }
+);
+
+test('promotion failure never changes artifact delivery or leaks spool ownership', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const body = Buffer.from('promotion-failure-is-best-effort');
+  fetcher.behaviors.set('promotion-failure', { body });
+  let promotions = 0;
+  const artifactCache: SegmentArtifactCacheLookup = {
+    promotionEnabled: true,
+    acquire: () => Promise.resolve(undefined),
+    promote: () => {
+      promotions++;
+      return Promise.reject(new Error('synthetic promotion failure'));
+    },
+  };
+  const { pool, runtime } = await createHarness(context, fetcher, {
+    artifactCache,
+  });
+  const artifact = await pool.fetchSegmentArtifact(
+    { messageId: 'promotion-failure', bytes: body.length },
+    'nzb',
+    undefined
+  );
+  assert.deepEqual(await readArtifact(artifact), body);
+  assert.equal(promotions, 1);
+  await runtime.close();
+  assert.equal(runtime.spoolManager.stats().artifacts, 0);
+  assert.equal(runtime.spoolManager.stats().budget.reservedBytes, 0);
+});
+
+test('a completed spool promotion becomes a file-backed hit without another network fetch', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const body = Buffer.from('persistent-promotion-hit');
+  fetcher.behaviors.set('persistent-promotion', { body });
+  const diskRoot = await mkdtemp(path.join(tmpdir(), 'artifact-promotion-l2-'));
+  const persistent = new SegmentCache({
+    arenaBytes: 0,
+    diskBytes: MEBIBYTE_BYTES,
+    diskPath: diskRoot,
+    namespace: 'segments',
+  });
+  const promoted = Promise.withResolvers<boolean>();
+  const artifactCache: SegmentArtifactCacheLookup = {
+    get promotionEnabled() {
+      return persistent.promotionEnabled;
+    },
+    acquire: (messageId, signal) => persistent.acquire(messageId, signal),
+    promote: async (messageId, metadata, sourcePath) => {
+      const result = await persistent.promote(messageId, metadata, sourcePath);
+      promoted.resolve(result);
+      return result;
+    },
+  };
+  context.after(async () => {
+    await persistent.close();
+    await rm(diskRoot, { recursive: true, force: true });
+  });
+  const { pool } = await createHarness(context, fetcher, { artifactCache });
+  const first = await pool.fetchSegmentArtifact(
+    { messageId: 'persistent-promotion', bytes: body.length },
+    'nzb',
+    undefined
+  );
+  assert.deepEqual(await readArtifact(first), body);
+  assert.equal(await promoted.promise, true);
+
+  const second = await pool.fetchSegmentArtifact(
+    { messageId: 'persistent-promotion', bytes: body.length },
+    'nzb',
+    undefined
+  );
+  assert.equal(second.storage, 'disk-cache');
+  assert.deepEqual(await readArtifact(second), body);
+  assert.equal(fetcher.streamingCalls, 1);
+});
+
+test('an explicitly disabled persistent cache skips promotion entirely', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const body = Buffer.from('no-promotion');
+  fetcher.behaviors.set('promotion-disabled', { body });
+  let promotions = 0;
+  const artifactCache: SegmentArtifactCacheLookup = {
+    promotionEnabled: false,
+    acquire: () => Promise.resolve(undefined),
+    promote: () => {
+      promotions++;
+      return Promise.resolve(true);
+    },
+  };
+  const { pool } = await createHarness(context, fetcher, { artifactCache });
+  const artifact = await pool.fetchSegmentArtifact(
+    { messageId: 'promotion-disabled', bytes: body.length },
+    'nzb',
+    undefined
+  );
+  assert.deepEqual(await readArtifact(artifact), body);
+  assert.equal(promotions, 0);
 });
