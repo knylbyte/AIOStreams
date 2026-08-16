@@ -6,6 +6,7 @@ import { SpoolManager } from '../spool/manager.js';
 import { UsenetSpoolError } from '../spool/errors.js';
 import type { ByteLease } from './byte-budget.js';
 import type { SegmentArtifactCacheLookup } from './segment-artifact.js';
+import { resolveSegmentStreamMemoryBytes } from '../stream-queue-budget.js';
 
 export interface SegmentSpoolingRuntimeOptions {
   readonly plan: SegmentSpoolingPlan;
@@ -70,6 +71,19 @@ export class SegmentSpoolingRuntime {
     this.streamAdmissionMaxBytes = Math.floor(
       options.plan.memoryBudgetBytes / 2
     );
+    const fileStreamWindowBytes = resolveSegmentStreamMemoryBytes(
+      options.plan.readerHighWaterMarkBytes,
+      options.plan.readerHighWaterMarkBytes
+    );
+    if (
+      fileStreamWindowBytes > options.plan.perStreamBufferBytes ||
+      fileStreamWindowBytes > this.streamAdmissionMaxBytes
+    ) {
+      throw new UsenetSpoolError(
+        'USENET_MEMORY_BUDGET',
+        'Segment-spooling resource plan cannot cover the hard stream queues'
+      );
+    }
     this.spoolManager =
       options.spoolManager ??
       new SpoolManager({
@@ -115,10 +129,10 @@ export class SegmentSpoolingRuntime {
 
   /**
    * Atomically reserve every bounded Readable queue owned by one output path.
-   * Direct streams request `2H` (artifact reader + ordered stream), while the
-   * FileStream path requests `3H` to include its relay. Admission and global
-   * accounting are checked in the same synchronous grant; no partial lease is
-   * held while another budget is awaited.
+   * Direct streams request two hard queue capacities (artifact reader +
+   * ordered stream), while the FileStream path includes a third capacity for
+   * its relay. Admission and global accounting are checked in the same
+   * synchronous grant; no partial lease is held while another budget awaits.
    */
   async acquireStreamMemory(
     bytes: number,

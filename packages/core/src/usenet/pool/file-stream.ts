@@ -22,6 +22,7 @@ import {
   resolveEngineResourcePlan,
   type EngineResourcePlan,
 } from '../resource-plan.js';
+import { resolveSegmentStreamQueuePlan } from '../stream-queue-budget.js';
 
 const logger = createLogger('usenet/file-stream');
 
@@ -84,8 +85,27 @@ interface KnownRange {
   /** Half-open decoded byte range [begin, end) of this segment in the file. */
   begin: number;
   end: number;
-  /** Whether this range may be asserted against an artifact's yEnc offsets. */
-  origin: 'global-range' | 'standalone-prefix' | 'proven-grid' | 'estimate';
+  /** Provenance keeps logical offsets separate from yEnc-assertable offsets. */
+  origin:
+    | 'global-yenc-range'
+    | 'global-yenc-grid'
+    | 'standalone-prefix'
+    | 'logical-grid'
+    | 'estimate';
+}
+
+function isExactSpoolingLogicalRange(range: KnownRange): boolean {
+  return (
+    range.origin === 'global-yenc-range' ||
+    range.origin === 'global-yenc-grid' ||
+    range.origin === 'standalone-prefix'
+  );
+}
+
+function isAssertableYencRange(range: KnownRange): boolean {
+  return (
+    range.origin === 'global-yenc-range' || range.origin === 'global-yenc-grid'
+  );
 }
 
 interface LocatedSegment {
@@ -217,7 +237,7 @@ export class FileStream implements SeekableStream {
     this.knownRanges.set(0, {
       begin: firstBegin,
       end: firstEnd,
-      origin: first.byteRange ? 'global-range' : 'estimate',
+      origin: first.byteRange ? 'global-yenc-range' : 'estimate',
     });
     this.avgDecodedSize = firstEnd - firstBegin || first.decodedSize || 1;
 
@@ -251,7 +271,7 @@ export class FileStream implements SeekableStream {
         this.knownRanges.set(lastIdx, {
           begin: last.byteRange[0],
           end: last.byteRange[1],
-          origin: 'global-range',
+          origin: 'global-yenc-range',
         });
         this._size = last.byteRange[1];
         this.sizeExact = true;
@@ -370,7 +390,7 @@ export class FileStream implements SeekableStream {
           this.knownRanges.set(segmentIndex, {
             begin,
             end: segEnd,
-            origin: h.data.byteRange ? 'global-range' : 'estimate',
+            origin: h.data.byteRange ? 'global-yenc-range' : 'estimate',
           });
           // The located segment must contain `pos`; subsequent segments start
           // at their own `begin`. Guard against a gap/overshoot just in case.
@@ -443,10 +463,14 @@ export class FileStream implements SeekableStream {
     let detachRelay: (() => void) | undefined;
     let releaseRelayLease: (() => void) | undefined;
     const locatorController = new AbortController();
-    const relayHighWaterMark =
-      this.resourcePlan.mode === 'segment_spooling'
-        ? this.resourcePlan.segmentSpooling?.readerHighWaterMarkBytes
+    const relayQueuePlan =
+      this.resourcePlan.mode === 'segment_spooling' &&
+      this.resourcePlan.segmentSpooling
+        ? resolveSegmentStreamQueuePlan(
+            this.resourcePlan.segmentSpooling.readerHighWaterMarkBytes
+          )
         : undefined;
+    const relayHighWaterMark = relayQueuePlan?.highWaterMarkBytes;
     const out = new Readable({
       ...(relayHighWaterMark === undefined
         ? {}
@@ -529,7 +553,10 @@ export class FileStream implements SeekableStream {
                     holes.hooks.onHole({
                       nzbFileIndex: holes.fileIndex,
                       segmentIndex: segmentIndex + local,
-                      targetOffset: this.segmentStartByte(segmentIndex + local),
+                      targetOffset:
+                        this.resourcePlan.mode === 'segment_spooling'
+                          ? this.spoolingSegmentStartByte(segmentIndex + local)
+                          : this.segmentStartByte(segmentIndex + local),
                       bytes,
                       kind,
                     })
@@ -749,8 +776,19 @@ export class FileStream implements SeekableStream {
 
   /** Add the trivial exact one-part known-size case used for early tailing. */
   private exactSpoolingSegmentSize(index: number): number | undefined {
-    const exact = this.exactSegmentSize(index);
-    if (exact !== undefined) return exact;
+    const known = this.knownRanges.get(index);
+    if (known && isExactSpoolingLogicalRange(known)) {
+      return known.end - known.begin;
+    }
+    const part = this.spoolingPartGridSize();
+    if (part !== undefined) {
+      const segmentCount = this.source.segments.length;
+      if (index < 0 || index >= segmentCount) return undefined;
+      if (index < segmentCount - 1) return part;
+      if (!this.sizeExact) return undefined;
+      const last = this._size - part * (segmentCount - 1);
+      if (last > 0 && last <= part) return last;
+    }
     return index === 0 &&
       this.source.segments.length === 1 &&
       this.sizeExact &&
@@ -759,24 +797,55 @@ export class FileStream implements SeekableStream {
       : undefined;
   }
 
+  /** Exact direct-spooling offset; buffering estimates are never eligible. */
+  private spoolingSegmentStartByte(index: number): number | undefined {
+    const known = this.knownRanges.get(index);
+    if (known && isExactSpoolingLogicalRange(known)) return known.begin;
+    const part = this.spoolingPartGridSize();
+    return part === undefined ? undefined : index * part;
+  }
+
+  /** Uniform global grid proven only from genuine yEnc range metadata. */
+  private spoolingPartGridSize(): number | undefined {
+    if (this.spoolingLayout !== 'global-range') return undefined;
+    if (this.lockedPartSize !== undefined && this.lockedPartSize > 0) {
+      return this.lockedPartSize;
+    }
+    const first = this.knownRanges.get(0);
+    if (
+      !first ||
+      !isAssertableYencRange(first) ||
+      first.begin !== 0 ||
+      !this.sizeExact
+    ) {
+      return undefined;
+    }
+    const length = first.end - first.begin;
+    const segmentCount = this.source.segments.length;
+    if (length <= 0) return undefined;
+    return length * (segmentCount - 1) < this._size &&
+      this._size <= length * segmentCount
+      ? length
+      : undefined;
+  }
+
   private authoritativeSpoolingByteRange(
     index: number
   ): readonly [number, number] | undefined {
     let range = this.knownRanges.get(index);
-    if (!range) {
-      const begin = this.segmentStartByte(index);
+    if (!range || !isAssertableYencRange(range)) {
+      const begin = this.spoolingSegmentStartByte(index);
       const length = this.exactSpoolingSegmentSize(index);
-      if (begin !== undefined && length !== undefined) {
-        range = { begin, end: begin + length, origin: 'proven-grid' };
+      if (
+        this.spoolingPartGridSize() !== undefined &&
+        begin !== undefined &&
+        length !== undefined
+      ) {
+        range = { begin, end: begin + length, origin: 'global-yenc-grid' };
         this.knownRanges.set(index, range);
       }
     }
-    if (
-      !range ||
-      (range.origin !== 'global-range' && range.origin !== 'proven-grid')
-    ) {
-      return undefined;
-    }
+    if (!range || !isAssertableYencRange(range)) return undefined;
     return [range.begin, range.end];
   }
 
@@ -789,14 +858,18 @@ export class FileStream implements SeekableStream {
     if (targetByte === 0 || segments.length === 1) {
       return {
         segmentIndex: 0,
-        segmentStartByte: this.knownRanges.get(0)?.begin ?? 0,
+        segmentStartByte: 0,
       };
     }
 
     let lo = 0;
     let hi = segments.length - 1;
     const firstRange = this.knownRanges.get(0);
-    if (firstRange && targetByte < firstRange.end) {
+    if (
+      firstRange &&
+      isExactSpoolingLogicalRange(firstRange) &&
+      targetByte < firstRange.end
+    ) {
       return { segmentIndex: 0, segmentStartByte: firstRange.begin };
     }
 
@@ -829,14 +902,19 @@ export class FileStream implements SeekableStream {
     signal: AbortSignal
   ): Promise<KnownRange> {
     const cached = this.knownRanges.get(index);
-    if (cached) return cached;
-    const start = this.segmentStartByte(index);
+    if (cached && isExactSpoolingLogicalRange(cached)) {
+      if (isAssertableYencRange(cached)) {
+        this.acceptSpoolingLayout('global-range');
+      }
+      return cached;
+    }
+    const start = this.spoolingSegmentStartByte(index);
     const exactLength = this.exactSpoolingSegmentSize(index);
     if (start !== undefined && exactLength !== undefined) {
       const range: KnownRange = {
         begin: start,
         end: start + exactLength,
-        origin: 'proven-grid',
+        origin: 'global-yenc-grid',
       };
       this.knownRanges.set(index, range);
       return range;
@@ -869,10 +947,10 @@ export class FileStream implements SeekableStream {
       return this.recordMeasuredRange(index, {
         byteRange: metadata.byteRange,
         decodedSize: metadata.decodedSize ?? 0,
-        origin: 'global-range',
+        origin: 'global-yenc-range',
       });
     } catch (error) {
-      const synthesized = this.synthesizeHoleRange(index, error);
+      const synthesized = this.synthesizeSpoolingHoleRange(index, error);
       if (synthesized) return synthesized;
       throw error;
     }
@@ -943,7 +1021,7 @@ export class FileStream implements SeekableStream {
       holes.hooks.onHole({
         nzbFileIndex: holes.fileIndex,
         segmentIndex: index,
-        targetOffset: this.segmentStartByte(index),
+        targetOffset: this.spoolingSegmentStartByte(index),
         bytes,
         kind,
       }) !== 'pad'
@@ -1139,7 +1217,7 @@ export class FileStream implements SeekableStream {
     return this.recordMeasuredRange(index, {
       byteRange: data.byteRange,
       decodedSize: data.size,
-      origin: data.byteRange ? 'global-range' : 'estimate',
+      origin: data.byteRange ? 'global-yenc-range' : 'estimate',
     });
   }
 
@@ -1186,11 +1264,38 @@ export class FileStream implements SeekableStream {
     const end = exact
       ? begin + exact
       : Math.min(begin + part, this._size || begin + part);
-    const range: KnownRange = { begin, end, origin: 'proven-grid' };
+    const range: KnownRange = { begin, end, origin: 'logical-grid' };
     this.knownRanges.set(index, range);
     logger.debug(
       { nzbHash: this.nzbHash, index, begin, end, kind },
       'segment unservable on all providers; synthesized grid range for seek'
+    );
+    return range;
+  }
+
+  /**
+   * Spooling holes require a globally proven yEnc grid. Buffering estimates
+   * and buffering-only logical grids must never manufacture direct offsets.
+   */
+  private synthesizeSpoolingHoleRange(
+    index: number,
+    error: unknown
+  ): KnownRange | undefined {
+    const kind = definitiveLossKind(error);
+    if (kind === undefined) return undefined;
+    const part = this.spoolingPartGridSize();
+    const exact = this.exactSpoolingSegmentSize(index);
+    if (part === undefined || exact === undefined) return undefined;
+    const begin = index * part;
+    const range: KnownRange = {
+      begin,
+      end: begin + exact,
+      origin: 'global-yenc-grid',
+    };
+    this.knownRanges.set(index, range);
+    logger.debug(
+      { nzbHash: this.nzbHash, index, begin, end: range.end, kind },
+      'segment unservable on all providers; synthesized proven yEnc grid range'
     );
     return range;
   }

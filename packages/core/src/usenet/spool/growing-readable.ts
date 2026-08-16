@@ -5,6 +5,7 @@ import {
   UsenetSpoolError,
 } from './errors.js';
 import type { GrowingReadableSource, ManagedSpoolFile } from './types.js';
+import { resolveSegmentStreamQueuePlan } from '../stream-queue-budget.js';
 
 export interface GrowingFileReaderOptions {
   readonly source: GrowingReadableSource;
@@ -67,11 +68,12 @@ export class GrowingFileReader extends Readable {
         'Reader highWaterMark must be a safe positive integer'
       );
     }
+    const queuePlan = resolveSegmentStreamQueuePlan(options.highWaterMark);
     super({ highWaterMark: options.highWaterMark, autoDestroy: true });
     this.source = options.source;
     this.position = options.start;
     this.endExclusive = options.endExclusive;
-    this.readBytes = options.highWaterMark;
+    this.readBytes = queuePlan.maxChunkBytes;
     this.onClosed = options.onClosed;
     this.userSignal = options.signal;
     this.completion = options.completion;

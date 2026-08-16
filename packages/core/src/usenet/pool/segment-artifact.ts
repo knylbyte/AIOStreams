@@ -4,8 +4,11 @@ import type { DecodedSegmentMetadata } from './streaming-yenc-article-decoder.js
 import type { SharedSegment } from './segment-arena.js';
 import type { GrowingSpoolArtifact } from '../spool/growing-artifact.js';
 import { UsenetSpoolError } from '../spool/errors.js';
+import {
+  SEGMENT_STREAM_MAX_CHUNK_BYTES,
+  resolveSegmentStreamQueuePlan,
+} from '../stream-queue-budget.js';
 
-const ARTIFACT_CHUNK_BYTES = 64 * 1024;
 const MEBIBYTE_BYTES = 1024 * 1024;
 /** Matches the largest planned Block-1 spool reader HWM and bounds owned data. */
 const MAX_ARTIFACT_READER_HIGH_WATER_MARK_BYTES = 2 * MEBIBYTE_BYTES;
@@ -69,6 +72,7 @@ export interface SegmentArtifact {
   readonly metadata: DecodedSegmentMetadata;
   readonly length: number;
   readonly storage: SegmentArtifactStorage;
+  /** Every emitted Buffer is bounded by `SEGMENT_STREAM_MAX_CHUNK_BYTES`. */
   createReadStream(options?: SegmentArtifactReadOptions): Readable;
   release(): Promise<void>;
 }
@@ -97,7 +101,7 @@ function validateReadRange(
 ): ValidatedReadRange {
   const start = options.start ?? 0;
   const endExclusive = options.endExclusive ?? length;
-  const highWaterMark = options.highWaterMark ?? ARTIFACT_CHUNK_BYTES;
+  const highWaterMark = options.highWaterMark ?? SEGMENT_STREAM_MAX_CHUNK_BYTES;
   if (
     !Number.isSafeInteger(start) ||
     !Number.isSafeInteger(endExclusive) ||
@@ -116,6 +120,7 @@ function validateReadRange(
       'Segment artifact highWaterMark must be a safe positive integer no larger than 2 MiB'
     );
   }
+  resolveSegmentStreamQueuePlan(highWaterMark);
   return { start, endExclusive, highWaterMark };
 }
 
@@ -139,7 +144,7 @@ class BufferRangeReadable extends Readable {
     }
     const bytes = Math.min(
       Math.max(1, size),
-      ARTIFACT_CHUNK_BYTES,
+      SEGMENT_STREAM_MAX_CHUNK_BYTES,
       this.endExclusive - this.position
     );
     const chunk = Buffer.allocUnsafe(bytes);
@@ -307,7 +312,7 @@ class ZeroReadable extends Readable {
     }
     const bytes = Math.min(
       this.remaining,
-      ARTIFACT_CHUNK_BYTES,
+      SEGMENT_STREAM_MAX_CHUNK_BYTES,
       Math.max(1, size)
     );
     this.remaining -= bytes;

@@ -15,6 +15,7 @@ import {
   type SpoolingSegmentArtifactSource,
 } from './spooling-segments-stream.js';
 import type { SegmentArtifact } from './segment-artifact.js';
+import { resolveSegmentStreamQueuePlan } from '../stream-queue-budget.js';
 
 /** Mode-neutral inputs for the direct ordered segment read path. */
 export interface CommonSegmentReadOptions {
@@ -24,9 +25,9 @@ export interface CommonSegmentReadOptions {
   readonly maxPrefetchSegments: number;
   /** Existing RAM reorder-buffer size, used only by segment buffering. */
   readonly bufferingBufferSizeBytes: number;
-  /** Resource-plan HWM, required and used only by segment spooling. */
+  /** Resource-plan threshold; hard queue capacity is derived centrally. */
   readonly spoolingReaderHighWaterMarkBytes?: number;
-  /** FileStream relay HWM; omitted for a direct two-queue spool stream. */
+  /** FileStream relay threshold; omitted for a direct two-queue spool stream. */
   readonly spoolingRelayHighWaterMarkBytes?: number;
   readonly skipBytes?: number;
   readonly limitBytes?: number;
@@ -79,13 +80,18 @@ export function createSegmentReadStream(
       'Segment-spooling stream requires a resolved resource plan'
     );
   }
+  const readerQueue = resolveSegmentStreamQueuePlan(readerHighWaterMarkBytes);
+  const relayQueue =
+    options.spoolingRelayHighWaterMarkBytes === undefined
+      ? undefined
+      : resolveSegmentStreamQueuePlan(options.spoolingRelayHighWaterMarkBytes);
   return new SpoolingSegmentsStream({
     pool: options.pool,
     segments: options.segments,
     nzbHash: options.nzbHash,
     maxPrefetchSegments: options.maxPrefetchSegments,
-    readerHighWaterMarkBytes,
-    relayHighWaterMarkBytes: options.spoolingRelayHighWaterMarkBytes,
+    readerHighWaterMarkBytes: readerQueue.highWaterMarkBytes,
+    relayHighWaterMarkBytes: relayQueue?.highWaterMarkBytes,
     skipBytes: options.skipBytes,
     limitBytes: options.limitBytes,
     priority: options.priority,

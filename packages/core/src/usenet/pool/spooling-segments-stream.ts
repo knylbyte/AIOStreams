@@ -10,6 +10,10 @@ import {
 } from './segment-artifact.js';
 import type { CommandPriority, NzbSegmentRef } from '../types.js';
 import { YencMetadataError } from './yenc.js';
+import {
+  resolveSegmentStreamMemoryBytes,
+  resolveSegmentStreamQueuePlan,
+} from '../stream-queue-budget.js';
 
 const logger = createLogger('usenet/spooling-segments');
 
@@ -99,10 +103,11 @@ function isPositiveSafeInteger(value: number): boolean {
  *   for complete provider failover and producer validation;
  * - exactly one artifact reader may feed the outer Readable at a time;
  * - output order is monotonically increasing by local segment index;
- * - one pre-dispatch stream-memory lease covers the artifact reader and this
- *   stream (`2H`), plus the optional FileStream relay (`3H`); it remains held
- *   until producer resources are detached AND every owned output queue is
- *   drained or destroyed;
+ * - one pre-dispatch stream-memory lease covers the hard capacities of the
+ *   artifact reader and this stream (`2Q`), plus the optional FileStream relay
+ *   (`3Q`); `Q = H + 64 KiB - 1`, so partial reads followed by a final
+ *   bounded push cannot exceed the lease. It remains held until producer
+ *   resources are detached AND every owned output queue is drained/destroyed;
  * - satisfying a finite byte range stops further output immediately, but
  *   successful EOF is linearized only by the active artifact reader's
  *   producer-validated `end` event;
@@ -114,6 +119,7 @@ export class SpoolingSegmentsStream extends Readable {
   private readonly nzbHash: string;
   private readonly maxPrefetchSegments: number;
   private readonly readerHighWaterMarkBytes: number;
+  private readonly maxChunkBytes: number;
   private readonly streamMemoryBytes: number;
   private readonly priority: CommandPriority;
   private readonly externalSignal: AbortSignal | undefined;
@@ -164,14 +170,10 @@ export class SpoolingSegmentsStream extends Readable {
         'Spooling relay high-water mark must be a safe positive integer'
       );
     }
-    const streamMemoryBytes =
-      2 * options.readerHighWaterMarkBytes +
-      (options.relayHighWaterMarkBytes ?? 0);
-    if (!isPositiveSafeInteger(streamMemoryBytes)) {
-      throw new RangeError(
-        'Spooling stream memory window must be a safe positive integer'
-      );
-    }
+    const streamMemoryBytes = resolveSegmentStreamMemoryBytes(
+      options.readerHighWaterMarkBytes,
+      options.relayHighWaterMarkBytes
+    );
     const skipBytes = options.skipBytes ?? 0;
     const limitBytes = options.limitBytes ?? Number.POSITIVE_INFINITY;
     if (!isNonNegativeSafeInteger(skipBytes)) {
@@ -192,6 +194,9 @@ export class SpoolingSegmentsStream extends Readable {
     this.nzbHash = options.nzbHash;
     this.maxPrefetchSegments = options.maxPrefetchSegments;
     this.readerHighWaterMarkBytes = options.readerHighWaterMarkBytes;
+    this.maxChunkBytes = resolveSegmentStreamQueuePlan(
+      options.readerHighWaterMarkBytes
+    ).maxChunkBytes;
     this.streamMemoryBytes = streamMemoryBytes;
     this.priority = options.priority;
     this.externalSignal = options.signal;
@@ -478,6 +483,12 @@ export class SpoolingSegmentsStream extends Readable {
     if (!Buffer.isBuffer(chunk)) {
       this.destroy(
         new TypeError('Segment artifact reader emitted non-Buffer data')
+      );
+      return;
+    }
+    if (chunk.length > this.maxChunkBytes) {
+      this.destroy(
+        new RangeError('Segment artifact reader exceeded its chunk contract')
       );
       return;
     }
