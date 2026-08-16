@@ -1881,3 +1881,105 @@ test('best-effort promotion memory never bypasses a queued stream request', asyn
   second.release();
   assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
 });
+
+test('promotion release immediately wakes a queued download window', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const windowBytes = spoolingPlan().perDownloadBaseLeaseBytes;
+  const { runtime } = await createHarness(context, fetcher, {
+    memoryBudget: new ByteBudget(windowBytes),
+  });
+  const promotion = runtime.tryAcquirePromotionMemory(windowBytes);
+  assert(promotion);
+
+  let granted = false;
+  const pending = runtime
+    .acquireDownloadMemory(CommandPriority.High)
+    .then((lease) => {
+      granted = true;
+      return lease;
+    });
+  await Promise.resolve();
+  assert.equal(granted, false);
+
+  promotion.release();
+  const download = await pending;
+  assert.equal(runtime.memoryBudget.stats().usedBytes, windowBytes);
+  download.release();
+  assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+});
+
+test('promotion release immediately wakes a queued stream window', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const windowBytes = spoolingPlan().perDownloadBaseLeaseBytes;
+  const { runtime } = await createHarness(context, fetcher, {
+    memoryBudget: new ByteBudget(windowBytes),
+  });
+  const promotion = runtime.tryAcquirePromotionMemory(windowBytes);
+  assert(promotion);
+
+  const pending = runtime.acquireStreamMemory(
+    windowBytes,
+    CommandPriority.High
+  );
+  promotion.release();
+  const stream = await pending;
+  assert.equal(runtime.memoryBudget.stats().usedBytes, windowBytes);
+  stream.release();
+  assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+});
+
+test('promotion release preserves runtime priority without double grants', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const windowBytes = spoolingPlan().perDownloadBaseLeaseBytes;
+  const { runtime } = await createHarness(context, fetcher, {
+    memoryBudget: new ByteBudget(windowBytes),
+  });
+  const promotion = runtime.tryAcquirePromotionMemory(windowBytes);
+  assert(promotion);
+  const order: string[] = [];
+  const low = runtime
+    .acquireDownloadMemory(CommandPriority.Low)
+    .then((lease) => {
+      order.push('low');
+      return lease;
+    });
+  const high = runtime
+    .acquireDownloadMemory(CommandPriority.High)
+    .then((lease) => {
+      order.push('high');
+      return lease;
+    });
+
+  promotion.release();
+  const highLease = await high;
+  assert.deepEqual(order, ['high']);
+  assert.equal(runtime.memoryBudget.stats().usedBytes, windowBytes);
+  highLease.release();
+  const lowLease = await low;
+  assert.deepEqual(order, ['high', 'low']);
+  assert.equal(runtime.memoryBudget.stats().usedBytes, windowBytes);
+  lowLease.release();
+  assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+});
+
+test('promotion release after runtime close is inert and frees its bytes', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const windowBytes = spoolingPlan().perDownloadBaseLeaseBytes;
+  const { runtime } = await createHarness(context, fetcher, {
+    memoryBudget: new ByteBudget(windowBytes),
+  });
+  const promotion = runtime.tryAcquirePromotionMemory(windowBytes);
+  assert(promotion);
+
+  await runtime.close();
+  promotion.release();
+  promotion.release();
+  assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+  await assert.rejects(
+    runtime.acquireDownloadMemory(CommandPriority.High),
+    (error: unknown) => {
+      assert(error instanceof UsenetSpoolError);
+      return error.code === 'USENET_SPOOL_CLOSED';
+    }
+  );
+});

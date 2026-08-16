@@ -19,6 +19,7 @@ import test, { type TestContext } from 'node:test';
 import '../../config/index.js';
 import { ByteBudget, type ByteLease } from './byte-budget.js';
 import {
+  closeSegmentCacheInBackground,
   SEGMENT_CACHE_PROMOTION_MEMORY_BYTES,
   SegmentCache,
 } from './segment-cache.js';
@@ -38,6 +39,16 @@ function budgetAdmission(
 function codedError(code: string): Error & { code: string } {
   return Object.assign(new Error(code), { code });
 }
+
+test('synchronous engine close boundary consumes cache close rejection', async () => {
+  const failure = new Error('synthetic segment cache close failure');
+  const observed = Promise.withResolvers<unknown>();
+  closeSegmentCacheInBackground(
+    { close: () => Promise.reject(failure) },
+    (error) => observed.resolve(error)
+  );
+  assert.equal(await observed.promise, failure);
+});
 
 async function collect(readable: Readable): Promise<Buffer> {
   const chunks: Buffer[] = [];
@@ -190,6 +201,7 @@ test('legacy cache files and index sizes remain readable across restart', async 
   assert(buffered);
   assert.deepEqual(buffered.body, body);
   assert.deepEqual(buffered.byteRange, [20, 31]);
+  await cache.close();
 });
 
 test('a promoted entry survives index flush and cache restart', async (context) => {
@@ -312,6 +324,7 @@ test('corrupt file-backed metadata is one miss, never a provisional hit', async 
     },
     { hits: 0, misses: 1, diskHits: 0, diskCount: 0 }
   );
+  await cache.close();
 });
 
 test('transient metadata-open failure preserves the persistent entry and stats', async (context) => {

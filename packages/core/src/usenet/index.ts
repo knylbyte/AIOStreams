@@ -7,7 +7,11 @@ import { appConfig } from '../utils/index.js';
 import { MultiProviderPool } from './pool/multi-provider-pool.js';
 import { SegmentSpoolingRuntime } from './pool/segment-spooling-runtime.js';
 import { PrioritySemaphore } from './pool/priority-semaphore.js';
-import { SegmentCache, CacheStats } from './pool/segment-cache.js';
+import {
+  closeSegmentCacheInBackground,
+  SegmentCache,
+  CacheStats,
+} from './pool/segment-cache.js';
 import { StatsAccumulator } from './stats/accumulator.js';
 import { FileStream, SeekableStream, SegmentMemo } from './pool/file-stream.js';
 import { trackSeekableStream, reapIdleStreams } from './pool/tracked-stream.js';
@@ -1196,7 +1200,12 @@ export class UsenetEngine {
     this.pool.close();
     // Persist the disk index + drain pending writes; keep on-disk files so the
     // cache survives the eviction/restart (do NOT clear()).
-    void this.cache.close();
+    closeSegmentCacheInBackground(this.cache, (error: unknown) => {
+      logger.error(
+        { fingerprint: this.fingerprint, err: error },
+        'usenet segment cache close failed'
+      );
+    });
     logger.debug({ fingerprint: this.fingerprint }, 'usenet engine closed');
   }
 }

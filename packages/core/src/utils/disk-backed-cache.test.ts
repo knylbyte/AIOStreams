@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
   access,
+  mkdir,
   open,
   mkdtemp,
   readFile,
@@ -71,6 +72,23 @@ async function prepared(
   const file = await cache.createPreparedFile();
   await writeFile(file.path, body, { flag: 'w', mode: 0o600 });
   return file;
+}
+
+async function writePersistentEntry(
+  root: string,
+  key: string,
+  body: Buffer
+): Promise<{ readonly dataPath: string; readonly indexPath: string }> {
+  const directory = path.join(root, 'test-cache');
+  const dataPath = path.join(directory, fileKey(key));
+  const indexPath = path.join(root, 'test-cache.index.json');
+  await mkdir(directory, { recursive: true });
+  await writeFile(dataPath, body, { mode: 0o600 });
+  await writeFile(
+    indexPath,
+    JSON.stringify({ [fileKey(key)]: { size: body.length } })
+  );
+  return { dataPath, indexPath };
 }
 
 test('prepared installs are atomic, touch LRU, and account serialized bytes', async (context) => {
@@ -695,4 +713,314 @@ test('load persists a reconciled index after dropping a missing entry', async (c
     {}
   );
   assert.equal(cache.stats().diskCount, 0);
+});
+
+test('close drains a previously admitted background write into the restart index', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-close-write-'));
+  const renamed = deferred();
+  const continueRename = deferred();
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    renameFile: async (source, destination) => {
+      await rename(source, destination);
+      if (path.basename(source).startsWith('.write-')) {
+        renamed.resolve();
+        await continueRename.promise;
+      }
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  cache.set('admitted-before-close', Buffer.from('new!'));
+  await renamed.promise;
+  let closeSettled = false;
+  const closing = cache.close().finally(() => {
+    closeSettled = true;
+  });
+  await Promise.resolve();
+  assert.equal(closeSettled, false);
+  continueRename.resolve();
+  await closing;
+
+  const restarted = createCache(context, root, { maxDiskBytes: 16 });
+  await restarted.whenReady();
+  assert.deepEqual(
+    await restarted.getAsync('admitted-before-close'),
+    Buffer.from('new!')
+  );
+  await restarted.close();
+});
+
+test('close preserves an admitted rewrite after its destination rename', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-close-rewrite-'));
+  const renamed = deferred();
+  const continueRename = deferred();
+  let pauseRewrite = false;
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    renameFile: async (source, destination) => {
+      await rename(source, destination);
+      if (pauseRewrite && path.basename(source).startsWith('.write-')) {
+        renamed.resolve();
+        await continueRename.promise;
+      }
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  cache.set('rewrite-before-close', Buffer.from('old!'));
+  await cache.flush();
+
+  pauseRewrite = true;
+  cache.set('rewrite-before-close', Buffer.from('new!'));
+  await renamed.promise;
+  const closing = cache.close();
+  continueRename.resolve();
+  await closing;
+  assert.equal(cache.stats().diskCount, 1);
+  assert.equal(cache.stats().diskBytes, 4);
+
+  const restarted = createCache(context, root, { maxDiskBytes: 16 });
+  await restarted.whenReady();
+  assert.deepEqual(
+    await restarted.getAsync('rewrite-before-close'),
+    Buffer.from('new!')
+  );
+  await restarted.close();
+});
+
+test('close propagates a typed final index durability failure', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-close-index-'));
+  const cache = new DiskBackedCache<Buffer>({
+    name: 'test-cache',
+    dir: root,
+    maxMemBytes: 0,
+    maxDiskBytes: 16,
+    serialize: (value) => Buffer.from(value),
+    deserialize: (value) => Buffer.from(value),
+    sizeOf: (value) => value.length,
+    fileSystem: {
+      writeFile: async (target, data, options) => {
+        if (String(target).endsWith('.index.json')) throw codedError('EIO');
+        return writeFile(target, data, options);
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  cache.set('index-failure', Buffer.from('data'));
+
+  await assert.rejects(cache.close(), (error: unknown) => {
+    assert(error instanceof DiskBackedCacheError);
+    assert.equal(error.code, 'DISK_CACHE_INDEX_IO');
+    assert(error.cause instanceof Error);
+    assert('code' in error.cause);
+    assert.equal(error.cause.code, 'EIO');
+    return true;
+  });
+});
+
+test('explicit flush propagates and can retry a typed index durability failure', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-flush-index-'));
+  let failIndexWrite = true;
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      writeFile: async (target, data, options) => {
+        if (failIndexWrite && String(target).endsWith('.index.json')) {
+          throw codedError('EIO');
+        }
+        return writeFile(target, data, options);
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  cache.set('flush-index-failure', Buffer.from('data'));
+
+  await assert.rejects(cache.flush(), (error: unknown) => {
+    assert(error instanceof DiskBackedCacheError);
+    return error.code === 'DISK_CACHE_INDEX_IO';
+  });
+  failIndexWrite = false;
+  await cache.flush();
+  await cache.close();
+
+  const restarted = createCache(context, root, { maxDiskBytes: 16 });
+  await restarted.whenReady();
+  assert.deepEqual(
+    await restarted.getAsync('flush-index-failure'),
+    Buffer.from('data')
+  );
+  await restarted.close();
+});
+
+test('close retries a current snapshot after an older index flush fails', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-close-retry-'));
+  const oldFlushEntered = deferred();
+  const continueOldFlush = deferred();
+  let indexWrites = 0;
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      writeFile: async (target, data, options) => {
+        if (String(target).endsWith('.index.json')) {
+          indexWrites++;
+          if (indexWrites === 1) {
+            oldFlushEntered.resolve();
+            await continueOldFlush.promise;
+            throw codedError('EIO');
+          }
+        }
+        return writeFile(target, data, options);
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await cache.installPreparedFile(
+    'retry-current-snapshot',
+    await prepared(cache, Buffer.from('data')),
+    4
+  );
+
+  const oldFlushResult = cache.flushIndex().then(
+    () => undefined,
+    (error: unknown) => error
+  );
+  await oldFlushEntered.promise;
+  const closing = cache.close();
+  continueOldFlush.resolve();
+  const oldError = await oldFlushResult;
+  assert(oldError instanceof DiskBackedCacheError);
+  assert.equal(oldError.code, 'DISK_CACHE_INDEX_IO');
+  await closing;
+  assert.equal(indexWrites, 2);
+
+  const restarted = createCache(context, root, { maxDiskBytes: 16 });
+  await restarted.whenReady();
+  assert.deepEqual(
+    await restarted.getAsync('retry-current-snapshot'),
+    Buffer.from('data')
+  );
+  await restarted.close();
+});
+
+test('transient startup index-read failure preserves the complete disk namespace', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-load-index-'));
+  const body = Buffer.from('safe');
+  const { dataPath, indexPath } = await writePersistentEntry(
+    root,
+    'startup-index',
+    body
+  );
+  const originalIndex = await readFile(indexPath, 'utf8');
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      readFile: async () => {
+        throw codedError('EIO');
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  await cache.whenReady();
+  cache.set('must-not-write', Buffer.from('nope'));
+  await cache.flush();
+  assert.equal(await cache.getAsync('startup-index'), undefined);
+  await access(dataPath);
+  assert.equal(await readFile(indexPath, 'utf8'), originalIndex);
+  assert.equal(cache.stats().diskCount, 0);
+  assert.equal(cache.stats().misses, 0);
+
+  const restarted = createCache(context, root, { maxDiskBytes: 16 });
+  await restarted.whenReady();
+  assert.deepEqual(await restarted.getAsync('startup-index'), body);
+  await restarted.close();
+});
+
+test('transient startup readdir failure preserves the complete disk namespace', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-load-readdir-'));
+  const body = Buffer.from('safe');
+  const { dataPath, indexPath } = await writePersistentEntry(
+    root,
+    'startup-readdir',
+    body
+  );
+  const originalIndex = await readFile(indexPath, 'utf8');
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      readdir: async () => {
+        throw codedError('EIO');
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  await cache.whenReady();
+  await cache.flush();
+  await access(dataPath);
+  assert.equal(await readFile(indexPath, 'utf8'), originalIndex);
+  assert.equal(cache.stats().diskCount, 0);
+
+  const restarted = createCache(context, root, { maxDiskBytes: 16 });
+  await restarted.whenReady();
+  assert.deepEqual(await restarted.getAsync('startup-readdir'), body);
+  await restarted.close();
+});
+
+test('transient startup entry-lstat failure preserves the complete disk namespace', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-load-lstat-'));
+  const body = Buffer.from('safe');
+  const { dataPath, indexPath } = await writePersistentEntry(
+    root,
+    'startup-lstat',
+    body
+  );
+  const originalIndex = await readFile(indexPath, 'utf8');
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      lstat: async () => {
+        throw codedError('EIO');
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  await cache.whenReady();
+  await cache.flush();
+  await access(dataPath);
+  assert.equal(await readFile(indexPath, 'utf8'), originalIndex);
+  assert.equal(cache.stats().diskCount, 0);
+
+  const restarted = createCache(context, root, { maxDiskBytes: 16 });
+  await restarted.whenReady();
+  assert.deepEqual(await restarted.getAsync('startup-lstat'), body);
+  await restarted.close();
+});
+
+test('startup reconciliation discards only structurally invalid index entries', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-load-invalid-'));
+  const body = Buffer.from('safe');
+  const { indexPath } = await writePersistentEntry(
+    root,
+    'valid-index-entry',
+    body
+  );
+  const validKey = fileKey('valid-index-entry');
+  await writeFile(
+    indexPath,
+    JSON.stringify({
+      [validKey]: { size: body.length },
+      'not-a-safe-file-key': { size: 4 },
+    })
+  );
+  const cache = createCache(context, root, { maxDiskBytes: 16 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  await cache.whenReady();
+  await cache.flush();
+  assert.deepEqual(JSON.parse(await readFile(indexPath, 'utf8')), {
+    [validKey]: { size: body.length },
+  });
+  assert.deepEqual(await cache.getAsync('valid-index-entry'), body);
 });

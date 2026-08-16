@@ -628,3 +628,15 @@ export class SegmentCache implements SegmentArtifactCacheLookup {
     await this.cache.close();
   }
 }
+
+/**
+ * Consume the asynchronous cache shutdown from the engine's synchronous close
+ * boundary. Durability failures remain observable without becoming unhandled
+ * promise rejections while the broader engine lifecycle is still synchronous.
+ */
+export function closeSegmentCacheInBackground(
+  cache: Pick<SegmentCache, 'close'>,
+  onError: (error: unknown) => void
+): void {
+  void cache.close().catch(onError);
+}

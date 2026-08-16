@@ -187,8 +187,21 @@ export class SegmentSpoolingRuntime {
     ) {
       return undefined;
     }
-    const lease = this.memoryBudget.tryAcquire(bytes);
-    return lease ?? undefined;
+    const globalLease = this.memoryBudget.tryAcquire(bytes);
+    if (!globalLease) return undefined;
+    let released = false;
+    return {
+      bytes: globalLease.bytes,
+      release: () => {
+        if (released) return;
+        released = true;
+        globalLease.release();
+        // Runtime waiters are intentionally kept outside ByteBudget so stream
+        // admission and cross-kind fairness can be decided atomically. A
+        // promotion therefore owns the matching lost-wakeup bridge as well.
+        this.drainMemoryWaiters();
+      },
+    };
   }
 
   /** Stop new memory waiters and idempotently dispose the complete spool. */

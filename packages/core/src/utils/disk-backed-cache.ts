@@ -51,6 +51,7 @@ function parseDiskIndex(raw: string): ParsedDiskIndex {
 
 export type DiskBackedCacheErrorCode =
   | 'DISK_CACHE_CLOSED'
+  | 'DISK_CACHE_INDEX_IO'
   | 'DISK_CACHE_PREPARED_LIMIT'
   | 'DISK_CACHE_PREPARED_INVALID';
 
@@ -291,12 +292,16 @@ export class DiskBackedCache<V> {
   /** Serialises index persistence. */
   private indexFlush: Promise<void> = Promise.resolve();
   private indexDirty = false;
+  /** Independent durability signal retained after a failed background flush. */
+  private indexFlushFailed = false;
   /** Pending debounced index-persist timer (see {@link scheduleIndexFlush}). */
   private flushTimer?: NodeJS.Timeout;
   private ready: Promise<void>;
   private closed = false;
-  /** Monotone mutation epoch; clear/close advance it before their first await. */
+  /** Monotone destructive epoch; only clear invalidates admitted mutations. */
   private generation = 0;
+  /** Fail-safe startup state: memory stays usable, this disk namespace does not. */
+  private diskUnavailable = false;
   private clearing = false;
   private clearPromise?: Promise<void>;
   private closePromise?: Promise<void>;
@@ -360,7 +365,7 @@ export class DiskBackedCache<V> {
   }
 
   private diskEnabled(): boolean {
-    return this.opts.maxDiskBytes > 0;
+    return this.opts.maxDiskBytes > 0 && !this.diskUnavailable;
   }
 
   private fileKey(key: string): string {
@@ -378,51 +383,54 @@ export class DiskBackedCache<V> {
       await this.fileSystem.mkdir(this.dir, { recursive: true });
       let entries: Array<[string, DiskEntry]> = [];
       let rawIndex: string | undefined;
+      let reconciled = false;
       try {
         rawIndex = await this.fileSystem.readFile(this.indexPath, 'utf8');
       } catch (error) {
         // No index yet — first run or it was removed.
-        if (nodeErrorCode(error) !== 'ENOENT') {
-          logger.debug(
-            { name: this.opts.name, err: errorMessage(error) },
-            'disk cache index read failed'
-          );
-        }
+        if (nodeErrorCode(error) !== 'ENOENT') throw error;
       }
       if (rawIndex !== undefined) {
         try {
           const parsed = parseDiskIndex(rawIndex);
           entries = parsed.entries;
-          if (parsed.discardedEntries) this.indexDirty = true;
+          if (parsed.discardedEntries) reconciled = true;
         } catch {
           // Invalid JSON is reconciled to a clean empty index.
-          this.indexDirty = true;
+          reconciled = true;
         }
       }
       // Index → keep only safe regular files and reconcile legacy index sizes
       // against their actual serialized byte length.
-      const present = new Set(
-        await this.fileSystem.readdir(this.dir).catch(() => [])
-      );
+      const present = new Set(await this.fileSystem.readdir(this.dir));
+      const stagedDisk = new Map<string, DiskEntry>();
+      let stagedDiskBytes = 0;
       for (const [fileKey, entry] of entries) {
         if (!present.has(fileKey) || typeof entry?.size !== 'number') {
-          this.indexDirty = true;
+          reconciled = true;
           continue;
         }
         try {
           const stats = await this.fileSystem.lstat(this.filePath(fileKey));
           if (!stats.isFile() || !Number.isSafeInteger(stats.size)) {
-            this.indexDirty = true;
+            reconciled = true;
             continue;
           }
-          this.disk.set(fileKey, { size: stats.size });
-          this.diskBytes += stats.size;
-          if (entry.size !== stats.size) this.indexDirty = true;
-        } catch {
-          // Missing or unsafe entries are omitted from the reconciled index.
-          this.indexDirty = true;
+          stagedDisk.set(fileKey, { size: stats.size });
+          stagedDiskBytes += stats.size;
+          if (entry.size !== stats.size) reconciled = true;
+        } catch (error) {
+          if (nodeErrorCode(error) !== 'ENOENT') throw error;
+          // Confirmed missing entries are omitted from the reconciled index.
+          reconciled = true;
         }
       }
+      // Commit the logical scan only after index read, directory read and all
+      // indexed-file checks completed. Operational uncertainty must never turn
+      // a partial startup scan into a destructive reconciliation.
+      this.disk = stagedDisk;
+      this.diskBytes = stagedDiskBytes;
+      this.indexDirty = reconciled;
       // Files → delete any not referenced by the index (StremThru cleanOrphaned).
       for (const fileKey of present) {
         if (!this.disk.has(fileKey)) {
@@ -449,9 +457,15 @@ export class DiskBackedCache<V> {
         'disk cache loaded'
       );
     } catch (err) {
+      this.diskUnavailable = true;
+      this.disk.clear();
+      this.diskBytes = 0;
+      this.indexDirty = false;
+      this.indexFlushFailed = false;
+      this.cancelIndexFlushTimer();
       logger.warn(
         { name: this.opts.name, err: errorMessage(err) },
-        'disk cache load failed; continuing memory-only'
+        'disk cache startup scan failed; preserving disk namespace and continuing memory-only'
       );
     }
   }
@@ -487,7 +501,10 @@ export class DiskBackedCache<V> {
     key: string,
     signal?: AbortSignal
   ): Promise<DiskFileLease | undefined> {
-    if (!this.diskEnabled() || this.closed || this.clearing) {
+    if (this.diskUnavailable || this.closed || this.clearing) {
+      return undefined;
+    }
+    if (!this.diskEnabled()) {
       this.misses++;
       return undefined;
     }
@@ -730,17 +747,16 @@ export class DiskBackedCache<V> {
     const run = async (): Promise<void> => {
       try {
         await this.ready.catch(() => undefined);
-        if (!this.isCurrentGeneration(generation) || !this.diskEnabled())
-          return;
+        if (!this.isCurrentMutationGeneration(generation)) return;
         await this.fileSystem.mkdir(this.dir, { recursive: true });
-        if (!this.isCurrentGeneration(generation)) return;
+        if (!this.isCurrentMutationGeneration(generation)) return;
         await this.fileSystem.writeFile(tempPath, payload, {
           flag: 'wx',
           mode: 0o600,
         });
-        if (!this.isCurrentGeneration(generation)) return;
+        if (!this.isCurrentMutationGeneration(generation)) return;
         await this.replaceBackgroundFile(tempPath, this.filePath(fileKey));
-        if (!this.isCurrentGeneration(generation)) {
+        if (!this.isCurrentMutationGeneration(generation)) {
           await this.discardStaleDestination(fileKey);
           return;
         }
@@ -1235,6 +1251,16 @@ export class DiskBackedCache<V> {
     return generation === this.generation && !this.closed && !this.clearing;
   }
 
+  /**
+   * Background writes admitted before close may finish, while clear remains a
+   * destructive barrier. Admission itself is synchronously closed by set().
+   */
+  private isCurrentMutationGeneration(generation: number): boolean {
+    return (
+      generation === this.generation && !this.clearing && this.diskEnabled()
+    );
+  }
+
   private assertAcceptingGeneration(generation: number): void {
     if (!this.isCurrentGeneration(generation) || !this.diskEnabled()) {
       throw this.cacheClosedError();
@@ -1357,6 +1383,7 @@ export class DiskBackedCache<V> {
     if (this.diskEnabled()) {
       await this.fileSystem.rm(this.indexPath, { force: true });
       this.indexDirty = false;
+      this.indexFlushFailed = false;
     }
     if (deleteError) cleanupFailures.push(deleteError);
     if (cleanupFailures.length > 0) {
@@ -1402,7 +1429,12 @@ export class DiskBackedCache<V> {
     }
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined;
-      void this.flushIndex();
+      void this.flushIndex().catch((error: unknown) => {
+        logger.debug(
+          { name: this.opts.name, err: errorMessage(error) },
+          'disk cache background index flush failed'
+        );
+      });
     }, DiskBackedCache.INDEX_FLUSH_DEBOUNCE_MS);
     this.flushTimer.unref?.();
   }
@@ -1417,16 +1449,18 @@ export class DiskBackedCache<V> {
     ) {
       return;
     }
-    return this.flushIndexForGeneration(this.generation, false);
+    return this.flushIndexForGeneration(this.generation, false, false);
   }
 
   private flushIndexForGeneration(
     generation: number,
-    allowClosed: boolean
+    allowClosed: boolean,
+    force: boolean
   ): Promise<void> {
-    this.indexFlush = this.indexFlush.then(async () => {
+    const operation = this.indexFlush.then(async () => {
       if (
-        !this.indexDirty ||
+        !this.diskEnabled() ||
+        (!force && !this.indexDirty) ||
         generation !== this.generation ||
         this.clearing ||
         (this.closed && !allowClosed)
@@ -1441,15 +1475,21 @@ export class DiskBackedCache<V> {
           this.indexPath,
           JSON.stringify(snapshot)
         );
+        this.indexFlushFailed = false;
       } catch (err) {
         if (generation === this.generation) this.indexDirty = true;
-        logger.debug(
-          { name: this.opts.name, err: errorMessage(err) },
-          'disk cache index flush failed'
+        this.indexFlushFailed = true;
+        throw new DiskBackedCacheError(
+          'DISK_CACHE_INDEX_IO',
+          'Disk cache index could not be persisted',
+          { cause: err }
         );
       }
     });
-    return this.indexFlush;
+    // Keep the serialization chain usable after a failed attempt while the
+    // explicit caller still observes the typed durability failure.
+    this.indexFlush = operation.catch(() => undefined);
+    return operation;
   }
 
   /**
@@ -1458,17 +1498,18 @@ export class DiskBackedCache<V> {
   async flush(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     if (this.clearPromise) await this.clearPromise;
-    return this.flushOnce(this.generation, false);
+    return this.flushOnce(this.generation, false, false);
   }
 
   private async flushOnce(
     generation: number,
-    allowClosed: boolean
+    allowClosed: boolean,
+    forceIndex: boolean
   ): Promise<void> {
     await this.ready.catch(() => undefined);
     await Promise.allSettled([...this.pendingWrites.values()]);
     await this.retryPendingPhysicalDeletes();
-    await this.flushIndexForGeneration(generation, allowClosed);
+    await this.flushIndexForGeneration(generation, allowClosed, forceIndex);
   }
 
   /** Drain in-flight writes, persist the index, and stop accepting writes. */
@@ -1477,7 +1518,6 @@ export class DiskBackedCache<V> {
     // Linearization point: no operation crossing an await may return a new
     // prepared/file lease after this synchronous state change.
     this.closed = true;
-    this.generation++;
     this.cancelIndexFlushTimer();
     diskCacheRegistry.delete(this);
     const generation = this.generation;
@@ -1504,10 +1544,23 @@ export class DiskBackedCache<V> {
     await Promise.allSettled([...this.pendingWrites.values()]);
     await this.indexFlush.catch(() => undefined);
     try {
-      await this.flushOnce(generation, true);
+      await this.retryPendingPhysicalDeletes();
     } catch (error) {
       cleanupFailures.push(error);
     }
+    try {
+      // Persist a final current snapshot after every admitted write. The
+      // independent failure bit forces a retry even if an older attempt had
+      // temporarily cleared indexDirty before failing.
+      await this.flushIndexForGeneration(
+        generation,
+        true,
+        this.indexFlushFailed
+      );
+    } catch (error) {
+      cleanupFailures.push(error);
+    }
+    if (cleanupFailures.length === 1) throw cleanupFailures[0];
     if (cleanupFailures.length > 0) {
       throw new AggregateError(
         cleanupFailures,
