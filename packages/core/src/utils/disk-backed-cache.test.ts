@@ -1523,3 +1523,425 @@ test('startup reconciliation discards only structurally invalid index entries', 
   });
   assert.deepEqual(await cache.getAsync('valid-index-entry'), body);
 });
+
+test('same-instance lease plus clear publishes delete intent before final release', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-own-clear-'));
+  const { dataPath } = await writePersistentEntry(
+    root,
+    'own-clear',
+    Buffer.from('data')
+  );
+  let deleteCalls = 0;
+  const owner = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath) deleteCalls++;
+        return rm(candidate, options);
+      },
+    },
+  });
+  const observer = createCache(context, root, { maxDiskBytes: 16 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await Promise.all([owner.whenReady(), observer.whenReady()]);
+
+  const lease = await owner.acquireDiskFile('own-clear');
+  assert(lease);
+  await owner.clear();
+  assert.equal(deleteCalls, 0);
+  await access(dataPath);
+
+  assert.equal(await observer.acquireDiskFile('own-clear'), undefined);
+  assert.deepEqual(
+    {
+      hits: observer.stats().hits,
+      misses: observer.stats().misses,
+      diskHits: observer.stats().diskHits,
+    },
+    { hits: 0, misses: 0, diskHits: 0 }
+  );
+  await lease.release();
+  assert.equal(deleteCalls, 1);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  await observer.clear();
+});
+
+test('same-instance lease plus explicit delete blocks every later process lease', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-own-delete-'));
+  const { dataPath } = await writePersistentEntry(
+    root,
+    'own-delete',
+    Buffer.from('data')
+  );
+  let deleteCalls = 0;
+  const owner = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath) deleteCalls++;
+        return rm(candidate, options);
+      },
+    },
+  });
+  const observer = createCache(context, root, { maxDiskBytes: 16 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await Promise.all([owner.whenReady(), observer.whenReady()]);
+
+  const lease = await owner.acquireDiskFile('own-delete');
+  assert(lease);
+  assert.equal(await owner.delete('own-delete'), true);
+  assert.equal(await observer.acquireDiskFile('own-delete'), undefined);
+  assert.equal(deleteCalls, 0);
+  await access(dataPath);
+
+  await lease.release();
+  assert.equal(deleteCalls, 1);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  await observer.clear();
+});
+
+test('LRU eviction with an owner lease fences foreign acquisition immediately', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-own-lru-'));
+  const { dataPath } = await writePersistentEntry(
+    root,
+    'lru-old',
+    Buffer.from('old!')
+  );
+  let deleteCalls = 0;
+  const owner = createCache(context, root, {
+    maxDiskBytes: 4,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath) deleteCalls++;
+        return rm(candidate, options);
+      },
+    },
+  });
+  const observer = createCache(context, root, { maxDiskBytes: 4 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await Promise.all([owner.whenReady(), observer.whenReady()]);
+
+  const lease = await owner.acquireDiskFile('lru-old');
+  assert(lease);
+  assert.equal(
+    await owner.installPreparedFile(
+      'lru-new',
+      await prepared(owner, Buffer.from('new!')),
+      4
+    ),
+    true
+  );
+  assert.equal(await observer.acquireDiskFile('lru-old'), undefined);
+  assert.equal(deleteCalls, 0);
+  assert.equal((await readFile(lease.path)).toString(), 'old!');
+
+  await lease.release();
+  assert.equal(deleteCalls, 1);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  await observer.clear();
+});
+
+test('process delete waits for every old lease while rejecting a third', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-many-old-'));
+  const { dataPath } = await writePersistentEntry(
+    root,
+    'many-old',
+    Buffer.from('data')
+  );
+  let deleteCalls = 0;
+  const owner = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath) deleteCalls++;
+        return rm(candidate, options);
+      },
+    },
+  });
+  const reader = createCache(context, root, { maxDiskBytes: 16 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await Promise.all([owner.whenReady(), reader.whenReady()]);
+
+  const first = await owner.acquireDiskFile('many-old');
+  const second = await reader.acquireDiskFile('many-old');
+  assert(first);
+  assert(second);
+  await owner.clear();
+  assert.equal(await reader.acquireDiskFile('many-old'), undefined);
+  assert.deepEqual(
+    {
+      hits: reader.stats().hits,
+      misses: reader.stats().misses,
+      diskHits: reader.stats().diskHits,
+    },
+    { hits: 0, misses: 0, diskHits: 0 }
+  );
+
+  await first.release();
+  assert.equal(deleteCalls, 0);
+  await access(dataPath);
+  await second.release();
+  assert.equal(deleteCalls, 1);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  await reader.clear();
+});
+
+test('startup orphan cleanup survives EBUSY and succeeds on flush', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-orphan-retry-'));
+  const directory = path.join(root, 'test-cache');
+  const dataPath = path.join(directory, fileKey('orphan-retry'));
+  await mkdir(directory, { recursive: true });
+  await writeFile(dataPath, 'orphan', { mode: 0o600 });
+  let deleteCalls = 0;
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath && ++deleteCalls === 1) {
+          throw codedError('EBUSY');
+        }
+        return rm(candidate, options);
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  await cache.whenReady();
+  assert.equal(deleteCalls, 1);
+  await access(dataPath);
+  await cache.flush();
+  assert.equal(deleteCalls, 2);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+});
+
+test('startup orphan wake failure remains fenced and retryable after foreign release', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-orphan-wake-'));
+  const { dataPath, indexPath } = await writePersistentEntry(
+    root,
+    'orphan-wake',
+    Buffer.from('data')
+  );
+  const reader = createCache(context, root, { maxDiskBytes: 16 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await reader.whenReady();
+  const lease = await reader.acquireDiskFile('orphan-wake');
+  assert(lease);
+  await rm(indexPath, { force: true });
+
+  let deleteCalls = 0;
+  const recovering = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath && ++deleteCalls === 1) {
+          throw codedError('EBUSY');
+        }
+        return rm(candidate, options);
+      },
+    },
+  });
+  await recovering.whenReady();
+  assert.equal(deleteCalls, 0);
+  assert.equal(await reader.acquireDiskFile('orphan-wake'), undefined);
+  assert.deepEqual(
+    {
+      hits: reader.stats().hits,
+      misses: reader.stats().misses,
+      diskHits: reader.stats().diskHits,
+    },
+    { hits: 0, misses: 0, diskHits: 0 }
+  );
+
+  await assert.rejects(lease.release(), { code: 'EBUSY' });
+  assert.equal(deleteCalls, 1);
+  await access(dataPath);
+  await recovering.flush();
+  assert.equal(deleteCalls, 2);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  await reader.clear();
+});
+
+test('close reports a persistently failing startup orphan delete', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-orphan-close-'));
+  const directory = path.join(root, 'test-cache');
+  const dataPath = path.join(directory, fileKey('orphan-close'));
+  await mkdir(directory, { recursive: true });
+  await writeFile(dataPath, 'orphan', { mode: 0o600 });
+  let deleteCalls = 0;
+  const cache = new DiskBackedCache<Buffer>({
+    name: 'test-cache',
+    dir: root,
+    maxMemBytes: 0,
+    maxDiskBytes: 16,
+    serialize: (value) => Buffer.from(value),
+    deserialize: (value) => Buffer.from(value),
+    sizeOf: (value) => value.length,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath) {
+          deleteCalls++;
+          throw codedError('EBUSY');
+        }
+        return rm(candidate, options);
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  await cache.whenReady();
+  assert.equal(deleteCalls, 1);
+  await assert.rejects(cache.close(), (error: unknown) => {
+    assert(error instanceof AggregateError);
+    return error.errors.some(
+      (candidate) =>
+        candidate instanceof Error &&
+        'code' in candidate &&
+        candidate.code === 'EBUSY'
+    );
+  });
+  assert.equal(deleteCalls, 2);
+  await access(dataPath);
+});
+
+test('two startup scans coalesce orphan removal without concurrent rm', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-orphan-pair-'));
+  const directory = path.join(root, 'test-cache');
+  const dataPath = path.join(directory, fileKey('orphan-pair'));
+  await mkdir(directory, { recursive: true });
+  await writeFile(dataPath, 'orphan', { mode: 0o600 });
+  const deleteEntered = deferred();
+  const continueDelete = deferred();
+  let deleteCalls = 0;
+  let activeDeletes = 0;
+  let peakDeletes = 0;
+  const guardedRm: DiskBackedCacheFileSystem['rm'] = async (
+    candidate,
+    options
+  ) => {
+    if (String(candidate) !== dataPath) return rm(candidate, options);
+    deleteCalls++;
+    activeDeletes++;
+    peakDeletes = Math.max(peakDeletes, activeDeletes);
+    try {
+      if (deleteCalls === 1) {
+        deleteEntered.resolve();
+        await continueDelete.promise;
+      }
+      return await rm(candidate, options);
+    } finally {
+      activeDeletes--;
+    }
+  };
+  const first = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: { rm: guardedRm },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await deleteEntered.promise;
+  const second = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: { rm: guardedRm },
+  });
+  await second.whenReady();
+  assert.equal(deleteCalls, 1);
+  continueDelete.resolve();
+  await first.whenReady();
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+
+  await second.flush();
+  assert.equal(deleteCalls, 2);
+  assert.equal(peakDeletes, 1);
+  await second.flush();
+  assert.equal(deleteCalls, 2);
+});
+
+test('stale background destination cleanup remains retryable after clear', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-stale-write-'));
+  const destination = path.join(
+    root,
+    'test-cache',
+    fileKey('stale-background')
+  );
+  const renamed = deferred();
+  const continueRename = deferred();
+  let deleteCalls = 0;
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    renameFile: async (source, target) => {
+      await rename(source, target);
+      if (String(target) === destination) {
+        renamed.resolve();
+        await continueRename.promise;
+      }
+    },
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === destination && ++deleteCalls === 1) {
+          throw codedError('EBUSY');
+        }
+        return rm(candidate, options);
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await cache.whenReady();
+
+  cache.set('stale-background', Buffer.from('data'));
+  await renamed.promise;
+  const clearing = cache.clear();
+  continueRename.resolve();
+  await clearing;
+  assert.equal(deleteCalls, 1);
+  await access(destination);
+  assert.equal(cache.stats().diskCount, 0);
+
+  await cache.flush();
+  assert.equal(deleteCalls, 2);
+  await assert.rejects(access(destination), { code: 'ENOENT' });
+});
+
+test('stale prepared destination cleanup remains retryable after clear', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-stale-install-'));
+  const destination = path.join(root, 'test-cache', fileKey('stale-prepared'));
+  const renamed = deferred();
+  const continueRename = deferred();
+  let deleteCalls = 0;
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    renameFile: async (source, target) => {
+      await rename(source, target);
+      if (String(target) === destination) {
+        renamed.resolve();
+        await continueRename.promise;
+      }
+    },
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === destination && ++deleteCalls === 1) {
+          throw codedError('EBUSY');
+        }
+        return rm(candidate, options);
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await cache.whenReady();
+
+  const install = cache.installPreparedFile(
+    'stale-prepared',
+    await prepared(cache, Buffer.from('data')),
+    4
+  );
+  await renamed.promise;
+  const clearing = cache.clear();
+  continueRename.resolve();
+  await assert.rejects(install, { code: 'EBUSY' });
+  await clearing;
+  assert.equal(deleteCalls, 1);
+  await access(destination);
+  assert.equal(cache.stats().diskCount, 0);
+
+  await cache.flush();
+  assert.equal(deleteCalls, 2);
+  await assert.rejects(access(destination), { code: 'ENOENT' });
+});

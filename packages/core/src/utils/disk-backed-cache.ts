@@ -163,6 +163,15 @@ interface FileLeaseState {
   processDeleteRequest?: ProcessPathDeleteRequest;
 }
 
+interface UnindexedDeleteState {
+  readonly fileKey: string;
+  readonly path: string;
+  readonly logMessage: string;
+  operation?: Promise<void>;
+  processDeleteRequest?: ProcessPathDeleteRequest;
+  lastError?: unknown;
+}
+
 interface PreparedFileState {
   readonly path: string;
   readonly generation: number;
@@ -444,8 +453,14 @@ export class DiskBackedCache<V> {
   private closePromise?: Promise<void>;
   /** File ownership states remain only while leased or awaiting deletion. */
   private readonly fileLeases = new Map<string, FileLeaseState>();
-  /** Physical deletes currently running; bounded by the disk index/lease set. */
+  /** Physical deletes currently running; bounded by known namespace paths. */
   private readonly pendingDeletes = new Set<Promise<void>>();
+  /**
+   * Retryable orphan/stale-file deletes, coalesced by absolute path. The map is
+   * bounded by the finite files discovered in this namespace plus bounded
+   * in-flight mutation destinations; successful/ENOENT cleanup removes entries.
+   */
+  private readonly unindexedDeletes = new Map<string, UnindexedDeleteState>();
   /** Staging handles are bounded by the same admission cap as writes. */
   private readonly preparedFiles = new Map<
     DiskPreparedFile,
@@ -918,7 +933,10 @@ export class DiskBackedCache<V> {
           if (!this.isCurrentMutationGeneration(generation)) return;
           await this.replaceBackgroundFile(tempPath, destination);
           if (!this.isCurrentMutationGeneration(generation)) {
-            await this.fileSystem.rm(destination, { force: true });
+            await this.scheduleUnindexedPathDelete(
+              fileKey,
+              'disk cache stale background destination cleanup was deferred'
+            );
             return;
           }
           this.commitDiskEntry(fileKey, serializedBytes);
@@ -1155,7 +1173,10 @@ export class DiskBackedCache<V> {
           fileKey
         );
         if (!this.isCurrentGeneration(generation)) {
-          await this.fileSystem.rm(destination, { force: true });
+          await this.scheduleUnindexedPathDelete(
+            fileKey,
+            'disk cache stale prepared destination cleanup was deferred'
+          );
           return;
         }
         this.commitDiskEntry(fileKey, serializedBytes);
@@ -1347,11 +1368,12 @@ export class DiskBackedCache<V> {
     };
     state.pendingDelete = true;
     this.fileLeases.set(fileKey, state);
-    if (state.leases === 0) {
-      // Logical eviction is synchronous; the retryable physical failure is
-      // surfaced by release/flush/clear/close rather than as an unhandled task.
-      void this.startPhysicalDelete(fileKey, state).catch(() => undefined);
-    }
+    // The process-wide delete intent is registered synchronously with logical
+    // eviction, even when this cache owns a lease. This is the linearization
+    // point that rejects every later process-local lease. Physical removal is
+    // still deferred by the shared ownership registry until its final old
+    // lease is released.
+    void this.startPhysicalDelete(fileKey, state).catch(() => undefined);
   }
 
   private async releaseFileLease(
@@ -1473,28 +1495,71 @@ export class DiskBackedCache<V> {
     logMessage: string
   ): Promise<void> {
     const dataPath = this.filePath(fileKey);
-    const reportFailure = (error: unknown): void => {
-      logger.debug(
-        { name: this.opts.name, err: errorMessage(error) },
-        logMessage
-      );
-    };
-    let handledOperation: Promise<void> | undefined;
+    const resolvedPath = resolvedFilePath(dataPath);
+    let state = this.unindexedDeletes.get(resolvedPath);
+    if (!state) {
+      state = {
+        fileKey,
+        path: resolvedPath,
+        logMessage,
+      };
+      this.unindexedDeletes.set(resolvedPath, state);
+    }
+    return this.startUnindexedPathDelete(state).catch(() => undefined);
+  }
+
+  private startUnindexedPathDelete(state: UnindexedDeleteState): Promise<void> {
+    if (state.operation) return state.operation;
+    if (state.processDeleteRequest) return Promise.resolve();
+    let deletion: Promise<void> | undefined;
     const request: ProcessPathDeleteRequest = {
       run: async () => {
+        let removed = false;
         try {
-          await this.fileSystem.rm(dataPath, { force: true });
+          await this.fileSystem.rm(state.path, { force: true });
+          removed = true;
         } catch (error) {
-          if (nodeErrorCode(error) !== 'ENOENT') throw error;
+          if (nodeErrorCode(error) === 'ENOENT') {
+            removed = true;
+          } else {
+            state.lastError = error;
+            throw error;
+          }
+        } finally {
+          state.operation = undefined;
+          if (state.processDeleteRequest === request) {
+            state.processDeleteRequest = undefined;
+          }
+          if (removed && this.unindexedDeletes.get(state.path) === state) {
+            state.lastError = undefined;
+            this.unindexedDeletes.delete(state.path);
+          }
+          if (deletion) this.pendingDeletes.delete(deletion);
         }
       },
       onStart: (operation) => {
-        handledOperation = operation.catch(reportFailure);
+        deletion = operation;
+        state.operation = operation;
+        this.pendingDeletes.add(operation);
+        void operation.catch((error: unknown) => {
+          logger.debug(
+            { name: this.opts.name, err: errorMessage(error) },
+            state.logMessage
+          );
+        });
       },
     };
-    const disposition = requestProcessPathDelete(dataPath, request);
+    state.processDeleteRequest = request;
+    const disposition = requestProcessPathDelete(state.path, request);
+    if (disposition.status === 'existing') {
+      state.processDeleteRequest = undefined;
+      // Retain this cache's local retry state. The existing process owner may
+      // fail or disappear; a later flush/clear/close safely retries or observes
+      // ENOENT after the winning deletion succeeds.
+      return Promise.resolve();
+    }
     return disposition.status === 'started'
-      ? (handledOperation ?? disposition.operation.catch(reportFailure))
+      ? disposition.operation
       : Promise.resolve();
   }
 
@@ -1602,8 +1667,13 @@ export class DiskBackedCache<V> {
     this.mem.clear();
     this.memBytes = 0;
     this.cancelIndexFlushTimer();
+    // Cleanup states created by mutations that cross this clear are retained
+    // for a later explicit retry. Existing orphan retries are part of this
+    // clear operation, while a newly stale destination gets one mutation-
+    // release attempt without an immediate duplicate retry in the same clear.
+    const unindexedDeletesAtStart = [...this.unindexedDeletes.values()];
     let operation: Promise<void>;
-    operation = this.clearOnce().finally(() => {
+    operation = this.clearOnce(unindexedDeletesAtStart).finally(() => {
       if (this.clearPromise === operation) {
         this.clearPromise = undefined;
         this.clearing = false;
@@ -1613,7 +1683,9 @@ export class DiskBackedCache<V> {
     return operation;
   }
 
-  private async clearOnce(): Promise<void> {
+  private async clearOnce(
+    unindexedDeletesAtStart: readonly UnindexedDeleteState[]
+  ): Promise<void> {
     await this.ready.catch(() => undefined);
     this.cancelIndexFlushTimer();
     await Promise.allSettled([...this.pendingPreparedCreations]);
@@ -1627,7 +1699,7 @@ export class DiskBackedCache<V> {
     for (const fileKey of [...this.disk.keys()]) this.dropDisk(fileKey);
     let deleteError: unknown;
     try {
-      await this.retryPendingPhysicalDeletes();
+      await this.retryPendingPhysicalDeletes(unindexedDeletesAtStart);
     } catch (error) {
       deleteError = error;
     }
@@ -1837,11 +1909,20 @@ export class DiskBackedCache<V> {
     );
   }
 
-  private async retryPendingPhysicalDeletes(): Promise<void> {
+  private async retryPendingPhysicalDeletes(
+    unindexedStates: readonly UnindexedDeleteState[] = [
+      ...this.unindexedDeletes.values(),
+    ]
+  ): Promise<void> {
     const retries = new Set<Promise<void>>(this.pendingDeletes);
     for (const [fileKey, state] of this.fileLeases) {
       if (state.pendingDelete && state.leases === 0) {
         retries.add(this.startPhysicalDelete(fileKey, state));
+      }
+    }
+    for (const state of unindexedStates) {
+      if (this.unindexedDeletes.get(state.path) === state) {
+        retries.add(this.startUnindexedPathDelete(state));
       }
     }
     const results = await Promise.allSettled(retries);
