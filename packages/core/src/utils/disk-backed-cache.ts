@@ -160,7 +160,7 @@ interface FileLeaseState {
   leases: number;
   pendingDelete: boolean;
   deletePromise?: Promise<void>;
-  processDeleteRequest?: ProcessPathDeleteRequest;
+  deleteIntent?: ProcessPathDeleteIntent;
 }
 
 interface UnindexedDeleteState {
@@ -168,7 +168,7 @@ interface UnindexedDeleteState {
   readonly path: string;
   readonly logMessage: string;
   operation?: Promise<void>;
-  processDeleteRequest?: ProcessPathDeleteRequest;
+  deleteIntent?: ProcessPathDeleteIntent;
   lastError?: unknown;
 }
 
@@ -213,11 +213,22 @@ interface ProcessPathDeleteRequest {
   onStart(operation: Promise<void>): void;
 }
 
+interface ProcessPathDeleteIntent {
+  /** Immutable incarnation token; object identity is never inferred from path. */
+  readonly id: symbol;
+  /** Resolves exactly once after rm success or confirmed ENOENT. */
+  readonly completion: Promise<void>;
+  readonly resolveCompletion: () => void;
+  status: 'unresolved' | 'resolved';
+  attempt?: Promise<void>;
+  pendingAttempt?: ProcessPathDeleteRequest;
+  lastError?: unknown;
+}
+
 interface ProcessPathOwnershipState {
   leases: number;
   mutationClaimed: boolean;
-  activeDelete: boolean;
-  pendingDelete?: ProcessPathDeleteRequest;
+  deleteIntent?: ProcessPathDeleteIntent;
 }
 
 interface ProcessPathMutationClaim {
@@ -225,19 +236,27 @@ interface ProcessPathMutationClaim {
 }
 
 interface ProcessPathLeaseRelease {
-  readonly deletionStarted: boolean;
   readonly completion: Promise<void>;
 }
 
-type ProcessPathDeleteDisposition =
-  | { readonly status: 'pending' | 'existing' }
-  | { readonly status: 'started'; readonly operation: Promise<void> };
+interface ProcessPathDeleteRegistration {
+  readonly intent: ProcessPathDeleteIntent;
+  /** Present only when this exact request started the process-wide attempt. */
+  readonly startedOperation?: Promise<void>;
+}
+
+interface ProcessPathDeleteAttemptResult {
+  readonly operation?: Promise<void>;
+  readonly started: boolean;
+}
 
 /**
  * Process-local ownership shared across cache re-instantiation. Synchronous
- * lease/mutation claims are the linearization points; async filesystem work is
- * only started while the matching path remains exclusively mutation-claimed.
- * A path owns at most one active or pending delete; no waiter queue is kept.
+ * lease/mutation claims and delete-intent publication are the linearization
+ * points. A transient filesystem failure retains the same incarnation token,
+ * blocks every new lease/mutation, and is retried only by an explicit caller.
+ * Shared completion resolves only after final success/ENOENT, allowing every
+ * bounded local participant to discard its state without a blind path retry.
  */
 const processPathOwnership = new Map<string, ProcessPathOwnershipState>();
 
@@ -252,7 +271,6 @@ function getProcessPathState(filePath: string): ProcessPathOwnershipState {
   const created: ProcessPathOwnershipState = {
     leases: 0,
     mutationClaimed: false,
-    activeDelete: false,
   };
   processPathOwnership.set(resolved, created);
   return created;
@@ -265,42 +283,75 @@ function cleanupProcessPathState(
   if (
     state.leases === 0 &&
     !state.mutationClaimed &&
-    !state.activeDelete &&
-    !state.pendingDelete &&
+    !state.deleteIntent &&
     processPathOwnership.get(resolved) === state
   ) {
     processPathOwnership.delete(resolved);
   }
 }
 
-function startPendingProcessPathDelete(
+function startProcessPathDeleteAttempt(
   resolved: string,
-  state: ProcessPathOwnershipState
-): Promise<void> {
-  const request = state.pendingDelete;
-  if (!request || state.leases > 0 || state.mutationClaimed) {
-    return Promise.resolve();
+  state: ProcessPathOwnershipState,
+  intent: ProcessPathDeleteIntent,
+  request?: ProcessPathDeleteRequest
+): ProcessPathDeleteAttemptResult {
+  if (state.deleteIntent?.id !== intent.id || intent.status === 'resolved') {
+    return { started: false };
   }
-  state.pendingDelete = undefined;
-  state.mutationClaimed = true;
-  state.activeDelete = true;
-  const operation = Promise.resolve()
-    .then(() => request.run())
-    .finally(async () => {
-      state.activeDelete = false;
-      state.mutationClaimed = false;
-      if (state.pendingDelete && state.leases === 0) {
-        await startPendingProcessPathDelete(resolved, state);
+  if (intent.attempt) {
+    return { operation: intent.attempt, started: false };
+  }
+  if (state.leases > 0 || state.mutationClaimed) {
+    return { started: false };
+  }
+  if (request && intent.lastError !== undefined) {
+    // A caller explicitly retrying a failed intent supplies the next bounded
+    // attempt. Before the first attempt, the original publisher remains owner
+    // so a later lease release has a deterministic executor.
+    intent.pendingAttempt = request;
+  }
+  const selectedRequest = intent.pendingAttempt;
+  if (!selectedRequest) {
+    throw new Error('Disk cache delete-attempt invariant violated');
+  }
+  let operation: Promise<void>;
+  operation = Promise.resolve()
+    .then(() => selectedRequest.run())
+    .then(
+      () => {
+        if (
+          state.deleteIntent?.id !== intent.id ||
+          intent.status === 'resolved'
+        ) {
+          return;
+        }
+        // Delete success is the incarnation transition: remove the tombstone
+        // before resolving shared completion. Every stale local participant
+        // still holds this resolved token and therefore cannot create a new rm.
+        intent.status = 'resolved';
+        intent.lastError = undefined;
+        intent.pendingAttempt = undefined;
+        state.deleteIntent = undefined;
+        intent.resolveCompletion();
+      },
+      (error: unknown) => {
+        intent.lastError = error;
+        throw error;
       }
+    )
+    .finally(() => {
+      if (intent.attempt === operation) intent.attempt = undefined;
       cleanupProcessPathState(resolved, state);
     });
-  request.onStart(operation);
-  return operation;
+  intent.attempt = operation;
+  selectedRequest.onStart(operation);
+  return { operation, started: true };
 }
 
 function tryAcquireProcessPathLease(filePath: string): boolean {
   const state = getProcessPathState(filePath);
-  if (state.mutationClaimed || state.pendingDelete) return false;
+  if (state.mutationClaimed || state.deleteIntent) return false;
   state.leases++;
   return true;
 }
@@ -312,14 +363,16 @@ function releaseProcessPathLease(filePath: string): ProcessPathLeaseRelease {
     throw new Error('Disk cache process lease accounting invariant violated');
   }
   state.leases--;
-  if (state.leases === 0 && state.pendingDelete && !state.mutationClaimed) {
-    return {
-      deletionStarted: true,
-      completion: startPendingProcessPathDelete(resolved, state),
-    };
+  if (state.leases === 0 && state.deleteIntent && !state.mutationClaimed) {
+    const result = startProcessPathDeleteAttempt(
+      resolved,
+      state,
+      state.deleteIntent
+    );
+    return { completion: result.operation ?? Promise.resolve() };
   }
   cleanupProcessPathState(resolved, state);
-  return { deletionStarted: false, completion: Promise.resolve() };
+  return { completion: Promise.resolve() };
 }
 
 function tryClaimProcessPathMutation(
@@ -327,12 +380,7 @@ function tryClaimProcessPathMutation(
 ): ProcessPathMutationClaim | undefined {
   const resolved = resolvedFilePath(filePath);
   const state = getProcessPathState(resolved);
-  if (
-    state.leases > 0 ||
-    state.mutationClaimed ||
-    state.activeDelete ||
-    state.pendingDelete
-  ) {
+  if (state.leases > 0 || state.mutationClaimed || state.deleteIntent) {
     cleanupProcessPathState(resolved, state);
     return undefined;
   }
@@ -342,10 +390,10 @@ function tryClaimProcessPathMutation(
     release: () => {
       if (releasePromise) return releasePromise;
       state.mutationClaimed = false;
-      releasePromise =
-        state.pendingDelete && state.leases === 0
-          ? startPendingProcessPathDelete(resolved, state)
-          : Promise.resolve();
+      const attempt = state.deleteIntent
+        ? startProcessPathDeleteAttempt(resolved, state, state.deleteIntent)
+        : undefined;
+      releasePromise = attempt?.operation ?? Promise.resolve();
       cleanupProcessPathState(resolved, state);
       return releasePromise;
     },
@@ -355,20 +403,54 @@ function tryClaimProcessPathMutation(
 function requestProcessPathDelete(
   filePath: string,
   request: ProcessPathDeleteRequest
-): ProcessPathDeleteDisposition {
+): ProcessPathDeleteRegistration {
   const resolved = resolvedFilePath(filePath);
   const state = getProcessPathState(resolved);
-  if (state.activeDelete || state.pendingDelete) {
-    return { status: 'existing' };
+  let intent = state.deleteIntent;
+  if (!intent) {
+    const completion = Promise.withResolvers<void>();
+    intent = {
+      id: Symbol('disk-cache-delete-intent'),
+      completion: completion.promise,
+      resolveCompletion: completion.resolve,
+      status: 'unresolved',
+      pendingAttempt: request,
+    };
+    // Synchronous publication is the delete-intent linearization point. From
+    // here until final completion both lease and mutation claims fail closed.
+    state.deleteIntent = intent;
   }
-  state.pendingDelete = request;
-  if (state.leases > 0 || state.mutationClaimed) {
-    return { status: 'pending' };
-  }
+  const result = startProcessPathDeleteAttempt(
+    resolved,
+    state,
+    intent,
+    request
+  );
   return {
-    status: 'started',
-    operation: startPendingProcessPathDelete(resolved, state),
+    intent,
+    startedOperation: result.started ? result.operation : undefined,
   };
+}
+
+function retryProcessPathDelete(
+  filePath: string,
+  intent: ProcessPathDeleteIntent,
+  request: ProcessPathDeleteRequest
+): Promise<void> | undefined {
+  if (intent.status === 'resolved') return intent.completion;
+  const resolved = resolvedFilePath(filePath);
+  const state = processPathOwnership.get(resolved);
+  if (!state || state.deleteIntent?.id !== intent.id) {
+    // An unresolved token must remain installed until its final transition.
+    throw new Error('Disk cache delete-intent invariant violated');
+  }
+  const result = startProcessPathDeleteAttempt(
+    resolved,
+    state,
+    intent,
+    request
+  );
+  return result.started ? result.operation : undefined;
 }
 
 /** Snapshot every live disk-backed cache for the dashboard cache page. */
@@ -1385,43 +1467,53 @@ export class DiskBackedCache<V> {
       return state.deletePromise ?? Promise.resolve();
     }
     state.leases--;
-    let processRelease: ProcessPathLeaseRelease | undefined;
     let processReleaseError: unknown;
     try {
-      processRelease = releaseProcessPathLease(this.filePath(fileKey));
+      const processRelease = releaseProcessPathLease(this.filePath(fileKey));
       await processRelease.completion;
     } catch (error) {
       processReleaseError = error;
     }
-    let localCleanupError: unknown;
     if (state.leases === 0) {
       if (state.pendingDelete) {
-        if (processRelease?.deletionStarted) {
-          // A process-shared delete won the final-release wakeup. Do not issue
-          // a duplicate rm. On success it satisfies this local logical delete;
-          // on failure retain our retryable state for a later flush/close.
-          if (!processReleaseError && this.fileLeases.get(fileKey) === state) {
-            this.fileLeases.delete(fileKey);
-          }
-        } else if (!processReleaseError) {
-          try {
-            await this.startPhysicalDelete(fileKey, state);
-          } catch (error) {
-            localCleanupError = error;
-          }
+        const intent = state.deleteIntent;
+        if (intent?.status === 'resolved') {
+          this.completeFileDeleteIntent(fileKey, state, intent);
         }
       } else if (this.fileLeases.get(fileKey) === state) {
         this.fileLeases.delete(fileKey);
       }
     }
-    if (processReleaseError && localCleanupError) {
-      throw new AggregateError(
-        [processReleaseError, localCleanupError],
-        'Disk cache file lease cleanup failed'
-      );
-    }
     if (processReleaseError) throw processReleaseError;
-    if (localCleanupError) throw localCleanupError;
+  }
+
+  private bindFileDeleteIntent(
+    fileKey: string,
+    state: FileLeaseState,
+    intent: ProcessPathDeleteIntent
+  ): void {
+    if (state.deleteIntent === intent) return;
+    if (state.deleteIntent && state.deleteIntent.status === 'unresolved') {
+      throw new Error('Disk cache local delete-intent invariant violated');
+    }
+    state.deleteIntent = intent;
+    void intent.completion.then(() => {
+      this.completeFileDeleteIntent(fileKey, state, intent);
+    });
+  }
+
+  private completeFileDeleteIntent(
+    fileKey: string,
+    state: FileLeaseState,
+    intent: ProcessPathDeleteIntent
+  ): void {
+    if (state.deleteIntent !== intent || intent.status !== 'resolved') return;
+    state.deleteIntent = undefined;
+    state.deletePromise = undefined;
+    state.pendingDelete = false;
+    if (state.leases === 0 && this.fileLeases.get(fileKey) === state) {
+      this.fileLeases.delete(fileKey);
+    }
   }
 
   private startPhysicalDelete(
@@ -1429,36 +1521,21 @@ export class DiskBackedCache<V> {
     state: FileLeaseState
   ): Promise<void> {
     if (state.deletePromise) return state.deletePromise;
-    if (state.processDeleteRequest) return Promise.resolve();
     const dataPath = this.filePath(fileKey);
     let deletion: Promise<void> | undefined;
     const request: ProcessPathDeleteRequest = {
       run: async () => {
-        let removed = false;
         try {
           await this.fileSystem.rm(dataPath, { force: true });
-          removed = true;
         } catch (error) {
           logger.debug(
             { name: this.opts.name, err: errorMessage(error) },
             'disk cache deferred delete failed'
           );
-          if (nodeErrorCode(error) === 'ENOENT') {
-            removed = true;
-          } else {
-            throw error;
-          }
+          if (nodeErrorCode(error) !== 'ENOENT') throw error;
         } finally {
-          state.deletePromise = undefined;
-          if (state.processDeleteRequest === request) {
-            state.processDeleteRequest = undefined;
-          }
-          if (
-            removed &&
-            this.fileLeases.get(fileKey) === state &&
-            state.leases === 0
-          ) {
-            this.fileLeases.delete(fileKey);
+          if (state.deletePromise === deletion) {
+            state.deletePromise = undefined;
           }
           if (deletion) this.pendingDeletes.delete(deletion);
         }
@@ -1473,21 +1550,20 @@ export class DiskBackedCache<V> {
         void operation.catch(() => undefined);
       },
     };
-    state.processDeleteRequest = request;
-    const disposition = requestProcessPathDelete(dataPath, request);
-    if (disposition.status === 'existing') {
-      state.processDeleteRequest = undefined;
-      // Exactly one process-local request owns physical deletion. This local
-      // zero-lease bookkeeping may be discarded; the registered owner retains
-      // retry state if its attempt fails.
-      if (this.fileLeases.get(fileKey) === state && state.leases === 0) {
-        this.fileLeases.delete(fileKey);
-      }
-      return Promise.resolve();
+    const currentIntent = state.deleteIntent;
+    if (currentIntent?.status === 'resolved') {
+      this.completeFileDeleteIntent(fileKey, state, currentIntent);
+      return currentIntent.completion;
     }
-    return disposition.status === 'started'
-      ? disposition.operation
-      : Promise.resolve();
+    if (currentIntent) {
+      return (
+        retryProcessPathDelete(dataPath, currentIntent, request) ??
+        Promise.resolve()
+      );
+    }
+    const registration = requestProcessPathDelete(dataPath, request);
+    this.bindFileDeleteIntent(fileKey, state, registration.intent);
+    return registration.startedOperation ?? Promise.resolve();
   }
 
   private scheduleUnindexedPathDelete(
@@ -1497,6 +1573,10 @@ export class DiskBackedCache<V> {
     const dataPath = this.filePath(fileKey);
     const resolvedPath = resolvedFilePath(dataPath);
     let state = this.unindexedDeletes.get(resolvedPath);
+    if (state?.deleteIntent?.status === 'resolved') {
+      this.completeUnindexedDeleteIntent(state, state.deleteIntent);
+      state = undefined;
+    }
     if (!state) {
       state = {
         fileKey,
@@ -1510,30 +1590,18 @@ export class DiskBackedCache<V> {
 
   private startUnindexedPathDelete(state: UnindexedDeleteState): Promise<void> {
     if (state.operation) return state.operation;
-    if (state.processDeleteRequest) return Promise.resolve();
     let deletion: Promise<void> | undefined;
     const request: ProcessPathDeleteRequest = {
       run: async () => {
-        let removed = false;
         try {
           await this.fileSystem.rm(state.path, { force: true });
-          removed = true;
         } catch (error) {
-          if (nodeErrorCode(error) === 'ENOENT') {
-            removed = true;
-          } else {
+          if (nodeErrorCode(error) !== 'ENOENT') {
             state.lastError = error;
             throw error;
           }
         } finally {
-          state.operation = undefined;
-          if (state.processDeleteRequest === request) {
-            state.processDeleteRequest = undefined;
-          }
-          if (removed && this.unindexedDeletes.get(state.path) === state) {
-            state.lastError = undefined;
-            this.unindexedDeletes.delete(state.path);
-          }
+          if (state.operation === deletion) state.operation = undefined;
           if (deletion) this.pendingDeletes.delete(deletion);
         }
       },
@@ -1549,18 +1617,47 @@ export class DiskBackedCache<V> {
         });
       },
     };
-    state.processDeleteRequest = request;
-    const disposition = requestProcessPathDelete(state.path, request);
-    if (disposition.status === 'existing') {
-      state.processDeleteRequest = undefined;
-      // Retain this cache's local retry state. The existing process owner may
-      // fail or disappear; a later flush/clear/close safely retries or observes
-      // ENOENT after the winning deletion succeeds.
-      return Promise.resolve();
+    const currentIntent = state.deleteIntent;
+    if (currentIntent?.status === 'resolved') {
+      this.completeUnindexedDeleteIntent(state, currentIntent);
+      return currentIntent.completion;
     }
-    return disposition.status === 'started'
-      ? disposition.operation
-      : Promise.resolve();
+    if (currentIntent) {
+      return (
+        retryProcessPathDelete(state.path, currentIntent, request) ??
+        Promise.resolve()
+      );
+    }
+    const registration = requestProcessPathDelete(state.path, request);
+    this.bindUnindexedDeleteIntent(state, registration.intent);
+    return registration.startedOperation ?? Promise.resolve();
+  }
+
+  private bindUnindexedDeleteIntent(
+    state: UnindexedDeleteState,
+    intent: ProcessPathDeleteIntent
+  ): void {
+    if (state.deleteIntent === intent) return;
+    if (state.deleteIntent && state.deleteIntent.status === 'unresolved') {
+      throw new Error('Disk cache orphan delete-intent invariant violated');
+    }
+    state.deleteIntent = intent;
+    void intent.completion.then(() => {
+      this.completeUnindexedDeleteIntent(state, intent);
+    });
+  }
+
+  private completeUnindexedDeleteIntent(
+    state: UnindexedDeleteState,
+    intent: ProcessPathDeleteIntent
+  ): void {
+    if (state.deleteIntent !== intent || intent.status !== 'resolved') return;
+    state.deleteIntent = undefined;
+    state.operation = undefined;
+    state.lastError = undefined;
+    if (this.unindexedDeletes.get(state.path) === state) {
+      this.unindexedDeletes.delete(state.path);
+    }
   }
 
   private isCurrentGeneration(generation: number): boolean {

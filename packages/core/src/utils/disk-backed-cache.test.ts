@@ -1686,6 +1686,96 @@ test('process delete waits for every old lease while rejecting a third', async (
   await reader.clear();
 });
 
+test('failed indexed delete fences leases and writes until one shared retry completes', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-intent-retry-'));
+  // This writer intentionally loads the empty incarnation before the old
+  // indexed file appears, so its writes exercise the process fence rather than
+  // a stale local index hit.
+  const writer = createCache(context, root, { maxDiskBytes: 16 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await writer.whenReady();
+  const { dataPath } = await writePersistentEntry(
+    root,
+    'intent-retry',
+    Buffer.from('old!')
+  );
+  let deleteCalls = 0;
+  const owner = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath && ++deleteCalls === 1) {
+          throw codedError('EBUSY');
+        }
+        return rm(candidate, options);
+      },
+    },
+  });
+  const observer = createCache(context, root, { maxDiskBytes: 16 });
+  await Promise.all([owner.whenReady(), observer.whenReady()]);
+
+  const oldLease = await owner.acquireDiskFile('intent-retry');
+  assert(oldLease);
+  assert.equal(await owner.delete('intent-retry'), true);
+  await assert.rejects(oldLease.release(), { code: 'EBUSY' });
+  assert.equal(deleteCalls, 1);
+  assert.equal((await readFile(dataPath)).toString(), 'old!');
+
+  assert.equal(await observer.acquireDiskFile('intent-retry'), undefined);
+  assert.deepEqual(
+    {
+      hits: observer.stats().hits,
+      misses: observer.stats().misses,
+      diskHits: observer.stats().diskHits,
+    },
+    { hits: 0, misses: 0, diskHits: 0 }
+  );
+  assert.equal(
+    await writer.installPreparedFile(
+      'intent-retry',
+      await prepared(writer, Buffer.from('blocked-prepared')),
+      16
+    ),
+    false
+  );
+  writer.set('intent-retry', Buffer.from('blocked-write'));
+  await writer.flush();
+  assert.equal(writer.stats().diskCount, 0);
+  assert.equal((await readFile(dataPath)).toString(), 'old!');
+
+  await owner.flush();
+  assert.equal(deleteCalls, 2);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  assert.equal(
+    await writer.installPreparedFile(
+      'intent-retry',
+      await prepared(writer, Buffer.from('new!')),
+      4
+    ),
+    true
+  );
+
+  // Every old participant has observed final completion. Repeated cleanup
+  // cannot turn the resolved old token into a delete for the new incarnation.
+  await owner.flush();
+  await observer.flush();
+  await owner.close();
+  await observer.close();
+  assert.equal(deleteCalls, 2);
+  const newLease = await writer.acquireDiskFile('intent-retry');
+  assert(newLease);
+  assert.equal((await readFile(newLease.path)).toString(), 'new!');
+  await newLease.release();
+  assert.deepEqual(
+    {
+      diskBytes: writer.stats().diskBytes,
+      diskCount: writer.stats().diskCount,
+    },
+    { diskBytes: 4, diskCount: 1 }
+  );
+  await writer.close();
+});
+
 test('startup orphan cleanup survives EBUSY and succeeds on flush', async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-orphan-retry-'));
   const directory = path.join(root, 'test-cache');
@@ -1755,10 +1845,98 @@ test('startup orphan wake failure remains fenced and retryable after foreign rel
   await assert.rejects(lease.release(), { code: 'EBUSY' });
   assert.equal(deleteCalls, 1);
   await access(dataPath);
+  assert.equal(await reader.acquireDiskFile('orphan-wake'), undefined);
+  assert.deepEqual(
+    {
+      hits: reader.stats().hits,
+      misses: reader.stats().misses,
+      diskHits: reader.stats().diskHits,
+    },
+    { hits: 0, misses: 0, diskHits: 0 }
+  );
   await recovering.flush();
   assert.equal(deleteCalls, 2);
   await assert.rejects(access(dataPath), { code: 'ENOENT' });
   await reader.clear();
+});
+
+test('a new cache retries an owner-closed intent after the final lease fails', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-owner-close-'));
+  const { dataPath } = await writePersistentEntry(
+    root,
+    'owner-close',
+    Buffer.from('old!')
+  );
+  let ownerDeleteCalls = 0;
+  const owner = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath) {
+          ownerDeleteCalls++;
+          throw codedError('EBUSY');
+        }
+        return rm(candidate, options);
+      },
+    },
+  });
+  const reader = createCache(context, root, { maxDiskBytes: 16 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await Promise.all([owner.whenReady(), reader.whenReady()]);
+  const lease = await reader.acquireDiskFile('owner-close');
+  assert(lease);
+
+  await owner.clear();
+  await owner.close();
+  assert.equal(ownerDeleteCalls, 0);
+  await assert.rejects(lease.release(), { code: 'EBUSY' });
+  assert.equal(ownerDeleteCalls, 1);
+  await access(dataPath);
+  assert.equal(await reader.acquireDiskFile('owner-close'), undefined);
+  assert.deepEqual(
+    {
+      hits: reader.stats().hits,
+      misses: reader.stats().misses,
+      diskHits: reader.stats().diskHits,
+    },
+    { hits: 0, misses: 0, diskHits: 0 }
+  );
+
+  // With the index removed by clear(), startup discovers the same physical
+  // orphan and explicitly retries the still-unresolved shared intent.
+  let recoveryDeleteCalls = 0;
+  const recovering = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath) recoveryDeleteCalls++;
+        return rm(candidate, options);
+      },
+    },
+  });
+  await recovering.whenReady();
+  assert.equal(recoveryDeleteCalls, 1);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  assert.equal(
+    await recovering.installPreparedFile(
+      'owner-close',
+      await prepared(recovering, Buffer.from('new!')),
+      4
+    ),
+    true
+  );
+
+  await owner.close();
+  await owner.flush();
+  await reader.flush();
+  await reader.close();
+  assert.equal(ownerDeleteCalls, 1);
+  assert.equal(recoveryDeleteCalls, 1);
+  const newLease = await recovering.acquireDiskFile('owner-close');
+  assert(newLease);
+  assert.equal((await readFile(newLease.path)).toString(), 'new!');
+  await newLease.release();
+  await recovering.close();
 });
 
 test('close reports a persistently failing startup orphan delete', async (context) => {
@@ -1849,10 +2027,32 @@ test('two startup scans coalesce orphan removal without concurrent rm', async (c
   await assert.rejects(access(dataPath), { code: 'ENOENT' });
 
   await second.flush();
-  assert.equal(deleteCalls, 2);
+  assert.equal(deleteCalls, 1);
   assert.equal(peakDeletes, 1);
+  assert.equal(
+    await second.installPreparedFile(
+      'orphan-pair',
+      await prepared(second, Buffer.from('new!')),
+      4
+    ),
+    true
+  );
+  await first.flush();
   await second.flush();
-  assert.equal(deleteCalls, 2);
+  await first.close();
+  assert.equal(deleteCalls, 1);
+  const lease = await second.acquireDiskFile('orphan-pair');
+  assert(lease);
+  assert.equal((await readFile(lease.path)).toString(), 'new!');
+  await lease.release();
+  assert.deepEqual(
+    {
+      diskBytes: second.stats().diskBytes,
+      diskCount: second.stats().diskCount,
+    },
+    { diskBytes: 4, diskCount: 1 }
+  );
+  await second.close();
 });
 
 test('stale background destination cleanup remains retryable after clear', async (context) => {
@@ -1883,8 +2083,9 @@ test('stale background destination cleanup remains retryable after clear', async
       },
     },
   });
+  const writer = createCache(context, root, { maxDiskBytes: 16 });
   context.after(() => rm(root, { recursive: true, force: true }));
-  await cache.whenReady();
+  await Promise.all([cache.whenReady(), writer.whenReady()]);
 
   cache.set('stale-background', Buffer.from('data'));
   await renamed.promise;
@@ -1895,9 +2096,22 @@ test('stale background destination cleanup remains retryable after clear', async
   await access(destination);
   assert.equal(cache.stats().diskCount, 0);
 
+  writer.set('stale-background', Buffer.from('blocked'));
+  await writer.flush();
+  assert.equal(writer.stats().diskCount, 0);
+  assert.equal((await readFile(destination)).toString(), 'data');
+
   await cache.flush();
   assert.equal(deleteCalls, 2);
   await assert.rejects(access(destination), { code: 'ENOENT' });
+  writer.set('stale-background', Buffer.from('fresh'));
+  await writer.flush();
+  await cache.flush();
+  assert.equal(deleteCalls, 2);
+  const lease = await writer.acquireDiskFile('stale-background');
+  assert(lease);
+  assert.equal((await readFile(lease.path)).toString(), 'fresh');
+  await lease.release();
 });
 
 test('stale prepared destination cleanup remains retryable after clear', async (context) => {
@@ -1924,8 +2138,9 @@ test('stale prepared destination cleanup remains retryable after clear', async (
       },
     },
   });
+  const writer = createCache(context, root, { maxDiskBytes: 16 });
   context.after(() => rm(root, { recursive: true, force: true }));
-  await cache.whenReady();
+  await Promise.all([cache.whenReady(), writer.whenReady()]);
 
   const install = cache.installPreparedFile(
     'stale-prepared',
@@ -1941,7 +2156,31 @@ test('stale prepared destination cleanup remains retryable after clear', async (
   await access(destination);
   assert.equal(cache.stats().diskCount, 0);
 
+  assert.equal(
+    await writer.installPreparedFile(
+      'stale-prepared',
+      await prepared(writer, Buffer.from('nope')),
+      4
+    ),
+    false
+  );
+  assert.equal((await readFile(destination)).toString(), 'data');
+
   await cache.flush();
   assert.equal(deleteCalls, 2);
   await assert.rejects(access(destination), { code: 'ENOENT' });
+  assert.equal(
+    await writer.installPreparedFile(
+      'stale-prepared',
+      await prepared(writer, Buffer.from('fresh')),
+      5
+    ),
+    true
+  );
+  await cache.flush();
+  assert.equal(deleteCalls, 2);
+  const lease = await writer.acquireDiskFile('stale-prepared');
+  assert(lease);
+  assert.equal((await readFile(lease.path)).toString(), 'fresh');
+  await lease.release();
 });
