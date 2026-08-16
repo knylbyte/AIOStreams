@@ -43,6 +43,10 @@ export interface SpoolingSegmentsStreamOptions {
   readonly readerHighWaterMarkBytes: number;
   /** Additional bounded relay queue owned by a wrapping FileStream. */
   readonly relayHighWaterMarkBytes?: number;
+  /** Exact logical offset of local segment zero in the containing file. */
+  readonly firstSegmentStartByte?: number;
+  /** Exact logical end of the containing file. */
+  readonly fileEndByte?: number;
   /** Bytes discarded from the first relevant artifact. */
   readonly skipBytes?: number;
   /** Exact post-skip output cap. */
@@ -152,6 +156,8 @@ export class SpoolingSegmentsStream extends Readable {
   private streamLifecycleEnded = false;
   private streamLeaseRetained = false;
   private artifactLayout: 'global-range' | 'standalone-part' | undefined;
+  private nextLogicalStart: number | undefined;
+  private readonly fileEndByte: number | undefined;
 
   constructor(options: SpoolingSegmentsStreamOptions) {
     if (!isPositiveSafeInteger(options.maxPrefetchSegments)) {
@@ -169,6 +175,20 @@ export class SpoolingSegmentsStream extends Readable {
       throw new RangeError(
         'Spooling relay high-water mark must be a safe positive integer'
       );
+    }
+    if (
+      options.firstSegmentStartByte !== undefined &&
+      !isNonNegativeSafeInteger(options.firstSegmentStartByte)
+    ) {
+      throw new RangeError(
+        'Spooling first-segment start must be a safe non-negative integer'
+      );
+    }
+    if (
+      options.fileEndByte !== undefined &&
+      !isPositiveSafeInteger(options.fileEndByte)
+    ) {
+      throw new RangeError('Spooling file end must be a safe positive integer');
     }
     const streamMemoryBytes = resolveSegmentStreamMemoryBytes(
       options.readerHighWaterMarkBytes,
@@ -205,6 +225,8 @@ export class SpoolingSegmentsStream extends Readable {
     this.onHole = options.onHole;
     this.knownHoles = options.knownHoles;
     this.initialArtifact = options.initialArtifact;
+    this.nextLogicalStart = options.firstSegmentStartByte;
+    this.fileEndByte = options.fileEndByte;
     this.skipRemaining = skipBytes;
     this.limitRemaining = limitBytes;
 
@@ -400,7 +422,7 @@ export class SpoolingSegmentsStream extends Readable {
       return;
     }
     try {
-      this.acceptArtifactLayout(artifact);
+      this.acceptArtifactLayout(task, artifact);
     } catch (error) {
       this.destroy(error instanceof Error ? error : new Error(String(error)));
       return;
@@ -408,8 +430,23 @@ export class SpoolingSegmentsStream extends Readable {
     this.startArtifactReader(task, artifact);
   }
 
-  private acceptArtifactLayout(artifact: SegmentArtifact): void {
-    if (artifact.storage === 'zero') return;
+  private acceptArtifactLayout(
+    task: PlannedSegment,
+    artifact: SegmentArtifact
+  ): void {
+    if (artifact.storage === 'zero') {
+      const exactRange = this.byteRangeForSegment?.(task.idx);
+      if (exactRange) {
+        this.assertGlobalRangeTopology(task.idx, exactRange, artifact.length);
+      } else if (this.nextLogicalStart !== undefined) {
+        const next = this.nextLogicalStart + artifact.length;
+        if (!Number.isSafeInteger(next)) {
+          throw this.inconsistentLayout('Segment offsets exceed safe integers');
+        }
+        this.nextLogicalStart = next;
+      }
+      return;
+    }
     const range = artifact.metadata.byteRange;
     const layout = range ? 'global-range' : 'standalone-part';
     if (
@@ -424,14 +461,62 @@ export class SpoolingSegmentsStream extends Readable {
     }
     if (this.artifactLayout === undefined) {
       this.artifactLayout = layout;
-      return;
-    }
-    if (this.artifactLayout !== layout) {
-      throw new YencMetadataError(
-        'inconsistent_layout',
+    } else if (this.artifactLayout !== layout) {
+      throw this.inconsistentLayout(
         'Logical file mixes global yEnc ranges with standalone parts'
       );
     }
+    if (range) {
+      this.assertGlobalRangeTopology(task.idx, range, artifact.length);
+      return;
+    }
+    if (this.nextLogicalStart !== undefined) {
+      const next = this.nextLogicalStart + artifact.length;
+      if (!Number.isSafeInteger(next)) {
+        throw this.inconsistentLayout('Segment offsets exceed safe integers');
+      }
+      this.nextLogicalStart = next;
+    }
+  }
+
+  private assertGlobalRangeTopology(
+    index: number,
+    range: readonly [number, number],
+    artifactLength: number
+  ): void {
+    const [begin, end] = range;
+    if (
+      !isNonNegativeSafeInteger(begin) ||
+      !isPositiveSafeInteger(end) ||
+      end <= begin ||
+      end - begin !== artifactLength
+    ) {
+      throw this.inconsistentLayout(
+        'Global yEnc range does not match the decoded segment length'
+      );
+    }
+    if (
+      this.nextLogicalStart !== undefined &&
+      begin !== this.nextLogicalStart
+    ) {
+      throw this.inconsistentLayout(
+        'Global yEnc ranges contain a leading gap, gap, or overlap'
+      );
+    }
+    if (
+      this.fileEndByte !== undefined &&
+      (end > this.fileEndByte ||
+        (index === this.segments.length - 1 && end !== this.fileEndByte))
+    ) {
+      throw this.inconsistentLayout(
+        'Global yEnc ranges do not end at the exact file boundary'
+      );
+    }
+    this.nextLogicalStart = end;
+  }
+
+  private inconsistentLayout(message: string): YencMetadataError {
+    return new YencMetadataError('inconsistent_layout', message);
   }
 
   private startArtifactReader(

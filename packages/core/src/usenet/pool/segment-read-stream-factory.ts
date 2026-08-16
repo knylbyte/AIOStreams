@@ -29,6 +29,10 @@ export interface CommonSegmentReadOptions {
   readonly spoolingReaderHighWaterMarkBytes?: number;
   /** FileStream relay threshold; omitted for a direct two-queue spool stream. */
   readonly spoolingRelayHighWaterMarkBytes?: number;
+  /** Exact logical offset expected for the first selected segment. */
+  readonly spoolingFirstSegmentStartByte?: number;
+  /** Exact logical file end used when the final segment is reached. */
+  readonly spoolingFileEndByte?: number;
   readonly skipBytes?: number;
   readonly limitBytes?: number;
   readonly priority: CommandPriority;
@@ -92,6 +96,8 @@ export function createSegmentReadStream(
     maxPrefetchSegments: options.maxPrefetchSegments,
     readerHighWaterMarkBytes: readerQueue.highWaterMarkBytes,
     relayHighWaterMarkBytes: relayQueue?.highWaterMarkBytes,
+    firstSegmentStartByte: options.spoolingFirstSegmentStartByte,
+    fileEndByte: options.spoolingFileEndByte,
     skipBytes: options.skipBytes,
     limitBytes: options.limitBytes,
     priority: options.priority,

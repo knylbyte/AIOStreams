@@ -72,7 +72,10 @@ export interface SegmentArtifact {
   readonly metadata: DecodedSegmentMetadata;
   readonly length: number;
   readonly storage: SegmentArtifactStorage;
-  /** Every emitted Buffer is bounded by `SEGMENT_STREAM_MAX_CHUNK_BYTES`. */
+  /**
+   * Every emitted Buffer is bounded by `SEGMENT_STREAM_MAX_CHUNK_BYTES` and
+   * owns no materially larger backing allocation hidden behind a short view.
+   */
   createReadStream(options?: SegmentArtifactReadOptions): Readable;
   release(): Promise<void>;
 }
@@ -147,7 +150,7 @@ class BufferRangeReadable extends Readable {
       SEGMENT_STREAM_MAX_CHUNK_BYTES,
       this.endExclusive - this.position
     );
-    const chunk = Buffer.allocUnsafe(bytes);
+    const chunk = Buffer.allocUnsafeSlow(bytes);
     this.body.copy(chunk, 0, this.position, this.position + bytes);
     this.position += bytes;
     this.push(chunk);
@@ -265,12 +268,26 @@ export class GrowingSpoolArtifactAdapter implements SegmentArtifact {
       throw new Error('Segment artifact handles support one reader');
     }
     const lengthAtOpen = this.length;
+    const byteRangeAtOpen = this.metadata.byteRange;
     validateReadRange(lengthAtOpen, options);
     const completion = this.producerCompletion?.then((metadata) => {
       if (metadata.size !== lengthAtOpen) {
         throw new UsenetSpoolError(
           'USENET_SPOOL_IO',
           'Decoded segment length differs from the exact file range'
+        );
+      }
+      const finalByteRange = metadata.byteRange;
+      if (
+        (byteRangeAtOpen === undefined) !== (finalByteRange === undefined) ||
+        (byteRangeAtOpen !== undefined &&
+          finalByteRange !== undefined &&
+          (finalByteRange[0] !== byteRangeAtOpen[0] ||
+            finalByteRange[1] !== byteRangeAtOpen[1]))
+      ) {
+        throw new UsenetSpoolError(
+          'USENET_SPOOL_METADATA_MISMATCH',
+          'Decoded segment metadata changed after reader publication'
         );
       }
     });

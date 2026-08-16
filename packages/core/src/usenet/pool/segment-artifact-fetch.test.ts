@@ -235,7 +235,8 @@ class LateFailoverSegmentFetcher extends FakeSegmentFetcher {
   constructor(
     private readonly targetMessageId: string,
     private readonly firstPrefix: Buffer,
-    private readonly successfulBody: Buffer
+    private readonly successfulBody: Buffer,
+    private readonly byteRangeStart = 0
   ) {
     super();
   }
@@ -260,12 +261,12 @@ class LateFailoverSegmentFetcher extends FakeSegmentFetcher {
     }
     this.streamingCalls++;
     const byteRange: readonly [number, number] = [
-      0,
-      this.successfulBody.length,
+      this.byteRangeStart,
+      this.byteRangeStart + this.successfulBody.length,
     ];
     const header = {
       byteRange,
-      fileSize: this.successfulBody.length,
+      fileSize: byteRange[1],
       totalParts: 1,
       name: 'failover.bin',
       expectedSize: this.successfulBody.length,
@@ -292,8 +293,8 @@ class LateFailoverSegmentFetcher extends FakeSegmentFetcher {
     return {
       value: second.value,
       metadata: {
-        byteRange: [0, this.successfulBody.length],
-        fileSize: this.successfulBody.length,
+        byteRange,
+        fileSize: byteRange[1],
         totalParts: 1,
         name: 'failover.bin',
         size: this.successfulBody.length,
@@ -1103,7 +1104,8 @@ test('a future SpoolingSegmentsStream task waits for complete provider failover'
   const fetcher = new LateFailoverSegmentFetcher(
     'future-stream-segment',
     Buffer.from('x'),
-    Buffer.from('1111')
+    Buffer.from('1111'),
+    4
   );
   const currentGate = Promise.withResolvers<void>();
   fetcher.behaviors.set('current-stream-segment', {

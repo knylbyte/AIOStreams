@@ -28,7 +28,9 @@ function isPositiveSafeInteger(value: number): boolean {
 /**
  * Range-aware reader for a file whose committed prefix grows over time.
  * Reads never cross the source's `committedBytes`; when caught up, the reader
- * waits on an abortable source notification instead of polling.
+ * waits on an abortable source notification instead of polling. Each output
+ * chunk owns one exact, unpooled allocation and bounded short reads fill that
+ * same target before it becomes visible to the Readable queue.
  */
 export class GrowingFileReader extends Readable {
   private readonly source: GrowingReadableSource;
@@ -170,7 +172,10 @@ export class GrowingFileReader extends Readable {
       const readableEnd = Math.min(snapshot.committedBytes, rangeEnd);
       if (this.position < readableEnd) {
         const size = Math.min(this.readBytes, readableEnd - this.position);
-        const buffer = Buffer.allocUnsafe(size);
+        // An unpooled target owns exactly `size` backing bytes. Short reads are
+        // filled into this same allocation, so no tiny queued view can retain
+        // a larger temporary read buffer (or a shared slab) outside the lease.
+        const buffer = Buffer.allocUnsafeSlow(size);
         const file = this.file;
         if (!file) {
           throw new UsenetSpoolError(
@@ -178,19 +183,35 @@ export class GrowingFileReader extends Readable {
             'Growing spool reader lost its file lease'
           );
         }
-        const result = await file.handle.read(buffer, 0, size, this.position);
-        if (
-          !Number.isSafeInteger(result.bytesRead) ||
-          result.bytesRead <= 0 ||
-          result.bytesRead > size
-        ) {
-          throw new UsenetSpoolError(
-            'USENET_SPOOL_IO',
-            'Committed spool data is missing or truncated'
+        let filledBytes = 0;
+        while (filledBytes < size) {
+          if (this.destroyed || this.controller.signal.aborted) {
+            throw spoolAbortError(this.controller.signal.reason);
+          }
+          const remainingBytes = size - filledBytes;
+          const result = await file.handle.read(
+            buffer,
+            filledBytes,
+            remainingBytes,
+            this.position + filledBytes
           );
+          if (
+            !Number.isSafeInteger(result.bytesRead) ||
+            result.bytesRead <= 0 ||
+            result.bytesRead > remainingBytes
+          ) {
+            throw new UsenetSpoolError(
+              'USENET_SPOOL_IO',
+              'Committed spool data is missing or truncated'
+            );
+          }
+          filledBytes += result.bytesRead;
         }
-        this.position += result.bytesRead;
-        if (!this.push(buffer.subarray(0, result.bytesRead))) return;
+        if (this.destroyed || this.controller.signal.aborted) {
+          throw spoolAbortError(this.controller.signal.reason);
+        }
+        this.position += size;
+        if (!this.push(buffer)) return;
         continue;
       }
 

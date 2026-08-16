@@ -88,7 +88,7 @@ interface KnownRange {
   /** Provenance keeps logical offsets separate from yEnc-assertable offsets. */
   origin:
     | 'global-yenc-range'
-    | 'global-yenc-grid'
+    | 'global-yenc-derived'
     | 'standalone-prefix'
     | 'logical-grid'
     | 'estimate';
@@ -97,15 +97,13 @@ interface KnownRange {
 function isExactSpoolingLogicalRange(range: KnownRange): boolean {
   return (
     range.origin === 'global-yenc-range' ||
-    range.origin === 'global-yenc-grid' ||
+    range.origin === 'global-yenc-derived' ||
     range.origin === 'standalone-prefix'
   );
 }
 
 function isAssertableYencRange(range: KnownRange): boolean {
-  return (
-    range.origin === 'global-yenc-range' || range.origin === 'global-yenc-grid'
-  );
+  return range.origin === 'global-yenc-range';
 }
 
 interface LocatedSegment {
@@ -580,6 +578,14 @@ export class FileStream implements SeekableStream {
                 spoolingPlan?.readerHighWaterMarkBytes,
               spoolingRelayHighWaterMarkBytes:
                 spoolingPlan?.readerHighWaterMarkBytes,
+              spoolingFirstSegmentStartByte:
+                this.resourcePlan.mode === 'segment_spooling'
+                  ? segmentStartByte
+                  : undefined,
+              spoolingFileEndByte:
+                this.resourcePlan.mode === 'segment_spooling'
+                  ? this._size
+                  : undefined,
               initialSpoolingArtifact: initialArtifact,
               skipBytes: start - segmentStartByte,
               limitBytes: length,
@@ -780,15 +786,6 @@ export class FileStream implements SeekableStream {
     if (known && isExactSpoolingLogicalRange(known)) {
       return known.end - known.begin;
     }
-    const part = this.spoolingPartGridSize();
-    if (part !== undefined) {
-      const segmentCount = this.source.segments.length;
-      if (index < 0 || index >= segmentCount) return undefined;
-      if (index < segmentCount - 1) return part;
-      if (!this.sizeExact) return undefined;
-      const last = this._size - part * (segmentCount - 1);
-      if (last > 0 && last <= part) return last;
-    }
     return index === 0 &&
       this.source.segments.length === 1 &&
       this.sizeExact &&
@@ -801,50 +798,13 @@ export class FileStream implements SeekableStream {
   private spoolingSegmentStartByte(index: number): number | undefined {
     const known = this.knownRanges.get(index);
     if (known && isExactSpoolingLogicalRange(known)) return known.begin;
-    const part = this.spoolingPartGridSize();
-    return part === undefined ? undefined : index * part;
-  }
-
-  /** Uniform global grid proven only from genuine yEnc range metadata. */
-  private spoolingPartGridSize(): number | undefined {
-    if (this.spoolingLayout !== 'global-range') return undefined;
-    if (this.lockedPartSize !== undefined && this.lockedPartSize > 0) {
-      return this.lockedPartSize;
-    }
-    const first = this.knownRanges.get(0);
-    if (
-      !first ||
-      !isAssertableYencRange(first) ||
-      first.begin !== 0 ||
-      !this.sizeExact
-    ) {
-      return undefined;
-    }
-    const length = first.end - first.begin;
-    const segmentCount = this.source.segments.length;
-    if (length <= 0) return undefined;
-    return length * (segmentCount - 1) < this._size &&
-      this._size <= length * segmentCount
-      ? length
-      : undefined;
+    return undefined;
   }
 
   private authoritativeSpoolingByteRange(
     index: number
   ): readonly [number, number] | undefined {
-    let range = this.knownRanges.get(index);
-    if (!range || !isAssertableYencRange(range)) {
-      const begin = this.spoolingSegmentStartByte(index);
-      const length = this.exactSpoolingSegmentSize(index);
-      if (
-        this.spoolingPartGridSize() !== undefined &&
-        begin !== undefined &&
-        length !== undefined
-      ) {
-        range = { begin, end: begin + length, origin: 'global-yenc-grid' };
-        this.knownRanges.set(index, range);
-      }
-    }
+    const range = this.knownRanges.get(index);
     if (!range || !isAssertableYencRange(range)) return undefined;
     return [range.begin, range.end];
   }
@@ -856,6 +816,16 @@ export class FileStream implements SeekableStream {
   ): Promise<LocatedSegment> {
     const segments = this.source.segments;
     if (targetByte === 0 || segments.length === 1) {
+      const firstRange = this.knownRanges.get(0);
+      if (
+        firstRange?.origin === 'global-yenc-range' &&
+        firstRange.begin !== 0
+      ) {
+        throw new YencMetadataError(
+          'inconsistent_layout',
+          'The first global yEnc range does not begin at file offset zero'
+        );
+      }
       return {
         segmentIndex: 0,
         segmentStartByte: 0,
@@ -907,17 +877,6 @@ export class FileStream implements SeekableStream {
         this.acceptSpoolingLayout('global-range');
       }
       return cached;
-    }
-    const start = this.spoolingSegmentStartByte(index);
-    const exactLength = this.exactSpoolingSegmentSize(index);
-    if (start !== undefined && exactLength !== undefined) {
-      const range: KnownRange = {
-        begin: start,
-        end: start + exactLength,
-        origin: 'global-yenc-grid',
-      };
-      this.knownRanges.set(index, range);
-      return range;
     }
 
     try {
@@ -1274,8 +1233,10 @@ export class FileStream implements SeekableStream {
   }
 
   /**
-   * Spooling holes require a globally proven yEnc grid. Buffering estimates
-   * and buffering-only logical grids must never manufacture direct offsets.
+   * Spooling holes require an exact range. A missing middle part is derivable
+   * only between two measured contiguous-neighbour boundaries; the final part
+   * may additionally use the exact file end. No single-part grid heuristic is
+   * promoted to a byte range, and a leading hole remains fail-closed.
    */
   private synthesizeSpoolingHoleRange(
     index: number,
@@ -1283,19 +1244,34 @@ export class FileStream implements SeekableStream {
   ): KnownRange | undefined {
     const kind = definitiveLossKind(error);
     if (kind === undefined) return undefined;
-    const part = this.spoolingPartGridSize();
-    const exact = this.exactSpoolingSegmentSize(index);
-    if (part === undefined || exact === undefined) return undefined;
-    const begin = index * part;
+    if (this.spoolingLayout !== 'global-range' || index <= 0) return undefined;
+    const previous = this.knownRanges.get(index - 1);
+    if (!previous || !isAssertableYencRange(previous)) return undefined;
+    let end: number | undefined;
+    if (index === this.source.segments.length - 1 && this.sizeExact) {
+      end = this._size;
+    } else {
+      const next = this.knownRanges.get(index + 1);
+      if (next && isAssertableYencRange(next)) end = next.begin;
+    }
+    const begin = previous.end;
+    if (
+      end === undefined ||
+      !Number.isSafeInteger(begin) ||
+      !Number.isSafeInteger(end) ||
+      end <= begin
+    ) {
+      return undefined;
+    }
     const range: KnownRange = {
       begin,
-      end: begin + exact,
-      origin: 'global-yenc-grid',
+      end,
+      origin: 'global-yenc-derived',
     };
     this.knownRanges.set(index, range);
     logger.debug(
       { nzbHash: this.nzbHash, index, begin, end: range.end, kind },
-      'segment unservable on all providers; synthesized proven yEnc grid range'
+      'segment unservable on all providers; derived exact neighbour range'
     );
     return range;
   }

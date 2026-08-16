@@ -769,7 +769,14 @@ test('spooling FileStream open without knownSize uses only bounded scalar metada
     (call) => {
       const body = bodies.get(call.segment.messageId);
       if (!body) throw new Error('missing bounded metadata test body');
-      return Promise.resolve(new BufferArtifact(body));
+      const index = Number(call.segment.messageId.split('-')[1]);
+      return Promise.resolve(
+        new BufferArtifact(body, {
+          byteRange: [index * body.length, (index + 1) * body.length],
+          fileSize: 8,
+          totalParts: 2,
+        })
+      );
     },
     (_segment, signal) => {
       assert.notEqual(signal?.aborted, true);
@@ -806,11 +813,370 @@ test('spooling FileStream open without knownSize uses only bounded scalar metada
   assert.equal(source.calls.length, 2);
   assert.deepEqual(
     source.calls.map((call) => call.expectedByteRange),
-    [
-      [0, 4],
-      [4, 8],
-    ]
+    [[0, 4], undefined]
   );
+});
+
+test('nonuniform global yEnc ranges use bounded target probes without a synthetic grid', async () => {
+  const bodies = [Buffer.from('abcd'), Buffer.from('efghi'), Buffer.from('j')];
+  const ranges = [
+    [0, 4],
+    [4, 9],
+    [9, 10],
+  ] as const;
+  const source = new TestArtifactSource(
+    (call) => {
+      const index = Number(call.segment.messageId.split('-')[1]);
+      const body = bodies[index];
+      const range = ranges[index];
+      assert(body);
+      assert(range);
+      return Promise.resolve(
+        new BufferArtifact(body, {
+          byteRange: range,
+          fileSize: 10,
+          totalParts: 3,
+        })
+      );
+    },
+    (candidate) => {
+      const index = Number(candidate.messageId.split('-')[1]);
+      const range = ranges[index];
+      assert(range);
+      return Promise.resolve({
+        byteRange: range,
+        fileSize: 10,
+        totalParts: 3,
+        decodedSize: range[1] - range[0],
+        layout: 'global-range',
+      });
+    }
+  );
+  const file = new FileStream(
+    source,
+    { segments: bodies.map((_, index) => segment(index)) },
+    'nonuniform-global-ranges',
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      streamingMode: 'segment_spooling',
+      prefetchSegments: 1,
+    }
+  );
+
+  await file.open();
+  assert.equal(source.metadataCalls, 1);
+  assert.equal(
+    (await collect(file.createReadStream({ start: 5, end: 10 }))).toString(),
+    'fghij'
+  );
+  assert.deepEqual(
+    source.metadataRequests.map((request) => request.segment.messageId),
+    ['segment-0', 'segment-1']
+  );
+  assert.deepEqual(source.calls[0].expectedByteRange, [4, 9]);
+  assert.equal(source.calls[0].expectedLength, 5);
+  assert.equal(source.calls[1].expectedByteRange, undefined);
+  assert.equal(source.sharedCalls, 0);
+  assert.equal(source.bufferingCalls, 0);
+
+  assert.deepEqual(
+    await collect(file.createReadStream()),
+    Buffer.concat(bodies)
+  );
+  assert(
+    source.calls.every(
+      (call) =>
+        call.expectedByteRange === undefined ||
+        (call.expectedByteRange[0] === 0 && call.expectedByteRange[1] === 4) ||
+        (call.expectedByteRange[0] === 4 && call.expectedByteRange[1] === 9)
+    )
+  );
+  assert.equal(source.activeStreamLeases, 0);
+});
+
+test('nonuniform global holes fail closed until exact topology proves their range', async () => {
+  const unprovenMiss = new ArticleNotFoundError('middle body missing', {
+    messageId: 'segment-1',
+    allProviders: true,
+  });
+  const unprovenHoles: HoleInfo[] = [];
+  const unprovenSource = new TestArtifactSource((call) => {
+    if (call.segment.messageId === 'segment-1') {
+      return Promise.reject(unprovenMiss);
+    }
+    if (call.segment.messageId === 'segment-0') {
+      return Promise.resolve(
+        new BufferArtifact(Buffer.from('abcd'), {
+          byteRange: [0, 4],
+          fileSize: 10,
+          totalParts: 3,
+        })
+      );
+    }
+    return Promise.resolve(
+      new BufferArtifact(Buffer.from('j'), {
+        byteRange: [9, 10],
+        fileSize: 10,
+        totalParts: 3,
+      })
+    );
+  });
+  const unproven = new FileStream(
+    unprovenSource,
+    { segments: [segment(0), segment(1), segment(2)], knownSize: 10 },
+    'unproven-global-hole',
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      streamingMode: 'segment_spooling',
+      prefetchSegments: 1,
+    },
+    undefined,
+    {
+      hooks: {
+        onHole: (info) => {
+          unprovenHoles.push(info);
+          return 'pad';
+        },
+      },
+      fileIndex: 0,
+    }
+  );
+  await unproven.open();
+  await assert.rejects(
+    collect(unproven.createReadStream()),
+    (error: unknown) => {
+      assert.equal(error, unprovenMiss);
+      return true;
+    }
+  );
+  assert.deepEqual(unprovenHoles, []);
+
+  const metadataMiss = new ArticleNotFoundError('middle metadata missing', {
+    messageId: 'segment-1',
+    allProviders: true,
+  });
+  const bodyMiss = new ArticleNotFoundError('middle body missing', {
+    messageId: 'segment-1',
+    allProviders: true,
+  });
+  const provenHoles: HoleInfo[] = [];
+  const provenSource = new TestArtifactSource(
+    (call) => {
+      if (call.segment.messageId === 'segment-1') {
+        return Promise.reject(bodyMiss);
+      }
+      const index = call.segment.messageId === 'segment-0' ? 0 : 2;
+      const range = index === 0 ? ([0, 4] as const) : ([9, 10] as const);
+      return Promise.resolve(
+        new BufferArtifact(
+          index === 0 ? Buffer.from('abcd') : Buffer.from('j'),
+          {
+            byteRange: range,
+            fileSize: 10,
+            totalParts: 3,
+          }
+        )
+      );
+    },
+    (candidate) => {
+      if (candidate.messageId === 'segment-1') {
+        return Promise.reject(metadataMiss);
+      }
+      const range =
+        candidate.messageId === 'segment-0'
+          ? ([0, 4] as const)
+          : ([9, 10] as const);
+      return Promise.resolve({
+        byteRange: range,
+        fileSize: 10,
+        totalParts: 3,
+        decodedSize: range[1] - range[0],
+        layout: 'global-range',
+      });
+    }
+  );
+  const proven = new FileStream(
+    provenSource,
+    { segments: [segment(0), segment(1), segment(2)] },
+    'proven-global-hole',
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      streamingMode: 'segment_spooling',
+      prefetchSegments: 1,
+    },
+    undefined,
+    {
+      hooks: {
+        onHole: (info) => {
+          provenHoles.push(info);
+          return 'pad';
+        },
+      },
+      fileIndex: 0,
+    }
+  );
+  await proven.open();
+  assert.equal(
+    (await collect(proven.createReadStream({ start: 9, end: 10 }))).toString(),
+    'j'
+  );
+  assert.deepEqual(
+    await collect(proven.createReadStream({ start: 5, end: 9 })),
+    Buffer.alloc(4)
+  );
+  assert.equal(provenHoles.length, 1);
+  assert.equal(provenHoles[0].targetOffset, 4);
+  assert.equal(provenHoles[0].bytes, 5);
+  const middleBodyCall = provenSource.calls.find(
+    (call) => call.segment.messageId === 'segment-1'
+  );
+  assert(middleBodyCall);
+  assert.equal(middleBodyCall.expectedLength, 5);
+  assert.equal(middleBodyCall.expectedByteRange, undefined);
+});
+
+test('a measured leading global range cannot be remapped to byte zero', async () => {
+  const source = new TestArtifactSource(
+    () =>
+      Promise.reject(new Error('inconsistent layout must not fetch a body')),
+    () =>
+      Promise.resolve({
+        byteRange: [2, 6],
+        fileSize: 10,
+        totalParts: 2,
+        decodedSize: 4,
+        layout: 'global-range',
+      })
+  );
+  const file = new FileStream(
+    source,
+    { segments: [segment(0), segment(1)] },
+    'leading-global-gap',
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      streamingMode: 'segment_spooling',
+      prefetchSegments: 1,
+    }
+  );
+  await file.open();
+
+  await assert.rejects(collect(file.createReadStream()), (error: unknown) => {
+    assert(error instanceof YencMetadataError);
+    assert.equal(error.code, 'inconsistent_layout');
+    return true;
+  });
+  assert.equal(source.calls.length, 0);
+  assert.equal(source.activeStreamLeases, 0);
+});
+
+test('a leading gap first exposed by a growing artifact header fails before reader output', async () => {
+  const artifact = new BufferArtifact(Buffer.from('WXYZ'), {
+    byteRange: [2, 6],
+    fileSize: 10,
+    totalParts: 2,
+  });
+  const source = new TestArtifactSource(() => Promise.resolve(artifact));
+  const file = new FileStream(
+    source,
+    { segments: [segment(0), segment(1)], knownSize: 10 },
+    'late-leading-global-gap',
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      streamingMode: 'segment_spooling',
+      prefetchSegments: 1,
+    }
+  );
+  await file.open();
+  const output: Buffer[] = [];
+  const stream = file.createReadStream({ start: 0, end: 4 });
+  stream.on('data', (chunk: Buffer) => output.push(chunk));
+
+  await assert.rejects(collect(stream), (error: unknown) => {
+    assert(error instanceof YencMetadataError);
+    assert.equal(error.code, 'inconsistent_layout');
+    return true;
+  });
+  assert.deepEqual(output, []);
+  assert.equal(artifact.readerHighWaterMark, undefined);
+  assert.equal(artifact.releaseCalls, 1);
+  assert.equal(source.activeStreamLeases, 0);
+});
+
+test('global gaps, overlaps, and wrong final ends fail before contradictory output', async (t) => {
+  const cases = [
+    {
+      name: 'gap',
+      bodies: [Buffer.from('aaaa'), Buffer.from('bbbb')],
+      ranges: [
+        [0, 4],
+        [5, 9],
+      ] as const,
+    },
+    {
+      name: 'overlap',
+      bodies: [Buffer.from('aaaaa'), Buffer.from('bbbbb')],
+      ranges: [
+        [0, 5],
+        [4, 9],
+      ] as const,
+    },
+    {
+      name: 'wrong final end',
+      bodies: [Buffer.from('aaaa'), Buffer.from('bbbbb')],
+      ranges: [
+        [0, 4],
+        [4, 9],
+      ] as const,
+    },
+  ] as const;
+  for (const fixture of cases) {
+    await t.test(fixture.name, async () => {
+      const artifacts = fixture.bodies.map(
+        (body, index) =>
+          new BufferArtifact(body, {
+            byteRange: fixture.ranges[index],
+            fileSize: 9,
+            totalParts: 2,
+          })
+      );
+      const source = new TestArtifactSource((call) => {
+        const index = Number(call.segment.messageId.split('-')[1]);
+        const artifact = artifacts[index];
+        assert(artifact);
+        return Promise.resolve(artifact);
+      });
+      const file = new FileStream(
+        source,
+        {
+          segments: [segment(0), segment(1)],
+          knownSize: fixture.name === 'wrong final end' ? 10 : 9,
+        },
+        `global-${fixture.name}`,
+        {
+          ...DEFAULT_ENGINE_OPTIONS,
+          streamingMode: 'segment_spooling',
+          prefetchSegments: 2,
+        }
+      );
+      await file.open();
+      const stream = file.createReadStream();
+      const output: Buffer[] = [];
+      stream.on('data', (chunk: Buffer) => output.push(chunk));
+      const failure = new Promise<Error>((resolve) =>
+        stream.once('error', resolve)
+      );
+      stream.resume();
+      const error = await failure;
+      assert(error instanceof YencMetadataError);
+      assert.equal(error.code, 'inconsistent_layout');
+      await closeEvent(stream);
+      assert.deepEqual(Buffer.concat(output), fixture.bodies[0]);
+      assert.equal(artifacts[1].readerHighWaterMark, undefined);
+      assert.equal(artifacts[0].releaseCalls, 1);
+      assert.equal(artifacts[1].releaseCalls, 1);
+      assert.equal(source.activeStreamLeases, 0);
+    });
+  }
 });
 
 test('standalone yEnc parts build an exact bounded prefix map and stream byte-identically', async () => {
