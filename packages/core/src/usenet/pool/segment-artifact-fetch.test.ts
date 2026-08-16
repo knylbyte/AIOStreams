@@ -1808,8 +1808,13 @@ test('a completed spool promotion becomes a file-backed hit without another netw
       return persistent.promotionEnabled;
     },
     acquire: (messageId, signal) => persistent.acquire(messageId, signal),
-    promote: async (messageId, metadata, sourcePath) => {
-      const result = await persistent.promote(messageId, metadata, sourcePath);
+    promote: async (messageId, metadata, sourcePath, tryAcquireMemory) => {
+      const result = await persistent.promote(
+        messageId,
+        metadata,
+        sourcePath,
+        tryAcquireMemory
+      );
       promoted.resolve(result);
       return result;
     },
@@ -1858,4 +1863,21 @@ test('an explicitly disabled persistent cache skips promotion entirely', async (
   );
   assert.deepEqual(await readArtifact(artifact), body);
   assert.equal(promotions, 0);
+});
+
+test('best-effort promotion memory never bypasses a queued stream request', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const { runtime } = await createHarness(context, fetcher);
+  const admissionBytes = Math.floor(spoolingPlan().memoryBudgetBytes / 2);
+  const first = await runtime.acquireStreamMemory(
+    admissionBytes,
+    CommandPriority.High
+  );
+  const queued = runtime.acquireStreamMemory(1, CommandPriority.High);
+
+  assert.equal(runtime.tryAcquirePromotionMemory(1), undefined);
+  first.release();
+  const second = await queued;
+  second.release();
+  assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
 });

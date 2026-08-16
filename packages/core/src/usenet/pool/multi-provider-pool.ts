@@ -1027,7 +1027,8 @@ export class MultiProviderPool {
         runtime.artifactCache,
         messageId,
         metadata,
-        source.path
+        source.path,
+        (bytes) => runtime.tryAcquirePromotionMemory(bytes)
       );
     } catch (error) {
       source.release();

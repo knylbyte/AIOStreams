@@ -92,6 +92,8 @@ test('DiskSegmentArtifact keeps its file lease through the actual reader close e
   const fileLease: DiskFileLease = {
     path: filePath,
     serializedBytes: body.length,
+    confirmHit: () => undefined,
+    invalidateAsMiss: () => undefined,
     release: () => {
       releases++;
       return Promise.resolve();

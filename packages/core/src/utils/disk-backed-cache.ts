@@ -6,6 +6,9 @@ import { createLogger } from '../logging/logger.js';
 
 const logger = createLogger('disk-cache');
 
+/** Maximum chunk retained by generic prepared-file copy pipelines. */
+export const DISK_CACHE_COPY_CHUNK_BYTES = 64 * 1024;
+
 function nodeErrorCode(error: unknown): string | undefined {
   if (typeof error !== 'object' || error === null || !('code' in error)) {
     return undefined;
@@ -21,20 +24,62 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function parseDiskIndex(raw: string): Array<[string, DiskEntry]> {
+interface ParsedDiskIndex {
+  readonly entries: Array<[string, DiskEntry]>;
+  readonly discardedEntries: boolean;
+}
+
+function parseDiskIndex(raw: string): ParsedDiskIndex {
   const parsed: unknown = JSON.parse(raw);
-  if (!isRecord(parsed)) return [];
+  if (!isRecord(parsed)) return { entries: [], discardedEntries: true };
   const entries: Array<[string, DiskEntry]> = [];
+  let discardedEntries = false;
   for (const [fileKey, value] of Object.entries(parsed)) {
-    if (!/^[a-f0-9]{40}$/.test(fileKey) || !isRecord(value)) continue;
+    if (!/^[a-f0-9]{40}$/.test(fileKey) || !isRecord(value)) {
+      discardedEntries = true;
+      continue;
+    }
     const size = value.size;
     if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) {
+      discardedEntries = true;
       continue;
     }
     entries.push([fileKey, { size }]);
   }
-  return entries;
+  return { entries, discardedEntries };
 }
+
+export type DiskBackedCacheErrorCode =
+  | 'DISK_CACHE_CLOSED'
+  | 'DISK_CACHE_PREPARED_LIMIT'
+  | 'DISK_CACHE_PREPARED_INVALID';
+
+/** Stable lifecycle/admission failures from {@link DiskBackedCache}. */
+export class DiskBackedCacheError extends Error {
+  readonly code: DiskBackedCacheErrorCode;
+
+  constructor(
+    code: DiskBackedCacheErrorCode,
+    message: string,
+    options?: ErrorOptions
+  ) {
+    super(message, options);
+    this.name = 'DiskBackedCacheError';
+    this.code = code;
+  }
+}
+
+export type DiskBackedCacheFileSystem = Pick<
+  typeof fs,
+  | 'mkdir'
+  | 'open'
+  | 'lstat'
+  | 'rm'
+  | 'writeFile'
+  | 'readFile'
+  | 'readdir'
+  | 'rename'
+>;
 
 /**
  * Codecs + budgets for a {@link DiskBackedCache}. Value-generic: the caller
@@ -68,6 +113,8 @@ export interface DiskBackedCacheOptions<V> {
   serializedSize?: (value: V) => number;
   /** Testable cross-device seam; production defaults to `fs.rename`. */
   renameFile?: (source: string, destination: string) => Promise<void>;
+  /** Narrow generic filesystem seam for deterministic lifecycle/I/O tests. */
+  fileSystem?: Partial<DiskBackedCacheFileSystem>;
 }
 
 /**
@@ -75,11 +122,17 @@ export interface DiskBackedCacheOptions<V> {
  *
  * Logical LRU eviction removes the entry from cache accounting immediately,
  * while physical deletion is deferred until the final lease is released. This
- * keeps open readers valid on Windows as well as POSIX. Release is idempotent.
+ * keeps open readers valid on Windows as well as POSIX. Format-aware callers
+ * finalize exactly one provisional stats outcome before release; all three
+ * lifecycle methods are idempotent.
  */
 export interface DiskFileLease {
   readonly path: string;
   readonly serializedBytes: number;
+  /** Finalize this provisional lookup as one successful disk hit. */
+  confirmHit(): void;
+  /** Finalize it as one miss and invalidate the structurally corrupt entry. */
+  invalidateAsMiss(): void;
   release(): Promise<void>;
 }
 
@@ -110,7 +163,9 @@ interface FileLeaseState {
 
 interface PreparedFileState {
   readonly path: string;
+  readonly generation: number;
   status: 'active' | 'installing' | 'released';
+  slotReleased: boolean;
   operation?: Promise<unknown>;
   releasePromise?: Promise<void>;
 }
@@ -142,6 +197,32 @@ interface RegisteredDiskCache {
 }
 
 const diskCacheRegistry = new Set<RegisteredDiskCache>();
+/**
+ * Process-local physical-file pins shared across cache re-instantiation. A
+ * cleared/closed cache may keep an issued lease valid while its replacement
+ * reconciles the same namespace; the replacement must not delete or overwrite
+ * that path until the final old lease releases it.
+ */
+const activeDiskFileLeases = new Map<string, number>();
+
+function activeFileLeaseCount(filePath: string): number {
+  return activeDiskFileLeases.get(path.resolve(filePath)) ?? 0;
+}
+
+function addActiveFileLease(filePath: string): void {
+  const resolved = path.resolve(filePath);
+  activeDiskFileLeases.set(resolved, activeFileLeaseCount(resolved) + 1);
+}
+
+function removeActiveFileLease(filePath: string): void {
+  const resolved = path.resolve(filePath);
+  const count = activeFileLeaseCount(resolved);
+  if (count <= 0) {
+    throw new Error('Disk cache process lease accounting invariant violated');
+  }
+  if (count === 1) activeDiskFileLeases.delete(resolved);
+  else activeDiskFileLeases.set(resolved, count - 1);
+}
 
 /** Snapshot every live disk-backed cache for the dashboard cache page. */
 export function describeDiskCaches(): {
@@ -188,7 +269,6 @@ export async function flushAllDiskCaches(): Promise<void> {
 export class DiskBackedCache<V> {
   private static readonly MAX_PENDING_WRITES = 64;
   private static readonly MAX_PENDING_WRITE_BYTES = 128 * 1024 * 1024;
-  private static readonly COPY_CHUNK_BYTES = 64 * 1024;
 
   private mem = new Map<string, MemEntry<V>>();
   private memBytes = 0;
@@ -215,6 +295,11 @@ export class DiskBackedCache<V> {
   private flushTimer?: NodeJS.Timeout;
   private ready: Promise<void>;
   private closed = false;
+  /** Monotone mutation epoch; clear/close advance it before their first await. */
+  private generation = 0;
+  private clearing = false;
+  private clearPromise?: Promise<void>;
+  private closePromise?: Promise<void>;
   /** File ownership states remain only while leased or awaiting deletion. */
   private readonly fileLeases = new Map<string, FileLeaseState>();
   /** Physical deletes currently running; bounded by the disk index/lease set. */
@@ -224,6 +309,12 @@ export class DiskBackedCache<V> {
     DiskPreparedFile,
     PreparedFileState
   >();
+  /** Reserved before async creation and held through active/installing state. */
+  private preparedSlots = 0;
+  private readonly pendingPreparedCreations = new Set<
+    Promise<DiskPreparedFile>
+  >();
+  private readonly fileSystem: DiskBackedCacheFileSystem;
   private readonly renameFile: (
     source: string,
     destination: string
@@ -233,7 +324,17 @@ export class DiskBackedCache<V> {
     this.opts = opts;
     this.dir = path.join(opts.dir, opts.name);
     this.indexPath = path.join(opts.dir, `${opts.name}.index.json`);
-    this.renameFile = opts.renameFile ?? fs.rename;
+    this.fileSystem = {
+      mkdir: opts.fileSystem?.mkdir ?? fs.mkdir,
+      open: opts.fileSystem?.open ?? fs.open,
+      lstat: opts.fileSystem?.lstat ?? fs.lstat,
+      rm: opts.fileSystem?.rm ?? fs.rm,
+      writeFile: opts.fileSystem?.writeFile ?? fs.writeFile,
+      readFile: opts.fileSystem?.readFile ?? fs.readFile,
+      readdir: opts.fileSystem?.readdir ?? fs.readdir,
+      rename: opts.fileSystem?.rename ?? fs.rename,
+    };
+    this.renameFile = opts.renameFile ?? this.fileSystem.rename;
     this.ready = this.load();
     diskCacheRegistry.add(this);
   }
@@ -274,33 +375,66 @@ export class DiskBackedCache<V> {
   private async load(): Promise<void> {
     if (!this.diskEnabled()) return;
     try {
-      await fs.mkdir(this.dir, { recursive: true });
+      await this.fileSystem.mkdir(this.dir, { recursive: true });
       let entries: Array<[string, DiskEntry]> = [];
+      let rawIndex: string | undefined;
       try {
-        const raw = await fs.readFile(this.indexPath, 'utf8');
-        entries = parseDiskIndex(raw);
-      } catch {
+        rawIndex = await this.fileSystem.readFile(this.indexPath, 'utf8');
+      } catch (error) {
         // No index yet — first run or it was removed.
+        if (nodeErrorCode(error) !== 'ENOENT') {
+          logger.debug(
+            { name: this.opts.name, err: errorMessage(error) },
+            'disk cache index read failed'
+          );
+        }
+      }
+      if (rawIndex !== undefined) {
+        try {
+          const parsed = parseDiskIndex(rawIndex);
+          entries = parsed.entries;
+          if (parsed.discardedEntries) this.indexDirty = true;
+        } catch {
+          // Invalid JSON is reconciled to a clean empty index.
+          this.indexDirty = true;
+        }
       }
       // Index → keep only safe regular files and reconcile legacy index sizes
       // against their actual serialized byte length.
-      const present = new Set(await fs.readdir(this.dir).catch(() => []));
+      const present = new Set(
+        await this.fileSystem.readdir(this.dir).catch(() => [])
+      );
       for (const [fileKey, entry] of entries) {
-        if (!present.has(fileKey) || typeof entry?.size !== 'number') continue;
+        if (!present.has(fileKey) || typeof entry?.size !== 'number') {
+          this.indexDirty = true;
+          continue;
+        }
         try {
-          const stats = await fs.lstat(this.filePath(fileKey));
-          if (!stats.isFile() || !Number.isSafeInteger(stats.size)) continue;
+          const stats = await this.fileSystem.lstat(this.filePath(fileKey));
+          if (!stats.isFile() || !Number.isSafeInteger(stats.size)) {
+            this.indexDirty = true;
+            continue;
+          }
           this.disk.set(fileKey, { size: stats.size });
           this.diskBytes += stats.size;
           if (entry.size !== stats.size) this.indexDirty = true;
         } catch {
           // Missing or unsafe entries are omitted from the reconciled index.
+          this.indexDirty = true;
         }
       }
       // Files → delete any not referenced by the index (StremThru cleanOrphaned).
       for (const fileKey of present) {
         if (!this.disk.has(fileKey)) {
-          await fs.rm(this.filePath(fileKey), { force: true }).catch(() => {});
+          if (activeFileLeaseCount(this.filePath(fileKey)) > 0) continue;
+          await this.fileSystem
+            .rm(this.filePath(fileKey), { force: true })
+            .catch((error: unknown) => {
+              logger.debug(
+                { name: this.opts.name, err: errorMessage(error) },
+                'disk cache orphan cleanup was deferred'
+              );
+            });
         }
       }
       // The index may have shrunk; trim to budget.
@@ -344,18 +478,29 @@ export class DiskBackedCache<V> {
 
   /**
    * Acquire an immutable file-backed L2 hit without reading its payload.
-   * Acquisition touches LRU recency and increments hit counters. Logical
-   * eviction may proceed while leased, but physical unlink waits for release.
+   * Acquisition touches LRU recency but returns a provisional stats outcome:
+   * format-aware callers confirm the hit only after validating their header.
+   * Logical eviction may proceed while leased, but physical unlink waits for
+   * release.
    */
-  async acquireDiskFile(key: string): Promise<DiskFileLease | undefined> {
-    if (!this.diskEnabled() || this.closed) {
+  async acquireDiskFile(
+    key: string,
+    signal?: AbortSignal
+  ): Promise<DiskFileLease | undefined> {
+    if (!this.diskEnabled() || this.closed || this.clearing) {
       this.misses++;
       return undefined;
     }
+    const generation = this.generation;
+    signal?.throwIfAborted();
     await this.ready.catch(() => undefined);
+    signal?.throwIfAborted();
+    if (!this.isCurrentGeneration(generation)) return undefined;
     const fileKey = this.fileKey(key);
     const pending = this.pendingWrites.get(fileKey);
     if (pending) await pending.catch(() => undefined);
+    signal?.throwIfAborted();
+    if (!this.isCurrentGeneration(generation)) return undefined;
 
     const entry = this.disk.get(fileKey);
     const existingState = this.fileLeases.get(fileKey);
@@ -368,18 +513,36 @@ export class DiskBackedCache<V> {
     const state = existingState ?? { leases: 0, pendingDelete: false };
     state.leases++;
     this.fileLeases.set(fileKey, state);
+    addActiveFileLease(this.filePath(fileKey));
 
     let serializedBytes: number;
     try {
-      const stats = await fs.lstat(this.filePath(fileKey));
+      const stats = await this.fileSystem.lstat(this.filePath(fileKey));
       if (!stats.isFile() || !Number.isSafeInteger(stats.size)) {
-        throw new Error('Disk cache entry is not a safe regular file');
+        await this.releaseFileLease(fileKey, state);
+        this.dropDisk(fileKey);
+        this.misses++;
+        return undefined;
       }
       serializedBytes = stats.size;
-    } catch {
+    } catch (error) {
       await this.releaseFileLease(fileKey, state);
-      this.dropDisk(fileKey);
-      this.misses++;
+      if (signal?.aborted) throw signal.reason;
+      if (nodeErrorCode(error) === 'ENOENT') {
+        this.dropDisk(fileKey);
+        this.misses++;
+        return undefined;
+      }
+      throw error;
+    }
+    try {
+      signal?.throwIfAborted();
+    } catch (error) {
+      await this.releaseFileLease(fileKey, state);
+      throw error;
+    }
+    if (!this.isCurrentGeneration(generation)) {
+      await this.releaseFileLease(fileKey, state);
       return undefined;
     }
 
@@ -404,13 +567,24 @@ export class DiskBackedCache<V> {
       return undefined;
     }
 
-    this.hits++;
-    this.diskHits++;
+    let outcome: 'hit' | 'miss' | undefined;
     let released = false;
     let releasePromise: Promise<void> | undefined;
     return {
       path: this.filePath(fileKey),
       serializedBytes,
+      confirmHit: () => {
+        if (outcome) return;
+        outcome = 'hit';
+        this.hits++;
+        this.diskHits++;
+      },
+      invalidateAsMiss: () => {
+        if (outcome) return;
+        outcome = 'miss';
+        this.misses++;
+        this.dropDisk(fileKey);
+      },
       release: () => {
         if (releasePromise) return releasePromise;
         if (released) return Promise.resolve();
@@ -430,18 +604,21 @@ export class DiskBackedCache<V> {
     }
     const lease = await this.acquireDiskFile(key);
     if (!lease) return undefined;
+    let buf: Buffer;
     try {
-      const buf = await fs.readFile(lease.path);
+      buf = await this.fileSystem.readFile(lease.path);
+    } catch (error) {
+      if (nodeErrorCode(error) === 'ENOENT') lease.invalidateAsMiss();
+      await lease.release();
+      return undefined;
+    }
+    try {
       const value = this.opts.deserialize(buf);
       this.addToMem(key, value, this.opts.sizeOf(value));
+      lease.confirmHit();
       return value;
     } catch {
-      // File vanished or is corrupt. Convert the provisional file hit into a
-      // miss, then logically evict; unlink waits for this lease to release.
-      this.hits--;
-      this.diskHits--;
-      this.misses++;
-      await this.delete(key);
+      lease.invalidateAsMiss();
       return undefined;
     } finally {
       await lease.release();
@@ -461,7 +638,7 @@ export class DiskBackedCache<V> {
     value: V,
     opts?: { skipDisk?: boolean; skipMem?: boolean }
   ): void {
-    if (this.closed) return;
+    if (this.closed || this.clearing) return;
     const size = this.opts.sizeOf(value);
     if (size <= 0) return;
     const fitsMem = this.opts.maxMemBytes > 0 && size <= this.opts.maxMemBytes;
@@ -512,11 +689,13 @@ export class DiskBackedCache<V> {
 
   /** Serialize synchronously, then atomically persist in a bounded background slot. */
   private persistToDisk(key: string, value: V, _decodedSize: number): void {
+    const generation = this.generation;
     const fileKey = this.fileKey(key);
     if (
       this.pendingWrites.has(fileKey) ||
       this.pendingWrites.size >= DiskBackedCache.MAX_PENDING_WRITES ||
-      this.fileLeases.has(fileKey)
+      this.fileLeases.has(fileKey) ||
+      activeFileLeaseCount(this.filePath(fileKey)) > 0
     ) {
       return;
     }
@@ -551,10 +730,20 @@ export class DiskBackedCache<V> {
     const run = async (): Promise<void> => {
       try {
         await this.ready.catch(() => undefined);
-        if (this.closed || !this.diskEnabled()) return;
-        await fs.mkdir(this.dir, { recursive: true });
-        await fs.writeFile(tempPath, payload, { flag: 'wx', mode: 0o600 });
-        await this.replaceFile(tempPath, this.filePath(fileKey));
+        if (!this.isCurrentGeneration(generation) || !this.diskEnabled())
+          return;
+        await this.fileSystem.mkdir(this.dir, { recursive: true });
+        if (!this.isCurrentGeneration(generation)) return;
+        await this.fileSystem.writeFile(tempPath, payload, {
+          flag: 'wx',
+          mode: 0o600,
+        });
+        if (!this.isCurrentGeneration(generation)) return;
+        await this.replaceBackgroundFile(tempPath, this.filePath(fileKey));
+        if (!this.isCurrentGeneration(generation)) {
+          await this.discardStaleDestination(fileKey);
+          return;
+        }
         this.commitDiskEntry(fileKey, serializedBytes);
       } catch (err) {
         logger.debug(
@@ -562,7 +751,9 @@ export class DiskBackedCache<V> {
           'disk cache write failed'
         );
       } finally {
-        await fs.rm(tempPath, { force: true }).catch(() => undefined);
+        await this.fileSystem
+          .rm(tempPath, { force: true })
+          .catch(() => undefined);
         if (slot) this.releaseWriteBuf(slot);
         this.releasePendingWriteBytes(serializedBytes);
         if (this.pendingWrites.get(fileKey) === write) {
@@ -587,51 +778,91 @@ export class DiskBackedCache<V> {
     this.scheduleIndexFlush();
   }
 
-  private async replaceFile(
+  private async replaceBackgroundFile(
     source: string,
     destination: string
   ): Promise<void> {
     try {
-      await fs.rename(source, destination);
+      await this.renameFile(source, destination);
     } catch (error) {
       const code = nodeErrorCode(error);
       if (code !== 'EEXIST' && code !== 'EPERM') throw error;
-      await fs.rm(destination, { force: true });
-      await fs.rename(source, destination);
+      await this.fileSystem.rm(destination, { force: true });
+      await this.renameFile(source, destination);
     }
   }
 
   /**
    * Create one secure, bounded staging file inside the cache namespace.
    */
-  async createPreparedFile(): Promise<DiskPreparedFile> {
-    await this.ready.catch(() => undefined);
-    if (this.closed || !this.diskEnabled()) {
-      throw new Error('Disk cache is not accepting prepared files');
+  createPreparedFile(): Promise<DiskPreparedFile> {
+    const generation = this.generation;
+    if (!this.isCurrentGeneration(generation) || !this.diskEnabled()) {
+      return Promise.reject(this.cacheClosedError());
     }
-    if (this.preparedFiles.size >= DiskBackedCache.MAX_PENDING_WRITES) {
-      throw new Error('Disk cache prepared-file limit reached');
+    if (this.preparedSlots >= DiskBackedCache.MAX_PENDING_WRITES) {
+      return Promise.reject(
+        new DiskBackedCacheError(
+          'DISK_CACHE_PREPARED_LIMIT',
+          'Disk cache prepared-file capacity reached'
+        )
+      );
     }
-    await fs.mkdir(this.dir, { recursive: true });
-    const preparedPath = path.join(this.dir, `.prepared-${randomUUID()}`);
-    const handle = await fs.open(preparedPath, 'wx', 0o600);
+    // Reservation is synchronous: concurrent calls can never pass the cap.
+    this.preparedSlots++;
+    this.assertPreparedAccounting();
+    let creation: Promise<DiskPreparedFile>;
+    creation = this.createPreparedFileOnce(generation).finally(() => {
+      this.pendingPreparedCreations.delete(creation);
+    });
+    this.pendingPreparedCreations.add(creation);
+    return creation;
+  }
+
+  private async createPreparedFileOnce(
+    generation: number
+  ): Promise<DiskPreparedFile> {
+    let preparedPath: string | undefined;
+    let registered = false;
     try {
-      await handle.close();
+      await this.ready.catch(() => undefined);
+      this.assertAcceptingGeneration(generation);
+      await this.fileSystem.mkdir(this.dir, { recursive: true });
+      this.assertAcceptingGeneration(generation);
+      preparedPath = path.join(this.dir, `.prepared-${randomUUID()}`);
+      const handle = await this.fileSystem.open(preparedPath, 'wx', 0o600);
+      try {
+        await handle.close();
+      } catch (error) {
+        await this.fileSystem
+          .rm(preparedPath, { force: true })
+          .catch(() => undefined);
+        throw error;
+      }
+      this.assertAcceptingGeneration(generation);
+
+      const state: PreparedFileState = {
+        path: preparedPath,
+        generation,
+        status: 'active',
+        slotReleased: false,
+      };
+      const prepared: DiskPreparedFile = {
+        path: preparedPath,
+        release: () => this.releasePreparedFile(prepared, state),
+      };
+      this.preparedFiles.set(prepared, state);
+      registered = true;
+      return prepared;
     } catch (error) {
-      await fs.rm(preparedPath, { force: true }).catch(() => undefined);
+      if (preparedPath) {
+        await this.fileSystem
+          .rm(preparedPath, { force: true })
+          .catch(() => undefined);
+      }
+      if (!registered) this.releasePreparedSlot();
       throw error;
     }
-
-    const state: PreparedFileState = {
-      path: preparedPath,
-      status: 'active',
-    };
-    const prepared: DiskPreparedFile = {
-      path: preparedPath,
-      release: () => this.releasePreparedFile(prepared, state),
-    };
-    this.preparedFiles.set(prepared, state);
-    return prepared;
   }
 
   /**
@@ -651,38 +882,42 @@ export class DiskBackedCache<V> {
     }
     const state = this.preparedFiles.get(prepared);
     if (!state || state.status !== 'active') {
-      throw new Error('Prepared disk cache file is not active');
+      throw new DiskBackedCacheError(
+        'DISK_CACHE_PREPARED_INVALID',
+        'Prepared disk cache file is not active'
+      );
     }
     state.status = 'installing';
     const operation = this.installPreparedFileOnce(
       key,
       state.path,
-      serializedBytes
+      serializedBytes,
+      state.generation
     );
     state.operation = operation;
     try {
       return await operation;
     } finally {
       state.status = 'released';
-      this.preparedFiles.delete(prepared);
-      await fs.rm(state.path, { force: true }).catch(() => undefined);
+      await this.removePreparedFile(prepared, state);
     }
   }
 
   private async installPreparedFileOnce(
     key: string,
     preparedPath: string,
-    serializedBytes: number
+    serializedBytes: number,
+    generation: number
   ): Promise<boolean> {
     await this.ready.catch(() => undefined);
     if (
-      this.closed ||
+      !this.isCurrentGeneration(generation) ||
       !this.diskEnabled() ||
       serializedBytes > this.opts.maxDiskBytes
     ) {
       return false;
     }
-    const stats = await fs.lstat(preparedPath);
+    const stats = await this.fileSystem.lstat(preparedPath);
     if (!stats.isFile() || stats.size !== serializedBytes) {
       throw new Error('Prepared disk cache file size is invalid');
     }
@@ -690,7 +925,9 @@ export class DiskBackedCache<V> {
     const fileKey = this.fileKey(key);
     const previous = this.pendingWrites.get(fileKey);
     if (previous) await previous.catch(() => undefined);
-    if (this.closed || !this.diskEnabled()) return false;
+    if (!this.isCurrentGeneration(generation) || !this.diskEnabled()) {
+      return false;
+    }
     const existing = this.disk.get(fileKey);
     if (existing) {
       this.disk.delete(fileKey);
@@ -699,12 +936,26 @@ export class DiskBackedCache<V> {
       this.scheduleIndexFlush();
       return false;
     }
+    const leaseState = this.fileLeases.get(fileKey);
+    if (leaseState?.pendingDelete && leaseState.leases === 0) {
+      try {
+        await this.startPhysicalDelete(fileKey, leaseState);
+      } catch (error) {
+        logger.debug(
+          { name: this.opts.name, err: errorMessage(error) },
+          'disk cache stale destination cleanup failed'
+        );
+        return false;
+      }
+    }
+    if (!this.isCurrentGeneration(generation)) return false;
     if (
       this.pendingWrites.has(fileKey) ||
       this.pendingWrites.size >= DiskBackedCache.MAX_PENDING_WRITES ||
       this.pendingWriteBytes + serializedBytes >
         DiskBackedCache.MAX_PENDING_WRITE_BYTES ||
-      this.fileLeases.has(fileKey)
+      this.fileLeases.has(fileKey) ||
+      activeFileLeaseCount(this.filePath(fileKey)) > 0
     ) {
       return false;
     }
@@ -716,8 +967,13 @@ export class DiskBackedCache<V> {
         await this.movePreparedFile(
           preparedPath,
           this.filePath(fileKey),
-          serializedBytes
+          serializedBytes,
+          fileKey
         );
+        if (!this.isCurrentGeneration(generation)) {
+          await this.discardStaleDestination(fileKey);
+          return;
+        }
         this.commitDiskEntry(fileKey, serializedBytes);
       } finally {
         this.releasePendingWriteBytes(serializedBytes);
@@ -730,44 +986,105 @@ export class DiskBackedCache<V> {
     install = run();
     this.pendingWrites.set(fileKey, install);
     await install;
-    return this.disk.has(fileKey);
+    return this.isCurrentGeneration(generation) && this.disk.has(fileKey);
   }
 
   private async movePreparedFile(
     source: string,
     destination: string,
-    serializedBytes: number
+    serializedBytes: number,
+    fileKey: string
   ): Promise<void> {
     try {
       await this.renameFile(source, destination);
       return;
     } catch (error) {
-      if (nodeErrorCode(error) !== 'EXDEV') throw error;
+      const code = nodeErrorCode(error);
+      if (code === 'EEXIST' || code === 'EPERM') {
+        await this.replaceUnindexedPreparedDestination(
+          source,
+          destination,
+          fileKey
+        );
+        return;
+      }
+      if (code !== 'EXDEV') throw error;
     }
 
     const copyPath = path.join(this.dir, `.install-${randomUUID()}`);
     try {
       await pipeline(
         createReadStream(source, {
-          highWaterMark: DiskBackedCache.COPY_CHUNK_BYTES,
+          highWaterMark: DISK_CACHE_COPY_CHUNK_BYTES,
         }),
         createWriteStream(copyPath, {
           flags: 'wx',
           mode: 0o600,
-          highWaterMark: DiskBackedCache.COPY_CHUNK_BYTES,
+          highWaterMark: DISK_CACHE_COPY_CHUNK_BYTES,
         })
       );
-      const copied = await fs.lstat(copyPath);
+      const copied = await this.fileSystem.lstat(copyPath);
       if (!copied.isFile() || copied.size !== serializedBytes) {
         throw new Error('Cross-device prepared-file copy was incomplete');
       }
-      await this.replaceFile(copyPath, destination);
+      try {
+        await this.renameFile(copyPath, destination);
+      } catch (error) {
+        const code = nodeErrorCode(error);
+        if (code !== 'EEXIST' && code !== 'EPERM') throw error;
+        await this.replaceUnindexedPreparedDestination(
+          copyPath,
+          destination,
+          fileKey
+        );
+      }
     } finally {
       await Promise.allSettled([
-        fs.rm(copyPath, { force: true }),
-        fs.rm(source, { force: true }),
+        this.fileSystem.rm(copyPath, { force: true }),
+        this.fileSystem.rm(source, { force: true }),
       ]);
     }
+  }
+
+  private async replaceUnindexedPreparedDestination(
+    source: string,
+    destination: string,
+    fileKey: string
+  ): Promise<void> {
+    if (
+      this.disk.has(fileKey) ||
+      this.fileLeases.has(fileKey) ||
+      activeFileLeaseCount(destination) > 0
+    ) {
+      throw new DiskBackedCacheError(
+        'DISK_CACHE_PREPARED_INVALID',
+        'Prepared cache destination is still owned'
+      );
+    }
+    try {
+      const stats = await this.fileSystem.lstat(destination);
+      if (!stats.isFile()) {
+        throw new DiskBackedCacheError(
+          'DISK_CACHE_PREPARED_INVALID',
+          'Prepared cache destination is not a safe regular file'
+        );
+      }
+      if (
+        this.disk.has(fileKey) ||
+        this.fileLeases.has(fileKey) ||
+        activeFileLeaseCount(destination) > 0
+      ) {
+        throw new DiskBackedCacheError(
+          'DISK_CACHE_PREPARED_INVALID',
+          'Prepared cache destination became owned'
+        );
+      }
+      await this.fileSystem.rm(destination, { force: true });
+    } catch (error) {
+      if (nodeErrorCode(error) !== 'ENOENT') throw error;
+    }
+    // Exactly one retry; a second Windows sharing violation remains visible.
+    await this.renameFile(source, destination);
   }
 
   private releasePreparedFile(
@@ -776,19 +1093,33 @@ export class DiskBackedCache<V> {
   ): Promise<void> {
     if (state.releasePromise) return state.releasePromise;
     if (state.status === 'installing') {
-      state.releasePromise = Promise.resolve(state.operation).then(
-        () => undefined,
-        () => undefined
+      return Promise.resolve(state.operation).then(
+        () => this.removePreparedFile(prepared, state),
+        () => this.removePreparedFile(prepared, state)
       );
-      return state.releasePromise;
     }
-    if (state.status === 'released') return Promise.resolve();
-    state.status = 'released';
-    this.preparedFiles.delete(prepared);
-    state.releasePromise = fs
+    if (state.status === 'active') state.status = 'released';
+    return this.removePreparedFile(prepared, state);
+  }
+
+  private removePreparedFile(
+    prepared: DiskPreparedFile,
+    state: PreparedFileState
+  ): Promise<void> {
+    if (state.slotReleased) return Promise.resolve();
+    if (state.releasePromise) return state.releasePromise;
+    let cleanup: Promise<void>;
+    cleanup = this.fileSystem
       .rm(state.path, { force: true })
-      .then(() => undefined);
-    return state.releasePromise;
+      .then(() => {
+        this.preparedFiles.delete(prepared);
+        this.releasePreparedSlot(state);
+      })
+      .finally(() => {
+        if (state.releasePromise === cleanup) state.releasePromise = undefined;
+      });
+    state.releasePromise = cleanup;
+    return cleanup;
   }
 
   /** Evict least-recently-used disk entries until within budget. */
@@ -820,15 +1151,23 @@ export class DiskBackedCache<V> {
     };
     state.pendingDelete = true;
     this.fileLeases.set(fileKey, state);
-    if (state.leases === 0) this.startPhysicalDelete(fileKey, state);
+    if (state.leases === 0) {
+      // Logical eviction is synchronous; the retryable physical failure is
+      // surfaced by release/flush/clear/close rather than as an unhandled task.
+      void this.startPhysicalDelete(fileKey, state).catch(() => undefined);
+    }
   }
 
   private releaseFileLease(
     fileKey: string,
     state: FileLeaseState
   ): Promise<void> {
-    if (state.leases <= 0) return state.deletePromise ?? Promise.resolve();
+    if (state.leases <= 0) {
+      if (state.pendingDelete) return this.startPhysicalDelete(fileKey, state);
+      return state.deletePromise ?? Promise.resolve();
+    }
     state.leases--;
+    removeActiveFileLease(this.filePath(fileKey));
     if (state.leases === 0) {
       if (state.pendingDelete) return this.startPhysicalDelete(fileKey, state);
       this.fileLeases.delete(fileKey);
@@ -841,17 +1180,34 @@ export class DiskBackedCache<V> {
     state: FileLeaseState
   ): Promise<void> {
     if (state.deletePromise) return state.deletePromise;
+    if (activeFileLeaseCount(this.filePath(fileKey)) > 0) {
+      // Another live cache generation/instance still owns the immutable path.
+      // Keep pendingDelete retryable; a later flush/install may retry safely.
+      return Promise.resolve();
+    }
     let deletion: Promise<void>;
     const run = async (): Promise<void> => {
+      let removed = false;
       try {
-        await fs.rm(this.filePath(fileKey), { force: true });
+        await this.fileSystem.rm(this.filePath(fileKey), { force: true });
+        removed = true;
       } catch (error) {
         logger.debug(
           { name: this.opts.name, err: errorMessage(error) },
           'disk cache deferred delete failed'
         );
+        if (nodeErrorCode(error) === 'ENOENT') {
+          removed = true;
+        } else {
+          throw error;
+        }
       } finally {
-        if (this.fileLeases.get(fileKey) === state && state.leases === 0) {
+        state.deletePromise = undefined;
+        if (
+          removed &&
+          this.fileLeases.get(fileKey) === state &&
+          state.leases === 0
+        ) {
           this.fileLeases.delete(fileKey);
         }
         this.pendingDeletes.delete(deletion);
@@ -861,6 +1217,55 @@ export class DiskBackedCache<V> {
     state.deletePromise = deletion;
     this.pendingDeletes.add(deletion);
     return deletion;
+  }
+
+  private async discardStaleDestination(fileKey: string): Promise<void> {
+    if (this.disk.has(fileKey)) {
+      this.dropDisk(fileKey);
+      const state = this.fileLeases.get(fileKey);
+      if (state?.deletePromise) await state.deletePromise;
+      return;
+    }
+    await this.fileSystem
+      .rm(this.filePath(fileKey), { force: true })
+      .catch(() => undefined);
+  }
+
+  private isCurrentGeneration(generation: number): boolean {
+    return generation === this.generation && !this.closed && !this.clearing;
+  }
+
+  private assertAcceptingGeneration(generation: number): void {
+    if (!this.isCurrentGeneration(generation) || !this.diskEnabled()) {
+      throw this.cacheClosedError();
+    }
+  }
+
+  private cacheClosedError(): DiskBackedCacheError {
+    return new DiskBackedCacheError(
+      'DISK_CACHE_CLOSED',
+      'Disk cache is not accepting new file operations'
+    );
+  }
+
+  private releasePreparedSlot(state?: PreparedFileState): void {
+    if (state?.slotReleased) return;
+    if (state) state.slotReleased = true;
+    if (this.preparedSlots <= 0) {
+      throw new Error('Disk cache prepared-slot accounting invariant violated');
+    }
+    this.preparedSlots--;
+    this.assertPreparedAccounting();
+  }
+
+  private assertPreparedAccounting(): void {
+    if (
+      !Number.isSafeInteger(this.preparedSlots) ||
+      this.preparedSlots < 0 ||
+      this.preparedSlots > DiskBackedCache.MAX_PENDING_WRITES
+    ) {
+      throw new Error('Disk cache prepared-slot accounting invariant violated');
+    }
   }
 
   private assertDiskAccounting(): void {
@@ -911,16 +1316,54 @@ export class DiskBackedCache<V> {
     return removed;
   }
 
-  async clear(): Promise<void> {
+  clear(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    if (this.clearPromise) return this.clearPromise;
+    // Linearization point: every older async mutation is stale before waiting.
+    this.generation++;
+    this.clearing = true;
     this.mem.clear();
     this.memBytes = 0;
+    this.cancelIndexFlushTimer();
+    let operation: Promise<void>;
+    operation = this.clearOnce().finally(() => {
+      if (this.clearPromise === operation) {
+        this.clearPromise = undefined;
+        this.clearing = false;
+      }
+    });
+    this.clearPromise = operation;
+    return operation;
+  }
+
+  private async clearOnce(): Promise<void> {
     await this.ready.catch(() => undefined);
+    this.cancelIndexFlushTimer();
+    await Promise.allSettled([...this.pendingPreparedCreations]);
+    // Active prepared handles are invalidated by the generation change but
+    // remain caller-owned until their mandatory release. Removing their path
+    // here could let an in-flight external writer recreate it after clear.
+    const cleanupFailures: unknown[] = [];
     await Promise.allSettled([...this.pendingWrites.values()]);
+    // Any old snapshot already inside writeFile must settle before the final rm.
+    await this.indexFlush.catch(() => undefined);
     for (const fileKey of [...this.disk.keys()]) this.dropDisk(fileKey);
-    await Promise.allSettled([...this.pendingDeletes]);
+    let deleteError: unknown;
+    try {
+      await this.retryPendingPhysicalDeletes();
+    } catch (error) {
+      deleteError = error;
+    }
     if (this.diskEnabled()) {
-      await fs.rm(this.indexPath, { force: true }).catch(() => {});
+      await this.fileSystem.rm(this.indexPath, { force: true });
       this.indexDirty = false;
+    }
+    if (deleteError) cleanupFailures.push(deleteError);
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(
+        cleanupFailures,
+        'Disk cache clear cleanup did not complete'
+      );
     }
   }
 
@@ -949,7 +1392,14 @@ export class DiskBackedCache<V> {
    * single flush. Unref'd so the timer never keeps the process alive.
    */
   private scheduleIndexFlush(): void {
-    if (this.flushTimer || this.closed || !this.diskEnabled()) return;
+    if (
+      this.flushTimer ||
+      this.closed ||
+      this.clearing ||
+      !this.diskEnabled()
+    ) {
+      return;
+    }
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined;
       void this.flushIndex();
@@ -959,16 +1409,40 @@ export class DiskBackedCache<V> {
 
   /** Persist the disk index. Coalesces concurrent callers. */
   async flushIndex(): Promise<void> {
-    if (!this.diskEnabled() || !this.indexDirty) return;
+    if (
+      !this.diskEnabled() ||
+      !this.indexDirty ||
+      this.closed ||
+      this.clearing
+    ) {
+      return;
+    }
+    return this.flushIndexForGeneration(this.generation, false);
+  }
+
+  private flushIndexForGeneration(
+    generation: number,
+    allowClosed: boolean
+  ): Promise<void> {
     this.indexFlush = this.indexFlush.then(async () => {
-      if (!this.indexDirty) return;
+      if (
+        !this.indexDirty ||
+        generation !== this.generation ||
+        this.clearing ||
+        (this.closed && !allowClosed)
+      ) {
+        return;
+      }
       this.indexDirty = false;
       const snapshot: Record<string, DiskEntry> = {};
       for (const [k, v] of this.disk) snapshot[k] = v;
       try {
-        await fs.writeFile(this.indexPath, JSON.stringify(snapshot));
+        await this.fileSystem.writeFile(
+          this.indexPath,
+          JSON.stringify(snapshot)
+        );
       } catch (err) {
-        this.indexDirty = true;
+        if (generation === this.generation) this.indexDirty = true;
         logger.debug(
           { name: this.opts.name, err: errorMessage(err) },
           'disk cache index flush failed'
@@ -982,25 +1456,102 @@ export class DiskBackedCache<V> {
    * Drain in-flight writes and persist the index, without closing the cache.
    */
   async flush(): Promise<void> {
-    await this.ready.catch(() => {});
+    if (this.closePromise) return this.closePromise;
+    if (this.clearPromise) await this.clearPromise;
+    return this.flushOnce(this.generation, false);
+  }
+
+  private async flushOnce(
+    generation: number,
+    allowClosed: boolean
+  ): Promise<void> {
+    await this.ready.catch(() => undefined);
     await Promise.allSettled([...this.pendingWrites.values()]);
-    await Promise.allSettled([...this.pendingDeletes]);
-    await this.flushIndex();
+    await this.retryPendingPhysicalDeletes();
+    await this.flushIndexForGeneration(generation, allowClosed);
   }
 
   /** Drain in-flight writes, persist the index, and stop accepting writes. */
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    // Linearization point: no operation crossing an await may return a new
+    // prepared/file lease after this synchronous state change.
     this.closed = true;
-    if (this.flushTimer) {
-      clearTimeout(this.flushTimer);
-      this.flushTimer = undefined;
-    }
+    this.generation++;
+    this.cancelIndexFlushTimer();
     diskCacheRegistry.delete(this);
-    await Promise.allSettled(
+    const generation = this.generation;
+    const activeClear = this.clearPromise;
+    this.closePromise = this.closeOnce(generation, activeClear);
+    return this.closePromise;
+  }
+
+  private async closeOnce(
+    generation: number,
+    activeClear: Promise<void> | undefined
+  ): Promise<void> {
+    const cleanupFailures: unknown[] = [];
+    if (activeClear) {
+      try {
+        await activeClear;
+      } catch (error) {
+        cleanupFailures.push(error);
+      }
+    }
+    await this.ready.catch(() => undefined);
+    await Promise.allSettled([...this.pendingPreparedCreations]);
+    cleanupFailures.push(...(await this.releaseAllPreparedFiles()));
+    await Promise.allSettled([...this.pendingWrites.values()]);
+    await this.indexFlush.catch(() => undefined);
+    try {
+      await this.flushOnce(generation, true);
+    } catch (error) {
+      cleanupFailures.push(error);
+    }
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(
+        cleanupFailures,
+        'Disk cache close cleanup did not complete'
+      );
+    }
+  }
+
+  private cancelIndexFlushTimer(): void {
+    if (!this.flushTimer) return;
+    clearTimeout(this.flushTimer);
+    this.flushTimer = undefined;
+  }
+
+  private async releaseAllPreparedFiles(): Promise<unknown[]> {
+    const results = await Promise.allSettled(
       [...this.preparedFiles].map(([prepared, state]) =>
         this.releasePreparedFile(prepared, state)
       )
     );
-    await this.flush();
+    return results.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : []
+    );
+  }
+
+  private async retryPendingPhysicalDeletes(): Promise<void> {
+    const retries = new Set<Promise<void>>(this.pendingDeletes);
+    for (const [fileKey, state] of this.fileLeases) {
+      if (state.pendingDelete && state.leases === 0) {
+        retries.add(this.startPhysicalDelete(fileKey, state));
+      }
+    }
+    const results = await Promise.allSettled(retries);
+    const failures = results
+      .filter(
+        (result): result is PromiseRejectedResult =>
+          result.status === 'rejected'
+      )
+      .map((result) => result.reason);
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        'Disk cache physical cleanup did not complete'
+      );
+    }
   }
 }

@@ -3,19 +3,42 @@ import type { FileHandle } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import { createLogger } from '../../logging/logger.js';
 import type { SegmentData } from '../types.js';
-import { DiskBackedCache } from '../../utils/disk-backed-cache.js';
+import {
+  DISK_CACHE_COPY_CHUNK_BYTES,
+  DiskBackedCache,
+  type DiskBackedCacheOptions,
+  type DiskFileLease,
+  type DiskPreparedFile,
+} from '../../utils/disk-backed-cache.js';
 import { SegmentArena } from './segment-arena.js';
+import type { ByteLease } from './byte-budget.js';
 import {
   DiskSegmentArtifact,
   type SegmentArtifact,
   type SegmentArtifactCacheLookup,
 } from './segment-artifact.js';
 import type { DecodedSegmentMetadata } from './streaming-yenc-article-decoder.js';
+import { resolveSegmentStreamQueuePlan } from '../stream-queue-budget.js';
 
 const logger = createLogger('usenet/segment-cache');
 const MAX_SEGMENT_METADATA_BYTES = 64 * 1024;
-const PROMOTION_COPY_CHUNK_BYTES = 64 * 1024;
+const PROMOTION_COPY_CHUNK_BYTES = DISK_CACHE_COPY_CHUNK_BYTES;
 const DEFAULT_MAX_PROMOTIONS = 4;
+const PROMOTION_QUEUE_CAPACITY_BYTES = resolveSegmentStreamQueuePlan(
+  PROMOTION_COPY_CHUNK_BYTES
+).capacityBytes;
+/** Source queue + destination queue + the largest metadata header. */
+export const SEGMENT_CACHE_PROMOTION_MEMORY_BYTES =
+  2 * PROMOTION_QUEUE_CAPACITY_BYTES + 4 + MAX_SEGMENT_METADATA_BYTES;
+
+class SegmentCacheFormatError extends Error {
+  readonly code = 'USENET_SEGMENT_CACHE_FORMAT';
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'SegmentCacheFormatError';
+  }
+}
 
 /** Point-in-time cache stats for the dashboard. */
 export interface CacheStats {
@@ -57,6 +80,16 @@ export interface SegmentCacheOptions {
   namespace?: string;
   /** Hard concurrent promotion cap; excess best-effort work is skipped. */
   maxPromotions?: number;
+  /** Narrow deterministic I/O seams; production uses node:fs directly. */
+  openFile?: typeof fs.open;
+  lstatFile?: typeof fs.lstat;
+  createPromotionReadStream?: typeof createReadStream;
+  createPromotionWriteStream?: typeof createWriteStream;
+  /** Deterministic barrier immediately before prepared-file admission. */
+  beforePreparedInstall?: () => Promise<void>;
+  /** Generic cache seams used by lifecycle/Windows regression tests. */
+  diskCacheFileSystem?: DiskBackedCacheOptions<SegmentData>['fileSystem'];
+  diskCacheRenameFile?: DiskBackedCacheOptions<SegmentData>['renameFile'];
 }
 
 /** JSON metadata buffer (shared by serialize / size / serialize-into). */
@@ -115,7 +148,9 @@ function optionalSafeInteger(
     !Number.isSafeInteger(value) ||
     value < minimum
   ) {
-    throw new Error(`Segment cache metadata ${field} is invalid`);
+    throw new SegmentCacheFormatError(
+      `Segment cache metadata ${field} is invalid`
+    );
   }
   return value;
 }
@@ -134,7 +169,9 @@ function parseByteRange(value: unknown): readonly [number, number] | undefined {
     begin < 0 ||
     end <= begin
   ) {
-    throw new Error('Segment cache metadata byteRange is invalid');
+    throw new SegmentCacheFormatError(
+      'Segment cache metadata byteRange is invalid'
+    );
   }
   return [begin, end];
 }
@@ -143,9 +180,19 @@ function parseSegmentMetadata(
   encoded: Buffer,
   bodyLength: number
 ): DecodedSegmentMetadata {
-  const value: unknown = JSON.parse(encoded.toString('utf8'));
+  let value: unknown;
+  try {
+    value = JSON.parse(encoded.toString('utf8'));
+  } catch (error) {
+    throw new SegmentCacheFormatError(
+      'Segment cache metadata JSON is invalid',
+      { cause: error }
+    );
+  }
   if (!isRecord(value)) {
-    throw new Error('Segment cache metadata must be an object');
+    throw new SegmentCacheFormatError(
+      'Segment cache metadata must be an object'
+    );
   }
   const byteRange = parseByteRange(value.byteRange);
   const fileSize = optionalSafeInteger(value.fileSize, 'fileSize', 0);
@@ -153,16 +200,22 @@ function parseSegmentMetadata(
   const declaredSize = optionalSafeInteger(value.size, 'size', 0);
   const name = value.name;
   if (name !== undefined && typeof name !== 'string') {
-    throw new Error('Segment cache metadata name is invalid');
+    throw new SegmentCacheFormatError('Segment cache metadata name is invalid');
   }
   if (declaredSize !== undefined && declaredSize !== bodyLength) {
-    throw new Error('Segment cache metadata size differs from its body');
+    throw new SegmentCacheFormatError(
+      'Segment cache metadata size differs from its body'
+    );
   }
   if (byteRange && byteRange[1] - byteRange[0] !== bodyLength) {
-    throw new Error('Segment cache metadata byteRange differs from its body');
+    throw new SegmentCacheFormatError(
+      'Segment cache metadata byteRange differs from its body'
+    );
   }
   if (byteRange && fileSize !== undefined && byteRange[1] > fileSize) {
-    throw new Error('Segment cache metadata byteRange exceeds fileSize');
+    throw new SegmentCacheFormatError(
+      'Segment cache metadata byteRange exceeds fileSize'
+    );
   }
   return {
     byteRange,
@@ -174,14 +227,18 @@ function parseSegmentMetadata(
 }
 
 function deserializeSegment(buf: Buffer): SegmentData {
-  if (buf.length < 4) throw new Error('Segment cache entry is truncated');
+  if (buf.length < 4) {
+    throw new SegmentCacheFormatError('Segment cache entry is truncated');
+  }
   const metaLen = buf.readUInt32LE(0);
   if (
     metaLen <= 0 ||
     metaLen > MAX_SEGMENT_METADATA_BYTES ||
     4 + metaLen > buf.length
   ) {
-    throw new Error('Segment cache metadata header is invalid');
+    throw new SegmentCacheFormatError(
+      'Segment cache metadata header is invalid'
+    );
   }
   const body = buf.subarray(4 + metaLen);
   const metadata = parseSegmentMetadata(
@@ -216,18 +273,39 @@ async function readExactly(
       position + offset
     );
     if (result.bytesRead === 0) {
-      throw new Error('Segment cache entry is truncated');
+      throw new SegmentCacheFormatError('Segment cache entry is truncated');
     }
     offset += result.bytesRead;
+  }
+}
+
+async function writeExactly(
+  handle: FileHandle,
+  buffer: Buffer,
+  position: number
+): Promise<void> {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const result = await handle.write(
+      buffer,
+      offset,
+      buffer.length - offset,
+      position + offset
+    );
+    if (result.bytesWritten === 0) {
+      throw new Error('Segment cache prepared-header write made no progress');
+    }
+    offset += result.bytesWritten;
   }
 }
 
 async function readDiskSegmentMetadata(
   filePath: string,
   serializedBytes: number,
+  openFile: typeof fs.open,
   signal?: AbortSignal
 ): Promise<{ metadata: DecodedSegmentMetadata; bodyOffset: number }> {
-  const handle = await fs.open(filePath, 'r');
+  const handle = await openFile(filePath, 'r');
   try {
     const prefix = Buffer.allocUnsafe(4);
     await readExactly(handle, prefix, 0, signal);
@@ -237,7 +315,9 @@ async function readDiskSegmentMetadata(
       metaLen > MAX_SEGMENT_METADATA_BYTES ||
       4 + metaLen > serializedBytes
     ) {
-      throw new Error('Segment cache metadata header is invalid');
+      throw new SegmentCacheFormatError(
+        'Segment cache metadata header is invalid'
+      );
     }
     const encoded = Buffer.allocUnsafe(metaLen);
     await readExactly(handle, encoded, 4, signal);
@@ -262,6 +342,11 @@ export class SegmentCache implements SegmentArtifactCacheLookup {
   private readonly cache: DiskBackedCache<SegmentData>;
   private readonly maxPromotions: number;
   private readonly promotions = new Set<Promise<boolean>>();
+  private readonly openFile: typeof fs.open;
+  private readonly lstatFile: typeof fs.lstat;
+  private readonly createPromotionReadStream: typeof createReadStream;
+  private readonly createPromotionWriteStream: typeof createWriteStream;
+  private readonly beforePreparedInstall: (() => Promise<void>) | undefined;
   private closed = false;
   /** Pinned decoded-body tier; owned here, driven by MultiProviderPool. */
   readonly arena: SegmentArena;
@@ -274,6 +359,13 @@ export class SegmentCache implements SegmentArtifactCacheLookup {
       );
     }
     this.maxPromotions = maxPromotions;
+    this.openFile = opts.openFile ?? fs.open;
+    this.lstatFile = opts.lstatFile ?? fs.lstat;
+    this.createPromotionReadStream =
+      opts.createPromotionReadStream ?? createReadStream;
+    this.createPromotionWriteStream =
+      opts.createPromotionWriteStream ?? createWriteStream;
+    this.beforePreparedInstall = opts.beforePreparedInstall;
     this.arena = new SegmentArena({ budgetBytes: opts.arenaBytes ?? 0 });
     this.cache = new DiskBackedCache<SegmentData>({
       name: opts.namespace ?? 'segments',
@@ -285,6 +377,8 @@ export class SegmentCache implements SegmentArtifactCacheLookup {
       serializedSize: serializedSegmentSize,
       deserialize: deserializeSegment,
       sizeOf: (s) => s.body.length,
+      fileSystem: opts.diskCacheFileSystem,
+      renameFile: opts.diskCacheRenameFile,
     });
   }
 
@@ -311,29 +405,58 @@ export class SegmentCache implements SegmentArtifactCacheLookup {
     signal?: AbortSignal
   ): Promise<SegmentArtifact | undefined> {
     signal?.throwIfAborted();
-    const lease = await this.cache.acquireDiskFile(messageId);
+    let lease: DiskFileLease | undefined;
+    try {
+      lease = await this.cache.acquireDiskFile(messageId, signal);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      logger.debug(
+        { err: error },
+        'persistent segment cache lookup was temporarily unavailable'
+      );
+      return undefined;
+    }
     if (!lease) return undefined;
     try {
       signal?.throwIfAborted();
       const parsed = await readDiskSegmentMetadata(
         lease.path,
         lease.serializedBytes,
+        this.openFile,
         signal
       );
       signal?.throwIfAborted();
-      return new DiskSegmentArtifact(
+      const artifact = new DiskSegmentArtifact(
         lease,
         parsed.metadata,
         parsed.bodyOffset,
         parsed.metadata.size
       );
+      lease.confirmHit();
+      return artifact;
     } catch (error) {
+      if (signal?.aborted) {
+        await lease.release().catch((releaseError: unknown) => {
+          logger.debug(
+            { err: releaseError },
+            'persistent segment cache abort cleanup failed'
+          );
+        });
+        throw error;
+      }
+      if (error instanceof SegmentCacheFormatError) {
+        lease.invalidateAsMiss();
+        await lease.release();
+        logger.debug(
+          { err: error },
+          'discarded an invalid persistent segment cache entry'
+        );
+        return undefined;
+      }
       await lease.release();
-      if (signal?.aborted) throw error;
-      await this.cache.delete(messageId);
       logger.debug(
         { err: error },
-        'discarded an invalid persistent segment cache entry'
+        'persistent segment cache metadata read was temporarily unavailable'
       );
       return undefined;
     }
@@ -346,24 +469,42 @@ export class SegmentCache implements SegmentArtifactCacheLookup {
   promote(
     messageId: string,
     metadata: DecodedSegmentMetadata,
-    sourcePath: string
+    sourcePath: string,
+    tryAcquireMemory: (bytes: number) => ByteLease | undefined
   ): Promise<boolean> {
     if (
       this.closed ||
       this.cache.maxDiskBytes === 0 ||
-      this.promotions.size >= this.maxPromotions
+      this.promotions.size >= this.maxPromotions ||
+      !Number.isSafeInteger(metadata.size) ||
+      metadata.size <= 0
     ) {
       return Promise.resolve(false);
     }
+    const memoryLease = tryAcquireMemory(SEGMENT_CACHE_PROMOTION_MEMORY_BYTES);
+    if (!memoryLease) return Promise.resolve(false);
+    if (memoryLease.bytes !== SEGMENT_CACHE_PROMOTION_MEMORY_BYTES) {
+      memoryLease.release();
+      return Promise.resolve(false);
+    }
+    // Reserve the generation and prepared slot before the first promotion
+    // await. A concurrent clear/close invalidates every already-started copy.
+    const prepared = this.cache.createPreparedFile();
     let promotion: Promise<boolean>;
     const run = async (): Promise<boolean> => {
       try {
-        return await this.promoteOnce(messageId, metadata, sourcePath);
+        return await this.promoteOnce(
+          messageId,
+          metadata,
+          sourcePath,
+          await prepared
+        );
       } catch (error) {
         logger.debug({ err: error }, 'segment cache promotion failed');
         return false;
       } finally {
         this.promotions.delete(promotion);
+        memoryLease.release();
       }
     };
     promotion = run();
@@ -374,53 +515,60 @@ export class SegmentCache implements SegmentArtifactCacheLookup {
   private async promoteOnce(
     messageId: string,
     metadata: DecodedSegmentMetadata,
-    sourcePath: string
+    sourcePath: string,
+    prepared: DiskPreparedFile
   ): Promise<boolean> {
-    if (!Number.isSafeInteger(metadata.size) || metadata.size <= 0)
-      return false;
-    const sourceStats = await fs.lstat(sourcePath);
-    if (!sourceStats.isFile() || sourceStats.size !== metadata.size)
-      return false;
-    const headerMetadata = metaBufOf({
-      body: Buffer.alloc(0),
-      byteRange: metadata.byteRange
-        ? [metadata.byteRange[0], metadata.byteRange[1]]
-        : undefined,
-      fileSize: metadata.fileSize,
-      totalParts: metadata.totalParts,
-      name: metadata.name,
-      size: metadata.size,
-    });
-    if (
-      headerMetadata.length <= 0 ||
-      headerMetadata.length > MAX_SEGMENT_METADATA_BYTES
-    ) {
-      return false;
-    }
-    const prefix = Buffer.allocUnsafe(4);
-    prefix.writeUInt32LE(headerMetadata.length, 0);
-    const header = Buffer.concat([prefix, headerMetadata]);
-    const serializedBytes = header.length + metadata.size;
-    if (
-      !Number.isSafeInteger(serializedBytes) ||
-      serializedBytes > this.cache.maxDiskBytes
-    ) {
-      return false;
-    }
-
-    const prepared = await this.cache.createPreparedFile();
     try {
-      await fs.writeFile(prepared.path, header, { flag: 'w', mode: 0o600 });
+      const sourceStats = await this.lstatFile(sourcePath);
+      if (!sourceStats.isFile() || sourceStats.size !== metadata.size)
+        return false;
+      const headerMetadata = metaBufOf({
+        body: Buffer.alloc(0),
+        byteRange: metadata.byteRange
+          ? [metadata.byteRange[0], metadata.byteRange[1]]
+          : undefined,
+        fileSize: metadata.fileSize,
+        totalParts: metadata.totalParts,
+        name: metadata.name,
+        size: metadata.size,
+      });
+      if (
+        headerMetadata.length <= 0 ||
+        headerMetadata.length > MAX_SEGMENT_METADATA_BYTES
+      ) {
+        return false;
+      }
+      const serializedBytes = 4 + headerMetadata.length + metadata.size;
+      if (
+        !Number.isSafeInteger(serializedBytes) ||
+        serializedBytes > this.cache.maxDiskBytes
+      ) {
+        return false;
+      }
+
+      // Never use a create-capable flag after the prepared generation was
+      // issued: clear/close may unlink it while source I/O is pending.
+      const headerHandle = await this.openFile(prepared.path, 'r+', 0o600);
+      try {
+        const prefix = Buffer.allocUnsafe(4);
+        prefix.writeUInt32LE(headerMetadata.length, 0);
+        await writeExactly(headerHandle, prefix, 0);
+        await writeExactly(headerHandle, headerMetadata, 4);
+      } finally {
+        await headerHandle.close();
+      }
       await pipeline(
-        createReadStream(sourcePath, {
+        this.createPromotionReadStream(sourcePath, {
           highWaterMark: PROMOTION_COPY_CHUNK_BYTES,
         }),
-        createWriteStream(prepared.path, {
-          flags: 'a',
+        this.createPromotionWriteStream(prepared.path, {
+          flags: 'r+',
           mode: 0o600,
           highWaterMark: PROMOTION_COPY_CHUNK_BYTES,
+          start: 4 + headerMetadata.length,
         })
       );
+      await this.beforePreparedInstall?.();
       return await this.cache.installPreparedFile(
         messageId,
         prepared,
@@ -467,9 +615,9 @@ export class SegmentCache implements SegmentArtifactCacheLookup {
     };
   }
 
-  clear(): void {
+  async clear(): Promise<void> {
     this.arena.clear();
-    void this.cache.clear();
+    await this.cache.clear();
   }
 
   /** Flush the disk index + drain pending writes (called on engine close). */

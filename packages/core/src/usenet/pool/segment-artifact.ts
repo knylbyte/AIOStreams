@@ -2,6 +2,7 @@ import { addAbortSignal, Readable } from 'node:stream';
 import { createReadStream } from 'node:fs';
 import { createLogger } from '../../logging/logger.js';
 import type { DiskFileLease } from '../../utils/disk-backed-cache.js';
+import type { ByteLease } from './byte-budget.js';
 import type { DecodedSegmentMetadata } from './streaming-yenc-article-decoder.js';
 import type { SharedSegment } from './segment-arena.js';
 import type { GrowingSpoolArtifact } from '../spool/growing-artifact.js';
@@ -96,12 +97,14 @@ export interface SegmentArtifactCacheLookup {
   ): Promise<SegmentArtifact | undefined>;
   /**
    * Best-effort promotion of one complete transient spool file. Implementations
-   * must bound concurrency and must not retain `sourcePath` after settlement.
+   * must bound concurrency, atomically acquire every copy-queue byte through
+   * `tryAcquireMemory`, and must not retain `sourcePath` after settlement.
    */
   promote?(
     messageId: string,
     metadata: DecodedSegmentMetadata,
-    sourcePath: string
+    sourcePath: string,
+    tryAcquireMemory: (bytes: number) => ByteLease | undefined
   ): Promise<boolean>;
 }
 

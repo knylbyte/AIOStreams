@@ -173,6 +173,24 @@ export class SegmentSpoolingRuntime {
     }
   }
 
+  /**
+   * Best-effort admission for bounded background promotion queues. Promotion
+   * never queues and never bypasses an already waiting stream/download.
+   */
+  tryAcquirePromotionMemory(bytes: number): ByteLease | undefined {
+    if (
+      this.closedError ||
+      this.memoryWaitingCount > 0 ||
+      !Number.isSafeInteger(bytes) ||
+      bytes <= 0 ||
+      bytes > this.plan.memoryBudgetBytes
+    ) {
+      return undefined;
+    }
+    const lease = this.memoryBudget.tryAcquire(bytes);
+    return lease ?? undefined;
+  }
+
   /** Stop new memory waiters and idempotently dispose the complete spool. */
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
