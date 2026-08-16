@@ -1,5 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { createReadStream, createWriteStream, promises as fs } from 'node:fs';
+import {
+  createReadStream,
+  createWriteStream,
+  promises as fs,
+  type Stats,
+} from 'node:fs';
 import path from 'path';
 import { pipeline } from 'node:stream/promises';
 import { createLogger } from '../logging/logger.js';
@@ -167,6 +172,7 @@ interface UnindexedDeleteState {
   readonly fileKey: string;
   readonly path: string;
   readonly logMessage: string;
+  readonly candidateFingerprint?: DiskPathFingerprint;
   operation?: Promise<void>;
   deleteIntent?: ProcessPathDeleteIntent;
   lastError?: unknown;
@@ -208,18 +214,112 @@ interface RegisteredDiskCache {
 }
 
 const diskCacheRegistry = new Set<RegisteredDiskCache>();
+
+type ProcessPathDeleteOutcome = 'deleted' | 'absent' | 'superseded';
+
+type DiskPathType =
+  | 'file'
+  | 'directory'
+  | 'symbolic-link'
+  | 'block-device'
+  | 'character-device'
+  | 'fifo'
+  | 'socket'
+  | 'other';
+
+/**
+ * Bounded scalar identity of one observed filesystem entry. It intentionally
+ * excludes atime (ordinary reads may change it) and file contents. Device and
+ * inode are combined with type, size and change timestamps so a recycled path
+ * is conservatively recognized without materializing a cache body.
+ */
+interface DiskPathFingerprint {
+  readonly type: DiskPathType;
+  readonly dev: number;
+  readonly ino: number;
+  readonly mode: number;
+  readonly nlink: number;
+  readonly uid: number;
+  readonly gid: number;
+  readonly rdev: number;
+  readonly size: number;
+  readonly blksize: number;
+  readonly blocks: number;
+  readonly mtimeMs: number;
+  readonly ctimeMs: number;
+  readonly birthtimeMs: number;
+}
+
+function diskPathType(stats: Stats): DiskPathType {
+  if (stats.isFile()) return 'file';
+  if (stats.isDirectory()) return 'directory';
+  if (stats.isSymbolicLink()) return 'symbolic-link';
+  if (stats.isBlockDevice()) return 'block-device';
+  if (stats.isCharacterDevice()) return 'character-device';
+  if (stats.isFIFO()) return 'fifo';
+  if (stats.isSocket()) return 'socket';
+  return 'other';
+}
+
+function diskPathFingerprint(stats: Stats): DiskPathFingerprint {
+  return {
+    type: diskPathType(stats),
+    dev: stats.dev,
+    ino: stats.ino,
+    mode: stats.mode,
+    nlink: stats.nlink,
+    uid: stats.uid,
+    gid: stats.gid,
+    rdev: stats.rdev,
+    size: stats.size,
+    blksize: stats.blksize,
+    blocks: stats.blocks,
+    mtimeMs: stats.mtimeMs,
+    ctimeMs: stats.ctimeMs,
+    birthtimeMs: stats.birthtimeMs,
+  };
+}
+
+function sameDiskPathFingerprint(
+  left: DiskPathFingerprint,
+  right: DiskPathFingerprint
+): boolean {
+  return (
+    left.type === right.type &&
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.mode === right.mode &&
+    left.nlink === right.nlink &&
+    left.uid === right.uid &&
+    left.gid === right.gid &&
+    left.rdev === right.rdev &&
+    left.size === right.size &&
+    left.blksize === right.blksize &&
+    left.blocks === right.blocks &&
+    left.mtimeMs === right.mtimeMs &&
+    left.ctimeMs === right.ctimeMs &&
+    left.birthtimeMs === right.birthtimeMs
+  );
+}
+
 interface ProcessPathDeleteRequest {
-  run(): Promise<void>;
+  readonly candidateFingerprint?: DiskPathFingerprint;
+  run(
+    candidateFingerprint: DiskPathFingerprint | undefined
+  ): Promise<ProcessPathDeleteOutcome>;
   onStart(operation: Promise<void>): void;
 }
 
 interface ProcessPathDeleteIntent {
   /** Immutable incarnation token; object identity is never inferred from path. */
   readonly id: symbol;
-  /** Resolves exactly once after rm success or confirmed ENOENT. */
-  readonly completion: Promise<void>;
-  readonly resolveCompletion: () => void;
+  /** Optional physical incarnation observed before this intent was published. */
+  readonly candidateFingerprint?: DiskPathFingerprint;
+  /** Resolves exactly once after delete, confirmed absence or supersession. */
+  readonly completion: Promise<ProcessPathDeleteOutcome>;
+  readonly resolveCompletion: (outcome: ProcessPathDeleteOutcome) => void;
   status: 'unresolved' | 'resolved';
+  outcome?: ProcessPathDeleteOutcome;
   attempt?: Promise<void>;
   pendingAttempt?: ProcessPathDeleteRequest;
   lastError?: unknown;
@@ -315,25 +415,31 @@ function startProcessPathDeleteAttempt(
   if (!selectedRequest) {
     throw new Error('Disk cache delete-attempt invariant violated');
   }
+  // `lastError` describes a settled failed attempt only. Clearing it before
+  // dispatch distinguishes live contention from the narrow rejection/finally
+  // handoff that an explicit retry may safely bridge once.
+  intent.lastError = undefined;
   let operation: Promise<void>;
   operation = Promise.resolve()
-    .then(() => selectedRequest.run())
+    .then(() => selectedRequest.run(intent.candidateFingerprint))
     .then(
-      () => {
+      (outcome) => {
         if (
           state.deleteIntent?.id !== intent.id ||
           intent.status === 'resolved'
         ) {
           return;
         }
-        // Delete success is the incarnation transition: remove the tombstone
-        // before resolving shared completion. Every stale local participant
-        // still holds this resolved token and therefore cannot create a new rm.
+        // A final delete/absent/superseded outcome is the incarnation
+        // transition: remove the tombstone before resolving shared completion.
+        // Every stale local participant still holds this resolved token and
+        // therefore cannot create a new rm.
         intent.status = 'resolved';
+        intent.outcome = outcome;
         intent.lastError = undefined;
         intent.pendingAttempt = undefined;
         state.deleteIntent = undefined;
-        intent.resolveCompletion();
+        intent.resolveCompletion(outcome);
       },
       (error: unknown) => {
         intent.lastError = error;
@@ -408,9 +514,10 @@ function requestProcessPathDelete(
   const state = getProcessPathState(resolved);
   let intent = state.deleteIntent;
   if (!intent) {
-    const completion = Promise.withResolvers<void>();
+    const completion = Promise.withResolvers<ProcessPathDeleteOutcome>();
     intent = {
       id: Symbol('disk-cache-delete-intent'),
+      candidateFingerprint: request.candidateFingerprint,
       completion: completion.promise,
       resolveCompletion: completion.resolve,
       status: 'unresolved',
@@ -437,7 +544,9 @@ function retryProcessPathDelete(
   intent: ProcessPathDeleteIntent,
   request: ProcessPathDeleteRequest
 ): Promise<void> | undefined {
-  if (intent.status === 'resolved') return intent.completion;
+  if (intent.status === 'resolved') {
+    return intent.completion.then(() => undefined);
+  }
   const resolved = resolvedFilePath(filePath);
   const state = processPathOwnership.get(resolved);
   if (!state || state.deleteIntent?.id !== intent.id) {
@@ -634,30 +743,50 @@ export class DiskBackedCache<V> {
           reconciled = true;
         }
       }
+      // Build one complete, fail-safe startup observation before publishing
+      // logical state or scheduling destructive cleanup. Orphan fingerprints
+      // bind later deletes to the exact entry observed by this scan.
+      const present = new Set(await this.fileSystem.readdir(this.dir));
+      const observed = new Map<
+        string,
+        { readonly stats: Stats; readonly fingerprint: DiskPathFingerprint }
+      >();
+      for (const fileKey of present) {
+        try {
+          const stats = await this.fileSystem.lstat(this.filePath(fileKey));
+          observed.set(fileKey, {
+            stats,
+            fingerprint: diskPathFingerprint(stats),
+          });
+        } catch (error) {
+          if (nodeErrorCode(error) !== 'ENOENT') throw error;
+          // A directory entry that disappeared during the snapshot is absent,
+          // not a candidate that may be deleted by a later stale observation.
+        }
+      }
+
       // Index → keep only safe regular files and reconcile legacy index sizes
       // against their actual serialized byte length.
-      const present = new Set(await this.fileSystem.readdir(this.dir));
       const stagedDisk = new Map<string, DiskEntry>();
       let stagedDiskBytes = 0;
       for (const [fileKey, entry] of entries) {
-        if (!present.has(fileKey) || typeof entry?.size !== 'number') {
+        const observation = observed.get(fileKey);
+        if (!observation || typeof entry?.size !== 'number') {
           reconciled = true;
           continue;
         }
-        try {
-          const stats = await this.fileSystem.lstat(this.filePath(fileKey));
-          if (!stats.isFile() || !Number.isSafeInteger(stats.size)) {
-            reconciled = true;
-            continue;
-          }
-          stagedDisk.set(fileKey, { size: stats.size });
-          stagedDiskBytes += stats.size;
-          if (entry.size !== stats.size) reconciled = true;
-        } catch (error) {
-          if (nodeErrorCode(error) !== 'ENOENT') throw error;
-          // Confirmed missing entries are omitted from the reconciled index.
+        const { stats } = observation;
+        if (
+          !stats.isFile() ||
+          !Number.isSafeInteger(stats.size) ||
+          stats.size < 0
+        ) {
           reconciled = true;
+          continue;
         }
+        stagedDisk.set(fileKey, { size: stats.size });
+        stagedDiskBytes += stats.size;
+        if (entry.size !== stats.size) reconciled = true;
       }
       // Commit the logical scan only after index read, directory read and all
       // indexed-file checks completed. Operational uncertainty must never turn
@@ -666,11 +795,12 @@ export class DiskBackedCache<V> {
       this.diskBytes = stagedDiskBytes;
       this.indexDirty = reconciled;
       // Files → delete any not referenced by the index (StremThru cleanOrphaned).
-      for (const fileKey of present) {
+      for (const [fileKey, observation] of observed) {
         if (!this.disk.has(fileKey)) {
           await this.scheduleUnindexedPathDelete(
             fileKey,
-            'disk cache orphan cleanup was deferred'
+            'disk cache orphan cleanup was deferred',
+            observation.fingerprint
           );
         }
       }
@@ -768,21 +898,33 @@ export class DiskBackedCache<V> {
     let serializedBytes: number;
     try {
       const stats = await this.fileSystem.lstat(dataPath);
-      if (!stats.isFile() || !Number.isSafeInteger(stats.size)) {
-        await this.releaseFileLease(fileKey, state);
+      if (
+        !stats.isFile() ||
+        !Number.isSafeInteger(stats.size) ||
+        stats.size < 0
+      ) {
+        // Publish logical invalidation while this lookup still owns its
+        // process-wide lease. The resulting intent closes the path before the
+        // final old lease can be released and a newer incarnation admitted.
         this.dropDisk(fileKey);
+        await this.releaseInvalidatedFileLease(fileKey, state);
         this.misses++;
         return undefined;
       }
       serializedBytes = stats.size;
     } catch (error) {
-      await this.releaseFileLease(fileKey, state);
-      if (signal?.aborted) throw signal.reason;
       if (nodeErrorCode(error) === 'ENOENT') {
+        // There must be no await between the confirmed stale observation and
+        // intent publication. Physical ENOENT confirmation remains tied to
+        // this intent and may safely run after the lease is released.
         this.dropDisk(fileKey);
+        await this.releaseInvalidatedFileLease(fileKey, state);
+        if (signal?.aborted) throw signal.reason;
         this.misses++;
         return undefined;
       }
+      await this.releaseFileLease(fileKey, state);
+      if (signal?.aborted) throw signal.reason;
       throw error;
     }
     try {
@@ -1487,6 +1629,26 @@ export class DiskBackedCache<V> {
     if (processReleaseError) throw processReleaseError;
   }
 
+  /**
+   * Release a lookup lease after its logical entry was synchronously
+   * invalidated. A physical cleanup failure is already retained by the shared
+   * delete intent; it must not turn a definitive stale lookup into an
+   * unhandled background rejection or accidentally reopen the path.
+   */
+  private async releaseInvalidatedFileLease(
+    fileKey: string,
+    state: FileLeaseState
+  ): Promise<void> {
+    try {
+      await this.releaseFileLease(fileKey, state);
+    } catch (error) {
+      logger.debug(
+        { name: this.opts.name, err: errorMessage(error) },
+        'disk cache stale lookup cleanup remains pending'
+      );
+    }
+  }
+
   private bindFileDeleteIntent(
     fileKey: string,
     state: FileLeaseState,
@@ -1516,6 +1678,43 @@ export class DiskBackedCache<V> {
     }
   }
 
+  /**
+   * Remove one path under its already-published process intent. Startup
+   * candidates carry a fingerprint captured by the complete fail-safe scan;
+   * indexed/stale-destination deletes intentionally omit it because their
+   * logical delete itself owns the current incarnation.
+   */
+  private async removePathForDeleteIntent(
+    dataPath: string,
+    candidateFingerprint: DiskPathFingerprint | undefined
+  ): Promise<ProcessPathDeleteOutcome> {
+    if (candidateFingerprint) {
+      let current: Stats;
+      try {
+        current = await this.fileSystem.lstat(dataPath);
+      } catch (error) {
+        if (nodeErrorCode(error) === 'ENOENT') return 'absent';
+        throw error;
+      }
+      if (
+        !sameDiskPathFingerprint(
+          candidateFingerprint,
+          diskPathFingerprint(current)
+        )
+      ) {
+        return 'superseded';
+      }
+    }
+
+    try {
+      await this.fileSystem.rm(dataPath, { force: true });
+      return 'deleted';
+    } catch (error) {
+      if (nodeErrorCode(error) === 'ENOENT') return 'absent';
+      throw error;
+    }
+  }
+
   private startPhysicalDelete(
     fileKey: string,
     state: FileLeaseState
@@ -1524,26 +1723,34 @@ export class DiskBackedCache<V> {
     const dataPath = this.filePath(fileKey);
     let deletion: Promise<void> | undefined;
     const request: ProcessPathDeleteRequest = {
-      run: async () => {
+      run: async (candidateFingerprint) => {
         try {
-          await this.fileSystem.rm(dataPath, { force: true });
+          return await this.removePathForDeleteIntent(
+            dataPath,
+            candidateFingerprint
+          );
         } catch (error) {
           logger.debug(
             { name: this.opts.name, err: errorMessage(error) },
             'disk cache deferred delete failed'
           );
-          if (nodeErrorCode(error) !== 'ENOENT') throw error;
-        } finally {
-          if (state.deletePromise === deletion) {
-            state.deletePromise = undefined;
-          }
-          if (deletion) this.pendingDeletes.delete(deletion);
+          throw error;
         }
       },
       onStart: (operation) => {
         deletion = operation;
         state.deletePromise = operation;
         this.pendingDeletes.add(operation);
+        const finishAttempt = (): void => {
+          if (state.deletePromise === deletion) {
+            state.deletePromise = undefined;
+          }
+          if (deletion) this.pendingDeletes.delete(deletion);
+        };
+        // Keep the attempt registered through the process intent's rejection
+        // and finally transition. Explicit flush/close can then deterministically
+        // await it before issuing their one bounded retry.
+        void operation.then(finishAttempt, finishAttempt);
         // File-lease callers still observe the original rejection. This
         // additional observer prevents a deferred cleanup started by a caller
         // that intentionally ignores release() from becoming unhandled.
@@ -1553,7 +1760,7 @@ export class DiskBackedCache<V> {
     const currentIntent = state.deleteIntent;
     if (currentIntent?.status === 'resolved') {
       this.completeFileDeleteIntent(fileKey, state, currentIntent);
-      return currentIntent.completion;
+      return currentIntent.completion.then(() => undefined);
     }
     if (currentIntent) {
       return (
@@ -1568,7 +1775,8 @@ export class DiskBackedCache<V> {
 
   private scheduleUnindexedPathDelete(
     fileKey: string,
-    logMessage: string
+    logMessage: string,
+    candidateFingerprint?: DiskPathFingerprint
   ): Promise<void> {
     const dataPath = this.filePath(fileKey);
     const resolvedPath = resolvedFilePath(dataPath);
@@ -1582,6 +1790,7 @@ export class DiskBackedCache<V> {
         fileKey,
         path: resolvedPath,
         logMessage,
+        candidateFingerprint,
       };
       this.unindexedDeletes.set(resolvedPath, state);
     }
@@ -1592,23 +1801,27 @@ export class DiskBackedCache<V> {
     if (state.operation) return state.operation;
     let deletion: Promise<void> | undefined;
     const request: ProcessPathDeleteRequest = {
-      run: async () => {
+      candidateFingerprint: state.candidateFingerprint,
+      run: async (candidateFingerprint) => {
         try {
-          await this.fileSystem.rm(state.path, { force: true });
+          return await this.removePathForDeleteIntent(
+            state.path,
+            candidateFingerprint
+          );
         } catch (error) {
-          if (nodeErrorCode(error) !== 'ENOENT') {
-            state.lastError = error;
-            throw error;
-          }
-        } finally {
-          if (state.operation === deletion) state.operation = undefined;
-          if (deletion) this.pendingDeletes.delete(deletion);
+          state.lastError = error;
+          throw error;
         }
       },
       onStart: (operation) => {
         deletion = operation;
         state.operation = operation;
         this.pendingDeletes.add(operation);
+        const finishAttempt = (): void => {
+          if (state.operation === deletion) state.operation = undefined;
+          if (deletion) this.pendingDeletes.delete(deletion);
+        };
+        void operation.then(finishAttempt, finishAttempt);
         void operation.catch((error: unknown) => {
           logger.debug(
             { name: this.opts.name, err: errorMessage(error) },
@@ -1620,7 +1833,7 @@ export class DiskBackedCache<V> {
     const currentIntent = state.deleteIntent;
     if (currentIntent?.status === 'resolved') {
       this.completeUnindexedDeleteIntent(state, currentIntent);
-      return currentIntent.completion;
+      return currentIntent.completion.then(() => undefined);
     }
     if (currentIntent) {
       return (
@@ -2011,7 +2224,13 @@ export class DiskBackedCache<V> {
       ...this.unindexedDeletes.values(),
     ]
   ): Promise<void> {
-    const retries = new Set<Promise<void>>(this.pendingDeletes);
+    // Settle every attempt that was already admitted before this explicit
+    // cleanup barrier. Its completion observers clear the local operation
+    // slots first; failed unresolved intents are then eligible for exactly one
+    // fresh attempt below.
+    await Promise.allSettled([...this.pendingDeletes]);
+
+    const retries = new Set<Promise<void>>();
     for (const [fileKey, state] of this.fileLeases) {
       if (state.pendingDelete && state.leases === 0) {
         retries.add(this.startPhysicalDelete(fileKey, state));

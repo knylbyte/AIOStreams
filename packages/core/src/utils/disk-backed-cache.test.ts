@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import type { Stats } from 'node:fs';
 import {
   access,
+  lstat,
   mkdir,
   open,
   mkdtemp,
@@ -33,6 +35,15 @@ function fileKey(key: string): string {
 
 function codedError(code: string, message = code): Error & { code: string } {
   return Object.assign(new Error(message), { code });
+}
+
+function reportAsNonRegular(stats: Stats): Stats {
+  return new Proxy(stats, {
+    get: (target, property, receiver) =>
+      property === 'isFile'
+        ? () => false
+        : Reflect.get(target, property, receiver),
+  });
 }
 
 function createCache(
@@ -1158,6 +1169,293 @@ test('transient lstat errors preserve entries and do not finalize lookup stats',
   assert.equal(cache.stats().diskHits, 1);
 });
 
+test('stale ENOENT invalidation fences a pre-admitted background replace before lease release', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-stale-enoent-'));
+  const key = 'stale-enoent';
+  const dataPath = path.join(root, 'test-cache', fileKey(key));
+  const backgroundWriteEntered = deferred();
+  const continueBackgroundWrite = deferred();
+  let pauseBackgroundWrite = true;
+  const writer = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      writeFile: async (candidate, data, options) => {
+        await writeFile(candidate, data, options);
+        if (
+          pauseBackgroundWrite &&
+          path.basename(String(candidate)).startsWith('.write-')
+        ) {
+          pauseBackgroundWrite = false;
+          backgroundWriteEntered.resolve();
+          await continueBackgroundWrite.promise;
+        }
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await writer.whenReady();
+  await writePersistentEntry(root, key, Buffer.from('old!'));
+
+  const staleLstatEntered = deferred();
+  const continueStaleLstat = deferred();
+  let reportMissing = false;
+  const stale = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      lstat: async (candidate) => {
+        if (reportMissing && String(candidate) === dataPath) {
+          staleLstatEntered.resolve();
+          await continueStaleLstat.promise;
+          queueMicrotask(() => {
+            queueMicrotask(() => continueBackgroundWrite.resolve());
+          });
+          throw codedError('ENOENT');
+        }
+        return lstat(candidate);
+      },
+    },
+  });
+  await stale.whenReady();
+  await rm(dataPath, { force: true });
+  reportMissing = true;
+
+  const lookup = stale.acquireDiskFile(key);
+  await staleLstatEntered.promise;
+  writer.set(key, Buffer.from('lost'));
+  await backgroundWriteEntered.promise;
+  continueStaleLstat.resolve();
+
+  assert.equal(await lookup, undefined);
+  await writer.flush();
+  assert.deepEqual(
+    {
+      staleMisses: stale.stats().misses,
+      writerDiskBytes: writer.stats().diskBytes,
+      writerDiskCount: writer.stats().diskCount,
+    },
+    { staleMisses: 1, writerDiskBytes: 0, writerDiskCount: 0 }
+  );
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+
+  writer.set(key, Buffer.from('new!'));
+  await writer.flush();
+  const fresh = await writer.acquireDiskFile(key);
+  assert(fresh);
+  assert.equal((await readFile(fresh.path)).toString(), 'new!');
+  await fresh.release();
+  await stale.close();
+  await writer.close();
+});
+
+test('stale ENOENT invalidation rejects a cross-instance prepared install in the release window', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-stale-prepared-'));
+  const key = 'stale-prepared-window';
+  const dataPath = path.join(root, 'test-cache', fileKey(key));
+  const preparedLstatEntered = deferred();
+  const continuePreparedLstat = deferred();
+  let pausedPreparedPath: string | undefined;
+  let pausePreparedLstat = true;
+  const writer = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      lstat: async (candidate) => {
+        const stats = await lstat(candidate);
+        if (pausePreparedLstat && String(candidate) === pausedPreparedPath) {
+          pausePreparedLstat = false;
+          preparedLstatEntered.resolve();
+          await continuePreparedLstat.promise;
+        }
+        return stats;
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await writer.whenReady();
+  await writePersistentEntry(root, key, Buffer.from('old!'));
+
+  const staleLstatEntered = deferred();
+  const continueStaleLstat = deferred();
+  let reportMissing = false;
+  const stale = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      lstat: async (candidate) => {
+        if (reportMissing && String(candidate) === dataPath) {
+          staleLstatEntered.resolve();
+          await continueStaleLstat.promise;
+          queueMicrotask(() => {
+            queueMicrotask(() => continuePreparedLstat.resolve());
+          });
+          throw codedError('ENOENT');
+        }
+        return lstat(candidate);
+      },
+    },
+  });
+  await stale.whenReady();
+  const staged = await prepared(writer, Buffer.from('lost'));
+  pausedPreparedPath = staged.path;
+  await rm(dataPath, { force: true });
+  reportMissing = true;
+
+  const lookup = stale.acquireDiskFile(key);
+  await staleLstatEntered.promise;
+  const install = writer.installPreparedFile(key, staged, 4);
+  await preparedLstatEntered.promise;
+  continueStaleLstat.resolve();
+
+  assert.equal(await lookup, undefined);
+  assert.equal(await install, false);
+  assert.equal(writer.stats().diskCount, 0);
+  assert.equal(
+    await writer.installPreparedFile(
+      key,
+      await prepared(writer, Buffer.from('new!')),
+      4
+    ),
+    true
+  );
+  const fresh = await writer.acquireDiskFile(key);
+  assert(fresh);
+  assert.equal((await readFile(fresh.path)).toString(), 'new!');
+  await fresh.release();
+  await stale.close();
+  await writer.close();
+});
+
+test('unsafe lookup invalidation fences a pre-admitted replacement before lease release', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-stale-unsafe-'));
+  const key = 'stale-unsafe';
+  const dataPath = path.join(root, 'test-cache', fileKey(key));
+  const backgroundWriteEntered = deferred();
+  const continueBackgroundWrite = deferred();
+  let pauseBackgroundWrite = true;
+  const writer = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      writeFile: async (candidate, data, options) => {
+        await writeFile(candidate, data, options);
+        if (
+          pauseBackgroundWrite &&
+          path.basename(String(candidate)).startsWith('.write-')
+        ) {
+          pauseBackgroundWrite = false;
+          backgroundWriteEntered.resolve();
+          await continueBackgroundWrite.promise;
+        }
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await writer.whenReady();
+  await writePersistentEntry(root, key, Buffer.from('old!'));
+
+  const staleLstatEntered = deferred();
+  const continueStaleLstat = deferred();
+  let reportUnsafe = false;
+  const stale = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      lstat: async (candidate) => {
+        const stats = await lstat(candidate);
+        if (reportUnsafe && String(candidate) === dataPath) {
+          staleLstatEntered.resolve();
+          await continueStaleLstat.promise;
+          queueMicrotask(() => {
+            queueMicrotask(() => continueBackgroundWrite.resolve());
+          });
+          return reportAsNonRegular(stats);
+        }
+        return stats;
+      },
+    },
+  });
+  await stale.whenReady();
+  reportUnsafe = true;
+
+  const lookup = stale.acquireDiskFile(key);
+  await staleLstatEntered.promise;
+  writer.set(key, Buffer.from('lost'));
+  await backgroundWriteEntered.promise;
+  continueStaleLstat.resolve();
+
+  assert.equal(await lookup, undefined);
+  await writer.flush();
+  assert.equal(writer.stats().diskCount, 0);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  writer.set(key, Buffer.from('safe'));
+  await writer.flush();
+  const fresh = await writer.acquireDiskFile(key);
+  assert(fresh);
+  assert.equal((await readFile(fresh.path)).toString(), 'safe');
+  await fresh.release();
+  await stale.close();
+  await writer.close();
+});
+
+test('stale lookup cleanup failure keeps its intent fenced until explicit retry', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-stale-retry-'));
+  const key = 'stale-cleanup-retry';
+  const dataPath = path.join(root, 'test-cache', fileKey(key));
+  const writer = createCache(context, root, { maxDiskBytes: 32 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await writer.whenReady();
+  await writePersistentEntry(root, key, Buffer.from('old!'));
+
+  let reportUnsafe = false;
+  let deleteCalls = 0;
+  const stale = createCache(context, root, {
+    maxDiskBytes: 32,
+    fileSystem: {
+      lstat: async (candidate) => {
+        const stats = await lstat(candidate);
+        return reportUnsafe && String(candidate) === dataPath
+          ? reportAsNonRegular(stats)
+          : stats;
+      },
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath && ++deleteCalls === 1) {
+          throw codedError('EBUSY');
+        }
+        return rm(candidate, options);
+      },
+    },
+  });
+  await stale.whenReady();
+  reportUnsafe = true;
+
+  assert.equal(await stale.acquireDiskFile(key), undefined);
+  assert.equal(stale.stats().misses, 1);
+  assert.equal(deleteCalls, 1);
+  await access(dataPath);
+  assert.equal(
+    await writer.installPreparedFile(
+      key,
+      await prepared(writer, Buffer.from('blocked')),
+      7
+    ),
+    false
+  );
+
+  await stale.flush();
+  assert.equal(deleteCalls, 2);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  assert.equal(
+    await writer.installPreparedFile(
+      key,
+      await prepared(writer, Buffer.from('fresh')),
+      5
+    ),
+    true
+  );
+  const fresh = await writer.acquireDiskFile(key);
+  assert(fresh);
+  assert.equal((await readFile(fresh.path)).toString(), 'fresh');
+  await fresh.release();
+  await stale.close();
+  await writer.close();
+});
+
 test('buffering deserialize corruption records one miss with no hit rollback drift', async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-deserialize-'));
   const cache = new DiskBackedCache<Buffer>({
@@ -1522,6 +1820,194 @@ test('startup reconciliation discards only structurally invalid index entries', 
     [validKey]: { size: body.length },
   });
   assert.deepEqual(await cache.getAsync('valid-index-entry'), body);
+});
+
+test('startup orphan fingerprint supersedes a candidate replaced before intent publication', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-orphan-aba-'));
+  const key = 'orphan-incarnation';
+  const writer = createCache(context, root, { maxDiskBytes: 32 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await writer.whenReady();
+  const { dataPath } = await writePersistentEntry(
+    root,
+    key,
+    Buffer.from('old!')
+  );
+
+  let replaced = false;
+  let deleteCalls = 0;
+  const scanner = createCache(context, root, {
+    maxDiskBytes: 32,
+    fileSystem: {
+      lstat: async (candidate) => {
+        const observed = await lstat(candidate);
+        if (!replaced && String(candidate) === dataPath) {
+          replaced = true;
+          writer.set(key, Buffer.from('new-content'));
+          await writer.flush();
+          // This scan observed an unsafe old entry. The process-local writer
+          // replaced it before the scanner can publish its delete intent.
+          return reportAsNonRegular(observed);
+        }
+        return observed;
+      },
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath) deleteCalls++;
+        return rm(candidate, options);
+      },
+    },
+  });
+
+  await scanner.whenReady();
+  assert.equal(replaced, true);
+  assert.equal(deleteCalls, 0);
+  assert.equal((await readFile(dataPath)).toString(), 'new-content');
+  assert.deepEqual(
+    {
+      scannerDiskCount: scanner.stats().diskCount,
+      writerDiskBytes: writer.stats().diskBytes,
+      writerDiskCount: writer.stats().diskCount,
+    },
+    { scannerDiskCount: 0, writerDiskBytes: 11, writerDiskCount: 1 }
+  );
+
+  await scanner.flush();
+  await scanner.close();
+  assert.equal(deleteCalls, 0);
+  assert.equal((await readFile(dataPath)).toString(), 'new-content');
+  const fresh = await writer.acquireDiskFile(key);
+  assert(fresh);
+  assert.equal((await readFile(fresh.path)).toString(), 'new-content');
+  await fresh.release();
+  await writer.close();
+});
+
+test('unchanged startup orphan is removed exactly once after fingerprint revalidation', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-orphan-stable-'));
+  const directory = path.join(root, 'test-cache');
+  const dataPath = path.join(directory, fileKey('stable-orphan'));
+  await mkdir(directory, { recursive: true });
+  await writeFile(dataPath, 'orphan', { mode: 0o600 });
+  let deleteCalls = 0;
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath) deleteCalls++;
+        return rm(candidate, options);
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  await cache.whenReady();
+  assert.equal(deleteCalls, 1);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  await cache.flush();
+  await cache.close();
+  assert.equal(deleteCalls, 1);
+});
+
+test('startup orphan disappearance completes as absent without a stale rm', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-orphan-absent-'));
+  const directory = path.join(root, 'test-cache');
+  const key = 'absent-orphan';
+  const dataPath = path.join(directory, fileKey(key));
+  await mkdir(directory, { recursive: true });
+  await writeFile(dataPath, 'orphan', { mode: 0o600 });
+  let removedAfterObservation = false;
+  let deleteCalls = 0;
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      lstat: async (candidate) => {
+        const observed = await lstat(candidate);
+        if (!removedAfterObservation && String(candidate) === dataPath) {
+          removedAfterObservation = true;
+          await rm(dataPath, { force: true });
+        }
+        return observed;
+      },
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath) deleteCalls++;
+        return rm(candidate, options);
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  await cache.whenReady();
+  assert.equal(removedAfterObservation, true);
+  assert.equal(deleteCalls, 0);
+  await cache.flush();
+  assert.equal(deleteCalls, 0);
+  assert.equal(
+    await cache.installPreparedFile(
+      key,
+      await prepared(cache, Buffer.from('new!')),
+      4
+    ),
+    true
+  );
+  const fresh = await cache.acquireDiskFile(key);
+  assert(fresh);
+  assert.equal((await readFile(fresh.path)).toString(), 'new!');
+  await fresh.release();
+  await cache.close();
+});
+
+test('startup fingerprint revalidation error remains fenced until explicit retry', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-orphan-recheck-'));
+  const directory = path.join(root, 'test-cache');
+  const key = 'recheck-orphan';
+  const dataPath = path.join(directory, fileKey(key));
+  await mkdir(directory, { recursive: true });
+  await writeFile(dataPath, 'orphan', { mode: 0o600 });
+  let targetLstatCalls = 0;
+  let deleteCalls = 0;
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      lstat: async (candidate) => {
+        if (String(candidate) === dataPath && ++targetLstatCalls === 2) {
+          throw codedError('EIO');
+        }
+        return lstat(candidate);
+      },
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath) deleteCalls++;
+        return rm(candidate, options);
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  await cache.whenReady();
+  assert.equal(targetLstatCalls, 2);
+  assert.equal(deleteCalls, 0);
+  await access(dataPath);
+  assert.equal(
+    await cache.installPreparedFile(
+      key,
+      await prepared(cache, Buffer.from('nope')),
+      4
+    ),
+    false
+  );
+
+  await cache.flush();
+  assert.equal(targetLstatCalls, 3);
+  assert.equal(deleteCalls, 1);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  assert.equal(
+    await cache.installPreparedFile(
+      key,
+      await prepared(cache, Buffer.from('new!')),
+      4
+    ),
+    true
+  );
+  await cache.close();
 });
 
 test('same-instance lease plus clear publishes delete intent before final release', async (context) => {
