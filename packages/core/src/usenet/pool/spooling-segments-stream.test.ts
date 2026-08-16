@@ -23,6 +23,7 @@ import type {
   SegmentArtifact,
   SegmentArtifactFetchOptions,
   SegmentArtifactReadOptions,
+  SegmentRangeLayout,
   SegmentRangeMetadataFetchOptions,
   SegmentRangeMetadata,
 } from './segment-artifact.js';
@@ -32,6 +33,7 @@ import { SegmentsStream } from './segments-stream.js';
 import {
   SpoolingSegmentsStream,
   type SpoolingSegmentArtifactSource,
+  type SpoolingSegmentLogicalRange,
 } from './spooling-segments-stream.js';
 import { reapIdleStreams } from './tracked-stream.js';
 import { YencMetadataError } from './yenc.js';
@@ -440,7 +442,16 @@ function streamOptions(
     readonly maxPrefetchSegments: number;
     readonly skipBytes: number;
     readonly limitBytes: number;
+    readonly firstSegmentStartByte: number;
+    readonly fileEndByte: number;
+    readonly layoutHint: SegmentRangeLayout;
     readonly sizeForSegment: (idx: number) => number | undefined;
+    readonly byteRangeForSegment: (
+      idx: number
+    ) => readonly [number, number] | undefined;
+    readonly logicalRangeForSegment: (
+      idx: number
+    ) => SpoolingSegmentLogicalRange | undefined;
     readonly knownHoles: ReadonlySet<number>;
     readonly onHole: (
       idx: number,
@@ -457,8 +468,13 @@ function streamOptions(
     readerHighWaterMarkBytes: 4,
     skipBytes: overrides.skipBytes,
     limitBytes: overrides.limitBytes,
+    firstSegmentStartByte: overrides.firstSegmentStartByte,
+    fileEndByte: overrides.fileEndByte,
+    layoutHint: overrides.layoutHint,
     priority: CommandPriority.High,
     sizeForSegment: overrides.sizeForSegment,
+    byteRangeForSegment: overrides.byteRangeForSegment,
+    logicalRangeForSegment: overrides.logicalRangeForSegment,
     knownHoles: overrides.knownHoles,
     onHole: overrides.onHole,
   };
@@ -894,6 +910,197 @@ test('nonuniform global yEnc ranges use bounded target probes without a syntheti
   assert.equal(source.activeStreamLeases, 0);
 });
 
+test('nonzero global seeks reject an overlapping or gapped predecessor before body fetch', async (t) => {
+  for (const fixture of [
+    {
+      name: 'overlap',
+      ranges: [
+        [0, 5],
+        [4, 9],
+      ] as const,
+      start: 6,
+    },
+    {
+      name: 'gap',
+      ranges: [
+        [0, 4],
+        [5, 9],
+      ] as const,
+      start: 6,
+    },
+  ]) {
+    await t.test(fixture.name, async () => {
+      const holes: HoleInfo[] = [];
+      const source = new TestArtifactSource(
+        () =>
+          Promise.reject(
+            new Error('contradictory predecessor must prevent body fetch')
+          ),
+        (candidate) => {
+          const index = Number(candidate.messageId.split('-')[1]);
+          const range = fixture.ranges[index];
+          assert(range);
+          return Promise.resolve({
+            byteRange: range,
+            fileSize: 9,
+            totalParts: 2,
+            decodedSize: range[1] - range[0],
+            layout: 'global-range',
+          });
+        }
+      );
+      const file = new FileStream(
+        source,
+        { segments: [segment(0), segment(1)], knownSize: 9 },
+        `nonzero-predecessor-${fixture.name}`,
+        {
+          ...DEFAULT_ENGINE_OPTIONS,
+          streamingMode: 'segment_spooling',
+          prefetchSegments: 1,
+        },
+        undefined,
+        {
+          hooks: {
+            onHole: (info) => {
+              holes.push(info);
+              return 'pad';
+            },
+          },
+          fileIndex: 0,
+        }
+      );
+      await file.open();
+      const stream = file.createReadStream({
+        start: fixture.start,
+        end: 8,
+      });
+
+      await assert.rejects(collect(stream), (error: unknown) => {
+        assert(error instanceof YencMetadataError);
+        assert.equal(error.code, 'inconsistent_layout');
+        return true;
+      });
+      await closeEvent(stream);
+      assert.deepEqual(
+        source.metadataRequests.map((request) => request.segment.messageId),
+        ['segment-1', 'segment-0']
+      );
+      assert.equal(source.calls.length, 0);
+      assert.deepEqual(holes, []);
+      assert.equal(source.activeStreamLeases, 0);
+    });
+  }
+});
+
+test('nonzero global seek validates a nonuniform predecessor and fetches only its target', async () => {
+  const ranges = [
+    [0, 4],
+    [4, 9],
+    [9, 10],
+  ] as const;
+  const target = new BufferArtifact(Buffer.from('j'), {
+    byteRange: ranges[2],
+    fileSize: 10,
+    totalParts: 3,
+  });
+  const source = new TestArtifactSource(
+    (call) => {
+      assert.equal(call.segment.messageId, 'segment-2');
+      return Promise.resolve(target);
+    },
+    (candidate) => {
+      const index = Number(candidate.messageId.split('-')[1]);
+      const range = ranges[index];
+      assert(range);
+      return Promise.resolve({
+        byteRange: range,
+        fileSize: 10,
+        totalParts: 3,
+        decodedSize: range[1] - range[0],
+        layout: 'global-range',
+      });
+    }
+  );
+  const file = new FileStream(
+    source,
+    { segments: [segment(0), segment(1), segment(2)], knownSize: 10 },
+    'nonzero-valid-predecessor',
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      streamingMode: 'segment_spooling',
+      prefetchSegments: 1,
+    }
+  );
+  await file.open();
+
+  assert.equal(
+    (await collect(file.createReadStream({ start: 9, end: 10 }))).toString(),
+    'j'
+  );
+  assert.deepEqual(
+    source.metadataRequests.map((request) => request.segment.messageId),
+    ['segment-2', 'segment-1']
+  );
+  assert.equal(source.calls.length, 1);
+  assert.equal(source.calls[0].segment.messageId, 'segment-2');
+  assert.equal(target.releaseCalls, 1);
+  assert.equal(source.activeStreamLeases, 0);
+});
+
+test('a cached authoritative predecessor avoids a duplicate nonzero-seek probe', async () => {
+  const ranges = [
+    [0, 4],
+    [4, 9],
+  ] as const;
+  const target = new BufferArtifact(Buffer.from('efghi'), {
+    byteRange: ranges[1],
+    fileSize: 9,
+    totalParts: 2,
+  });
+  const source = new TestArtifactSource(
+    () => Promise.resolve(target),
+    (candidate) => {
+      const index = Number(candidate.messageId.split('-')[1]);
+      const range = ranges[index];
+      assert(range);
+      return Promise.resolve({
+        byteRange: range,
+        fileSize: 9,
+        totalParts: 2,
+        decodedSize: range[1] - range[0],
+        layout: 'global-range',
+      });
+    }
+  );
+  const file = new FileStream(
+    source,
+    { segments: [segment(0), segment(1)] },
+    'cached-valid-predecessor',
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      streamingMode: 'segment_spooling',
+      prefetchSegments: 1,
+    }
+  );
+  await file.open();
+  assert.deepEqual(
+    source.metadataRequests.map((request) => request.segment.messageId),
+    ['segment-0']
+  );
+
+  assert.equal(
+    (await collect(file.createReadStream({ start: 5, end: 8 }))).toString(),
+    'fgh'
+  );
+  assert.deepEqual(
+    source.metadataRequests.map((request) => request.segment.messageId),
+    ['segment-0', 'segment-1']
+  );
+  assert.equal(source.calls.length, 1);
+  assert.equal(target.releaseCalls, 1);
+  assert.equal(source.activeStreamLeases, 0);
+});
+
 test('nonuniform global holes fail closed until exact topology proves their range', async () => {
   const unprovenMiss = new ArticleNotFoundError('middle body missing', {
     messageId: 'segment-1',
@@ -1179,6 +1386,195 @@ test('global gaps, overlaps, and wrong final ends fail before contradictory outp
   }
 });
 
+test('standalone final parts must end at the exact known file boundary', async (t) => {
+  for (const fixture of [
+    { name: 'body exceeds known size', knownSize: 8 },
+    { name: 'body is shorter than known size', knownSize: 12 },
+  ]) {
+    await t.test(fixture.name, async () => {
+      const artifacts = [
+        new BufferArtifact(Buffer.from('abcd'), {
+          fileSize: 4,
+          totalParts: 1,
+        }),
+        new BufferArtifact(Buffer.from('efghij'), {
+          fileSize: 6,
+          totalParts: 1,
+        }),
+      ];
+      const source = new TestArtifactSource((call) => {
+        const index = Number(call.segment.messageId.split('-')[1]);
+        const artifact = artifacts[index];
+        assert(artifact);
+        return Promise.resolve(artifact);
+      });
+      const file = new FileStream(
+        source,
+        {
+          segments: [segment(0), segment(1)],
+          knownSize: fixture.knownSize,
+        },
+        `standalone-final-${fixture.knownSize}`,
+        {
+          ...DEFAULT_ENGINE_OPTIONS,
+          streamingMode: 'segment_spooling',
+          prefetchSegments: 2,
+        }
+      );
+      await file.open();
+      const stream = file.createReadStream();
+      const output: Buffer[] = [];
+      stream.on('data', (chunk: Buffer) => output.push(chunk));
+
+      await assert.rejects(collect(stream), (error: unknown) => {
+        assert(error instanceof YencMetadataError);
+        assert.equal(error.code, 'inconsistent_layout');
+        return true;
+      });
+      await closeEvent(stream);
+      assert.equal(Buffer.concat(output).toString(), 'abcd');
+      assert.equal(artifacts[1].readerHighWaterMark, undefined);
+      assert.deepEqual(
+        artifacts.map((artifact) => artifact.releaseCalls),
+        [1, 1]
+      );
+      assert.equal(source.activeStreamLeases, 0);
+    });
+  }
+});
+
+test('exact standalone file end succeeds from byte zero and a later segment', async () => {
+  const bodies = [Buffer.from('abcd'), Buffer.from('efghij')];
+  const artifacts: BufferArtifact[] = [];
+  const source = new TestArtifactSource(
+    (call) => {
+      const index = Number(call.segment.messageId.split('-')[1]);
+      const body = bodies[index];
+      assert(body);
+      const artifact = new BufferArtifact(body, {
+        fileSize: body.length,
+        totalParts: 1,
+      });
+      artifacts.push(artifact);
+      return Promise.resolve(artifact);
+    },
+    (candidate) => {
+      const index = Number(candidate.messageId.split('-')[1]);
+      const body = bodies[index];
+      assert(body);
+      return Promise.resolve({
+        fileSize: body.length,
+        totalParts: 1,
+        decodedSize: body.length,
+        layout: 'standalone-part',
+      });
+    }
+  );
+  const file = new FileStream(
+    source,
+    { segments: [segment(0), segment(1)], knownSize: 10 },
+    'standalone-exact-final',
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      streamingMode: 'segment_spooling',
+      prefetchSegments: 1,
+    }
+  );
+  await file.open();
+
+  assert.deepEqual(
+    await collect(file.createReadStream()),
+    Buffer.concat(bodies)
+  );
+  assert.equal(
+    (await collect(file.createReadStream({ start: 5, end: 10 }))).toString(),
+    'fghij'
+  );
+  assert.equal(source.metadataCalls, 2);
+  assert.equal(source.calls.length, 3);
+  assert(artifacts.every((artifact) => artifact.releaseCalls === 1));
+  assert.equal(source.activeStreamLeases, 0);
+});
+
+test('zero artifacts preserve global and standalone layout provenance', async (t) => {
+  const cases: readonly {
+    readonly name: string;
+    readonly zeroLayout: SegmentRangeLayout;
+    readonly nextLayout: SegmentRangeLayout;
+    readonly succeeds: boolean;
+  }[] = [
+    {
+      name: 'global zero followed by standalone part',
+      zeroLayout: 'global-range',
+      nextLayout: 'standalone-part',
+      succeeds: false,
+    },
+    {
+      name: 'standalone zero followed by global part',
+      zeroLayout: 'standalone-part',
+      nextLayout: 'global-range',
+      succeeds: false,
+    },
+    {
+      name: 'global zero followed by contiguous global part',
+      zeroLayout: 'global-range',
+      nextLayout: 'global-range',
+      succeeds: true,
+    },
+    {
+      name: 'standalone zero followed by standalone part',
+      zeroLayout: 'standalone-part',
+      nextLayout: 'standalone-part',
+      succeeds: true,
+    },
+  ];
+
+  for (const fixture of cases) {
+    await t.test(fixture.name, async () => {
+      const next = new BufferArtifact(
+        Buffer.from('data'),
+        fixture.nextLayout === 'global-range'
+          ? { byteRange: [4, 8], fileSize: 8, totalParts: 2 }
+          : { fileSize: 4, totalParts: 1 }
+      );
+      const source = new TestArtifactSource(() => Promise.resolve(next));
+      const stream = new SpoolingSegmentsStream(
+        streamOptions(source, 2, {
+          firstSegmentStartByte: 0,
+          fileEndByte: 8,
+          knownHoles: new Set([0]),
+          sizeForSegment: () => 4,
+          logicalRangeForSegment: (index) =>
+            index === 0
+              ? { range: [0, 4], layout: fixture.zeroLayout }
+              : undefined,
+          onHole: () => 'pad',
+        })
+      );
+
+      if (fixture.succeeds) {
+        assert.deepEqual(
+          await collect(stream),
+          Buffer.concat([Buffer.alloc(4), Buffer.from('data')])
+        );
+      } else {
+        const output: Buffer[] = [];
+        stream.on('data', (chunk: Buffer) => output.push(chunk));
+        await assert.rejects(collect(stream), (error: unknown) => {
+          assert(error instanceof YencMetadataError);
+          assert.equal(error.code, 'inconsistent_layout');
+          return true;
+        });
+        assert.deepEqual(Buffer.concat(output), Buffer.alloc(4));
+        assert.equal(next.readerHighWaterMark, undefined);
+      }
+      await closeEvent(stream);
+      assert.equal(next.releaseCalls, 1);
+      assert.equal(source.activeStreamLeases, 0);
+    });
+  }
+});
+
 test('standalone yEnc parts build an exact bounded prefix map and stream byte-identically', async () => {
   const bodies = [Buffer.from('abcd'), Buffer.from('efgh'), Buffer.from('ij')];
   const source = new TestArtifactSource(
@@ -1354,10 +1750,22 @@ test('readAt preserves a genuine global yEnc range as a strict artifact expectat
     'USENET_SPOOL_METADATA_MISMATCH',
     'Decoded segment metadata does not match the requested file range'
   );
-  const source = new TestArtifactSource((call) => {
-    assert.deepEqual(call.expectedByteRange, [4, 8]);
-    return Promise.reject(expectedFailure);
-  });
+  const source = new TestArtifactSource(
+    (call) => {
+      assert.deepEqual(call.expectedByteRange, [4, 8]);
+      return Promise.reject(expectedFailure);
+    },
+    (candidate) => {
+      assert.equal(candidate.messageId, 'segment-0');
+      return Promise.resolve({
+        byteRange: [0, 4],
+        fileSize: 8,
+        totalParts: 2,
+        decodedSize: 4,
+        layout: 'global-range',
+      });
+    }
+  );
   source.sharedSegments.set('segment-1', {
     body: Buffer.from('efgh'),
     byteRange: [4, 8],
@@ -1384,7 +1792,7 @@ test('readAt preserves a genuine global yEnc range as a strict artifact expectat
   stream.resume();
   assert.equal(await failure.promise, expectedFailure);
   await closeEvent(stream);
-  assert.equal(source.metadataCalls, 0);
+  assert.equal(source.metadataCalls, 1);
   assert.equal(source.calls.length, 1);
 });
 

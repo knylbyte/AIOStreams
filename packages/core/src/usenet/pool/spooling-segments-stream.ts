@@ -7,6 +7,7 @@ import {
   ZeroSegmentArtifact,
   type SegmentArtifact,
   type SegmentArtifactFetchOptions,
+  type SegmentRangeLayout,
 } from './segment-artifact.js';
 import type { CommandPriority, NzbSegmentRef } from '../types.js';
 import { YencMetadataError } from './yenc.js';
@@ -33,6 +34,12 @@ export interface SpoolingSegmentArtifactSource {
   ): Promise<ByteLease>;
 }
 
+/** Exact logical segment range with the layout that proved it. */
+export interface SpoolingSegmentLogicalRange {
+  readonly range: readonly [number, number];
+  readonly layout: SegmentRangeLayout;
+}
+
 export interface SpoolingSegmentsStreamOptions {
   readonly pool: SpoolingSegmentArtifactSource;
   /** Segments in exact file order, starting with the range's first segment. */
@@ -47,6 +54,8 @@ export interface SpoolingSegmentsStreamOptions {
   readonly firstSegmentStartByte?: number;
   /** Exact logical end of the containing file. */
   readonly fileEndByte?: number;
+  /** File-wide layout already proven by bounded metadata. */
+  readonly layoutHint?: SegmentRangeLayout;
   /** Bytes discarded from the first relevant artifact. */
   readonly skipBytes?: number;
   /** Exact post-skip output cap. */
@@ -57,6 +66,10 @@ export interface SpoolingSegmentsStreamOptions {
   /** Authoritative global yEnc range, never an estimate or local prefix. */
   readonly byteRangeForSegment?:
     | ((idx: number) => readonly [number, number] | undefined)
+    | undefined;
+  /** Exact logical range plus its provenance; never an estimate. */
+  readonly logicalRangeForSegment?:
+    | ((idx: number) => SpoolingSegmentLogicalRange | undefined)
     | undefined;
   readonly onHole?: (
     idx: number,
@@ -133,6 +146,9 @@ export class SpoolingSegmentsStream extends Readable {
   private readonly byteRangeForSegment:
     | ((idx: number) => readonly [number, number] | undefined)
     | undefined;
+  private readonly logicalRangeForSegment:
+    | ((idx: number) => SpoolingSegmentLogicalRange | undefined)
+    | undefined;
   private readonly onHole:
     | ((idx: number, bytes: number, kind: HoleKind) => HoleDecision)
     | undefined;
@@ -155,7 +171,7 @@ export class SpoolingSegmentsStream extends Readable {
   private rangeSatisfied = false;
   private streamLifecycleEnded = false;
   private streamLeaseRetained = false;
-  private artifactLayout: 'global-range' | 'standalone-part' | undefined;
+  private artifactLayout: SegmentRangeLayout | undefined;
   private nextLogicalStart: number | undefined;
   private readonly fileEndByte: number | undefined;
 
@@ -222,9 +238,11 @@ export class SpoolingSegmentsStream extends Readable {
     this.externalSignal = options.signal;
     this.sizeForSegment = options.sizeForSegment;
     this.byteRangeForSegment = options.byteRangeForSegment;
+    this.logicalRangeForSegment = options.logicalRangeForSegment;
     this.onHole = options.onHole;
     this.knownHoles = options.knownHoles;
     this.initialArtifact = options.initialArtifact;
+    this.artifactLayout = options.layoutHint;
     this.nextLogicalStart = options.firstSegmentStartByte;
     this.fileEndByte = options.fileEndByte;
     this.skipRemaining = skipBytes;
@@ -435,15 +453,29 @@ export class SpoolingSegmentsStream extends Readable {
     artifact: SegmentArtifact
   ): void {
     if (artifact.storage === 'zero') {
-      const exactRange = this.byteRangeForSegment?.(task.idx);
-      if (exactRange) {
-        this.assertGlobalRangeTopology(task.idx, exactRange, artifact.length);
-      } else if (this.nextLogicalStart !== undefined) {
-        const next = this.nextLogicalStart + artifact.length;
-        if (!Number.isSafeInteger(next)) {
-          throw this.inconsistentLayout('Segment offsets exceed safe integers');
+      const globalRange = this.byteRangeForSegment?.(task.idx);
+      const logical: SpoolingSegmentLogicalRange | undefined =
+        this.logicalRangeForSegment?.(task.idx) ??
+        (globalRange
+          ? { range: globalRange, layout: 'global-range' }
+          : undefined);
+      if (logical) {
+        this.acceptArtifactLayoutKind(logical.layout);
+        if (logical.layout === 'global-range') {
+          this.assertGlobalRangeTopology(
+            task.idx,
+            logical.range,
+            artifact.length
+          );
+        } else {
+          this.assertStandaloneRangeTopology(
+            task.idx,
+            logical.range,
+            artifact.length
+          );
         }
-        this.nextLogicalStart = next;
+      } else {
+        this.advanceLogicalOffset(task.idx, artifact.length);
       }
       return;
     }
@@ -459,6 +491,29 @@ export class SpoolingSegmentsStream extends Readable {
         'Multipart yEnc artifact is missing its global byte range'
       );
     }
+    this.acceptArtifactLayoutKind(layout);
+    if (range) {
+      this.assertGlobalRangeTopology(task.idx, range, artifact.length);
+      return;
+    }
+    const logical = this.logicalRangeForSegment?.(task.idx);
+    if (logical) {
+      if (logical.layout !== 'standalone-part') {
+        throw this.inconsistentLayout(
+          'Logical file mixes global yEnc ranges with standalone parts'
+        );
+      }
+      this.assertStandaloneRangeTopology(
+        task.idx,
+        logical.range,
+        artifact.length
+      );
+      return;
+    }
+    this.advanceLogicalOffset(task.idx, artifact.length);
+  }
+
+  private acceptArtifactLayoutKind(layout: SegmentRangeLayout): void {
     if (this.artifactLayout === undefined) {
       this.artifactLayout = layout;
     } else if (this.artifactLayout !== layout) {
@@ -466,17 +521,56 @@ export class SpoolingSegmentsStream extends Readable {
         'Logical file mixes global yEnc ranges with standalone parts'
       );
     }
-    if (range) {
-      this.assertGlobalRangeTopology(task.idx, range, artifact.length);
-      return;
+  }
+
+  private assertStandaloneRangeTopology(
+    index: number,
+    range: readonly [number, number],
+    artifactLength: number
+  ): void {
+    const [begin, end] = range;
+    if (
+      !isNonNegativeSafeInteger(begin) ||
+      !isPositiveSafeInteger(end) ||
+      end <= begin ||
+      end - begin !== artifactLength
+    ) {
+      throw this.inconsistentLayout(
+        'Standalone prefix range does not match the decoded segment length'
+      );
     }
-    if (this.nextLogicalStart !== undefined) {
-      const next = this.nextLogicalStart + artifact.length;
-      if (!Number.isSafeInteger(next)) {
-        throw this.inconsistentLayout('Segment offsets exceed safe integers');
-      }
-      this.nextLogicalStart = next;
+    if (
+      this.nextLogicalStart !== undefined &&
+      begin !== this.nextLogicalStart
+    ) {
+      throw this.inconsistentLayout(
+        'Standalone prefix ranges contain a gap or overlap'
+      );
     }
+    this.nextLogicalStart = begin;
+    this.advanceLogicalOffset(index, artifactLength);
+  }
+
+  private advanceLogicalOffset(index: number, artifactLength: number): void {
+    const current = this.nextLogicalStart;
+    if (current === undefined) return;
+    if (!isPositiveSafeInteger(artifactLength)) {
+      throw this.inconsistentLayout('Segment length is not a safe integer');
+    }
+    const next = current + artifactLength;
+    if (!Number.isSafeInteger(next)) {
+      throw this.inconsistentLayout('Segment offsets exceed safe integers');
+    }
+    if (
+      this.fileEndByte !== undefined &&
+      (next > this.fileEndByte ||
+        (index === this.segments.length - 1 && next !== this.fileEndByte))
+    ) {
+      throw this.inconsistentLayout(
+        'Standalone parts do not end at the exact file boundary'
+      );
+    }
+    this.nextLogicalStart = next;
   }
 
   private assertGlobalRangeTopology(

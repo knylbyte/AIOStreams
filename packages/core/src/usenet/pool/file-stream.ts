@@ -5,6 +5,7 @@ import type { SegmentBufferingSource } from './segments-stream.js';
 import {
   SpoolingSegmentsStream,
   type SpoolingSegmentArtifactSource,
+  type SpoolingSegmentLogicalRange,
 } from './spooling-segments-stream.js';
 import type { SharedSegment } from './segment-arena.js';
 import type {
@@ -104,6 +105,18 @@ function isExactSpoolingLogicalRange(range: KnownRange): boolean {
 
 function isAssertableYencRange(range: KnownRange): boolean {
   return range.origin === 'global-yenc-range';
+}
+
+function spoolingLayoutForRange(
+  range: KnownRange | undefined
+): SegmentRangeLayout | undefined {
+  if (
+    range?.origin === 'global-yenc-range' ||
+    range?.origin === 'global-yenc-derived'
+  ) {
+    return 'global-range';
+  }
+  return range?.origin === 'standalone-prefix' ? 'standalone-part' : undefined;
 }
 
 interface LocatedSegment {
@@ -586,6 +599,14 @@ export class FileStream implements SeekableStream {
                 this.resourcePlan.mode === 'segment_spooling'
                   ? this._size
                   : undefined,
+              spoolingLayoutHint:
+                this.resourcePlan.mode === 'segment_spooling'
+                  ? this.spoolingLayout
+                  : undefined,
+              logicalRangeForSegment:
+                this.resourcePlan.mode === 'segment_spooling'
+                  ? (local) => this.spoolingLogicalRange(segmentIndex + local)
+                  : undefined,
               initialSpoolingArtifact: initialArtifact,
               skipBytes: start - segmentStartByte,
               limitBytes: length,
@@ -809,6 +830,15 @@ export class FileStream implements SeekableStream {
     return [range.begin, range.end];
   }
 
+  private spoolingLogicalRange(
+    index: number
+  ): SpoolingSegmentLogicalRange | undefined {
+    const range = this.knownRanges.get(index);
+    const layout = spoolingLayoutForRange(range);
+    if (!range || !layout) return undefined;
+    return { range: [range.begin, range.end], layout };
+  }
+
   /** Buffer-free locator used only by the direct segment-spooling stream. */
   private async locateSpoolingSegment(
     targetByte: number,
@@ -873,9 +903,8 @@ export class FileStream implements SeekableStream {
   ): Promise<KnownRange> {
     const cached = this.knownRanges.get(index);
     if (cached && isExactSpoolingLogicalRange(cached)) {
-      if (isAssertableYencRange(cached)) {
-        this.acceptSpoolingLayout('global-range');
-      }
+      const layout = spoolingLayoutForRange(cached);
+      if (layout) this.acceptSpoolingLayout(layout);
       return cached;
     }
 
@@ -920,6 +949,7 @@ export class FileStream implements SeekableStream {
     range: KnownRange,
     signal: AbortSignal
   ): Promise<LocatedSegment> {
+    await this.assertLocatedSpoolingPredecessor(index, range, signal);
     const expectedLength = range.end - range.begin;
     if (!Number.isSafeInteger(expectedLength) || expectedLength <= 0) {
       throw new Error('Spooling locator resolved an invalid segment range');
@@ -966,6 +996,38 @@ export class FileStream implements SeekableStream {
         }
       }
       throw error;
+    }
+  }
+
+  private async assertLocatedSpoolingPredecessor(
+    index: number,
+    range: KnownRange,
+    signal: AbortSignal
+  ): Promise<void> {
+    if (spoolingLayoutForRange(range) !== 'global-range') return;
+    if (index === 0) {
+      if (range.begin !== 0) {
+        throw new YencMetadataError(
+          'inconsistent_layout',
+          'The first global yEnc range does not begin at file offset zero'
+        );
+      }
+      return;
+    }
+
+    let previous = this.knownRanges.get(index - 1);
+    if (spoolingLayoutForRange(previous) !== 'global-range') {
+      previous = await this.rangeForSpoolingSegment(index - 1, signal);
+    }
+    if (
+      !previous ||
+      spoolingLayoutForRange(previous) !== 'global-range' ||
+      previous.end !== range.begin
+    ) {
+      throw new YencMetadataError(
+        'inconsistent_layout',
+        'The target global yEnc range has a gap or overlap at its predecessor boundary'
+      );
     }
   }
 

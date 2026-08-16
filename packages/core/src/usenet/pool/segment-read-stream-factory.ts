@@ -13,8 +13,12 @@ import {
 import {
   SpoolingSegmentsStream,
   type SpoolingSegmentArtifactSource,
+  type SpoolingSegmentLogicalRange,
 } from './spooling-segments-stream.js';
-import type { SegmentArtifact } from './segment-artifact.js';
+import type {
+  SegmentArtifact,
+  SegmentRangeLayout,
+} from './segment-artifact.js';
 import { resolveSegmentStreamQueuePlan } from '../stream-queue-budget.js';
 
 /** Mode-neutral inputs for the direct ordered segment read path. */
@@ -33,6 +37,8 @@ export interface CommonSegmentReadOptions {
   readonly spoolingFirstSegmentStartByte?: number;
   /** Exact logical file end used when the final segment is reached. */
   readonly spoolingFileEndByte?: number;
+  /** File-wide layout already proven by bounded metadata. */
+  readonly spoolingLayoutHint?: SegmentRangeLayout;
   readonly skipBytes?: number;
   readonly limitBytes?: number;
   readonly priority: CommandPriority;
@@ -41,6 +47,9 @@ export interface CommonSegmentReadOptions {
   readonly byteRangeForSegment?: (
     idx: number
   ) => readonly [number, number] | undefined;
+  readonly logicalRangeForSegment?: (
+    idx: number
+  ) => SpoolingSegmentLogicalRange | undefined;
   readonly onHole?: (
     idx: number,
     bytes: number,
@@ -98,12 +107,14 @@ export function createSegmentReadStream(
     relayHighWaterMarkBytes: relayQueue?.highWaterMarkBytes,
     firstSegmentStartByte: options.spoolingFirstSegmentStartByte,
     fileEndByte: options.spoolingFileEndByte,
+    layoutHint: options.spoolingLayoutHint,
     skipBytes: options.skipBytes,
     limitBytes: options.limitBytes,
     priority: options.priority,
     signal: options.signal,
     sizeForSegment: options.sizeForSegment,
     byteRangeForSegment: options.byteRangeForSegment,
+    logicalRangeForSegment: options.logicalRangeForSegment,
     onHole: options.onHole,
     knownHoles: options.knownHoles,
     initialArtifact: options.initialSpoolingArtifact,
