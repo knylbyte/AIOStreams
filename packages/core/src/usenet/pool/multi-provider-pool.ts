@@ -20,7 +20,7 @@ import {
   NntpError,
   definitiveLossKind,
 } from '../nntp/errors.js';
-import { YencDecodeError } from './yenc.js';
+import { YencDecodeError, YencMetadataError } from './yenc.js';
 import type { HoleKind } from '../holes.js';
 import {
   CommandPriority,
@@ -36,6 +36,7 @@ import {
   type SegmentArtifactFetchOptions,
   type SegmentRangeMetadataFetchOptions,
   type SegmentRangeMetadata,
+  type SegmentRangeLayout,
   type SegmentArtifact,
 } from './segment-artifact.js';
 import { SegmentSpoolingRuntime } from './segment-spooling-runtime.js';
@@ -50,6 +51,95 @@ import { resolveEstimatedDecodedSegmentBytes } from '../resource-plan.js';
 import type { ByteLease } from './byte-budget.js';
 
 const logger = createLogger('usenet/multi-provider-pool');
+
+function inferSegmentRangeLayout(
+  metadata: SegmentRangeMetadata
+): SegmentRangeLayout | undefined {
+  if (metadata.layout !== undefined) return metadata.layout;
+  if (metadata.byteRange !== undefined) return 'global-range';
+  if (metadata.totalParts !== undefined && metadata.totalParts > 1) {
+    return undefined;
+  }
+  return 'standalone-part';
+}
+
+interface ArtifactExpectations {
+  readonly expectedLength: number | undefined;
+  readonly expectedByteRange: readonly [number, number] | undefined;
+}
+
+function artifactMetadataMismatch(prefix = 'Decoded'): UsenetSpoolError {
+  return new UsenetSpoolError(
+    'USENET_SPOOL_METADATA_MISMATCH',
+    `${prefix} segment metadata differs from the exact file range`
+  );
+}
+
+function validateArtifactExpectations(
+  options: SegmentArtifactFetchOptions
+): ArtifactExpectations {
+  let expectedLength = options.expectedLength;
+  if (
+    expectedLength !== undefined &&
+    (!Number.isSafeInteger(expectedLength) || expectedLength <= 0)
+  ) {
+    throw new UsenetSpoolError(
+      'USENET_SPOOL_INVALID_ARGUMENT',
+      'Expected segment length must be a safe positive integer'
+    );
+  }
+  const range = options.expectedByteRange;
+  if (range === undefined) {
+    return { expectedLength, expectedByteRange: undefined };
+  }
+  const begin = range[0];
+  const end = range[1];
+  if (
+    range.length !== 2 ||
+    !Number.isSafeInteger(begin) ||
+    !Number.isSafeInteger(end) ||
+    begin < 0 ||
+    end <= begin
+  ) {
+    throw new UsenetSpoolError(
+      'USENET_SPOOL_INVALID_ARGUMENT',
+      'Expected segment byte range must contain safe increasing offsets'
+    );
+  }
+  const rangeLength = end - begin;
+  if (expectedLength !== undefined && expectedLength !== rangeLength) {
+    throw new UsenetSpoolError(
+      'USENET_SPOOL_INVALID_ARGUMENT',
+      'Expected segment length must equal the expected byte-range length'
+    );
+  }
+  expectedLength ??= rangeLength;
+  const expectedByteRange: readonly [number, number] = [begin, end];
+  return { expectedLength, expectedByteRange };
+}
+
+function assertMetadataExpectations(
+  metadata: DecodedSegmentMetadata,
+  expectations: ArtifactExpectations,
+  prefix = 'Decoded'
+): void {
+  if (
+    expectations.expectedLength !== undefined &&
+    metadata.size !== expectations.expectedLength
+  ) {
+    throw artifactMetadataMismatch(prefix);
+  }
+  const expectedRange = expectations.expectedByteRange;
+  if (expectedRange === undefined) return;
+  const actualRange = metadata.byteRange;
+  if (
+    actualRange === undefined ||
+    actualRange[0] !== expectedRange[0] ||
+    actualRange[1] !== expectedRange[1]
+  ) {
+    throw artifactMetadataMismatch(prefix);
+  }
+}
 
 export type { SegmentHeadData } from '../nntp/segment-fetcher.js';
 export type { SharedSegment } from './segment-arena.js';
@@ -74,6 +164,7 @@ interface SharedFlight {
 /** One caller waiting for an independently releasable file-backed handle. */
 interface ArtifactWaiter {
   readonly expectedLength: number | undefined;
+  readonly expectedByteRange: readonly [number, number] | undefined;
   readonly allowGrowing: boolean;
   deliver(artifact: SegmentArtifact): void;
   fail(error: unknown): void;
@@ -117,21 +208,34 @@ class SharedSpoolArtifactOwner {
     void this.producerCompletion.promise.catch(() => undefined);
   }
 
-  get expectedLength(): number {
-    return this.metadataValue.size;
-  }
-
   owns(artifact: GrowingSpoolArtifact): boolean {
     return this.artifact === artifact;
   }
 
-  acquire(): SegmentArtifact {
+  matches(expectations: ArtifactExpectations): boolean {
+    try {
+      assertMetadataExpectations(this.metadataValue, expectations, 'Published');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  acquire(expectations: ArtifactExpectations): SegmentArtifact {
     if (this.disposePromise) {
       throw new UsenetSpoolError(
         'USENET_SPOOL_CLOSED',
         'Cannot acquire a disposed shared spool artifact'
       );
     }
+    assertMetadataExpectations(this.metadataValue, expectations, 'Published');
+    const validatedCompletion = this.producerCompletion.promise.then(
+      (metadata) => {
+        assertMetadataExpectations(metadata, expectations);
+        return metadata;
+      }
+    );
+    void validatedCompletion.catch(() => undefined);
     this.references++;
     let released = false;
     return new GrowingSpoolArtifactAdapter(
@@ -143,7 +247,7 @@ class SharedSpoolArtifactOwner {
         this.references--;
         return this.disposeIfUnused();
       },
-      this.producerCompletion.promise,
+      validatedCompletion,
       () => this.metadataValue
     );
   }
@@ -411,17 +515,8 @@ export class MultiProviderPool {
     priority: CommandPriority = CommandPriority.High,
     options: SegmentArtifactFetchOptions = {}
   ): Promise<SegmentArtifact> {
-    const expectedLength = options.expectedLength;
+    const expectations = validateArtifactExpectations(options);
     const allowGrowing = options.allowGrowing ?? false;
-    if (
-      expectedLength !== undefined &&
-      (!Number.isSafeInteger(expectedLength) || expectedLength <= 0)
-    ) {
-      throw new UsenetSpoolError(
-        'USENET_SPOOL_INVALID_ARGUMENT',
-        'Expected segment length must be a safe positive integer'
-      );
-    }
     if (typeof allowGrowing !== 'boolean') {
       throw new UsenetSpoolError(
         'USENET_SPOOL_INVALID_ARGUMENT',
@@ -432,7 +527,7 @@ export class MultiProviderPool {
     const pinned = this.arena.acquire(id);
     if (pinned) {
       const artifact = new ArenaSegmentArtifact(pinned);
-      await this.assertArtifactLength(artifact, expectedLength);
+      await this.assertArtifactMetadata(artifact, expectations);
       return artifact;
     }
     if (signal?.aborted) throw new NntpError('connection', 'aborted');
@@ -452,7 +547,7 @@ export class MultiProviderPool {
           await persistent.release();
           throw new NntpError('connection', 'aborted');
         }
-        await this.assertArtifactLength(persistent, expectedLength);
+        await this.assertArtifactMetadata(persistent, expectations);
         return persistent;
       }
     }
@@ -464,7 +559,7 @@ export class MultiProviderPool {
       nzbHash,
       priority,
       signal,
-      expectedLength,
+      expectations,
       allowGrowing
     );
   }
@@ -486,12 +581,17 @@ export class MultiProviderPool {
     const pinned = this.arena.acquire(id);
     if (pinned) {
       try {
-        const metadata = {
+        const metadata: SegmentRangeMetadata = {
           byteRange: pinned.data.byteRange,
           fileSize: pinned.data.fileSize,
           totalParts: pinned.data.totalParts,
           name: pinned.data.name,
           decodedSize: pinned.data.size,
+          layout: pinned.data.byteRange
+            ? 'global-range'
+            : pinned.data.totalParts !== undefined && pinned.data.totalParts > 1
+              ? undefined
+              : 'standalone-part',
         };
         if (this.isUsableRangeMetadata(metadata, options)) return metadata;
       } finally {
@@ -503,12 +603,18 @@ export class MultiProviderPool {
     const persistent = await this.spooling?.artifactCache?.acquire(id, signal);
     if (persistent) {
       try {
-        const metadata = {
+        const metadata: SegmentRangeMetadata = {
           byteRange: persistent.metadata.byteRange,
           fileSize: persistent.metadata.fileSize,
           totalParts: persistent.metadata.totalParts,
           name: persistent.metadata.name,
           decodedSize: persistent.metadata.size,
+          layout: persistent.metadata.byteRange
+            ? 'global-range'
+            : persistent.metadata.totalParts !== undefined &&
+                persistent.metadata.totalParts > 1
+              ? undefined
+              : 'standalone-part',
         };
         if (this.isUsableRangeMetadata(metadata, options)) return metadata;
       } finally {
@@ -531,6 +637,7 @@ export class MultiProviderPool {
         {
           strictYencMetadata: true,
           requireByteRange: options.requireByteRange,
+          allowStandalonePart: options.allowStandalonePart,
         }
       );
       const metadata = {
@@ -539,12 +646,12 @@ export class MultiProviderPool {
         totalParts: head.totalParts,
         name: head.name,
         decodedSize: head.size,
+        layout: head.layout,
       };
       if (!this.isUsableRangeMetadata(metadata, options)) {
-        throw new YencDecodeError(
+        throw new YencMetadataError(
           'invalid_header',
-          'yEnc metadata probe returned unusable range metadata',
-          { terminal: true }
+          'yEnc metadata probe returned unusable range metadata'
         );
       }
       return metadata;
@@ -571,22 +678,29 @@ export class MultiProviderPool {
       return false;
     }
     const range = metadata.byteRange;
+    const layout = inferSegmentRangeLayout(metadata);
     const validRange =
+      layout === 'global-range' &&
       range !== undefined &&
       Number.isSafeInteger(range[0]) &&
       Number.isSafeInteger(range[1]) &&
       range[0] >= 0 &&
       range[1] > range[0] &&
       range[1] <= fileSize;
-    if (options.requireByteRange) return validRange;
     const decodedSize = metadata.decodedSize;
-    return (
-      validRange ||
-      (range === undefined &&
-        decodedSize !== undefined &&
-        Number.isSafeInteger(decodedSize) &&
-        decodedSize > 0)
-    );
+    const validStandalone =
+      layout === 'standalone-part' &&
+      range === undefined &&
+      decodedSize !== undefined &&
+      Number.isSafeInteger(decodedSize) &&
+      decodedSize > 0 &&
+      decodedSize === fileSize;
+    if (options.requireByteRange) {
+      return (
+        validRange || (options.allowStandalonePart === true && validStandalone)
+      );
+    }
+    return validRange || validStandalone;
   }
 
   private joinArtifactFlight(
@@ -594,7 +708,7 @@ export class MultiProviderPool {
     nzbHash: string,
     priority: CommandPriority,
     signal: AbortSignal | undefined,
-    expectedLength: number | undefined,
+    expectations: ArtifactExpectations,
     allowGrowing: boolean
   ): Promise<SegmentArtifact> {
     const id = segment.messageId;
@@ -639,7 +753,7 @@ export class MultiProviderPool {
         return true;
       };
       const waiter: ArtifactWaiter = {
-        expectedLength,
+        ...expectations,
         allowGrowing,
         deliver: (artifact) => {
           if (!finish()) {
@@ -679,11 +793,10 @@ export class MultiProviderPool {
         joined.growingOwnerPublished &&
         owner !== undefined &&
         allowGrowing &&
-        (expectedLength === undefined ||
-          owner.expectedLength === expectedLength)
+        owner.matches(expectations)
       ) {
         joined.waiters.delete(waiter);
-        waiter.deliver(owner.acquire());
+        waiter.deliver(owner.acquire(expectations));
       }
     });
     if (isNew) {
@@ -802,14 +915,11 @@ export class MultiProviderPool {
       const waiters = [...flight.waiters];
       flight.waiters.clear();
       for (const waiter of waiters) {
-        if (
-          waiter.expectedLength !== undefined &&
-          waiter.expectedLength !== result.metadata.size
-        ) {
-          waiter.fail(this.segmentLengthMismatch());
-          continue;
+        try {
+          waiter.deliver(owner.acquire(waiter));
+        } catch (error) {
+          waiter.fail(error);
         }
-        waiter.deliver(owner.acquire());
       }
       try {
         await owner.disposeIfUnused();
@@ -870,6 +980,7 @@ export class MultiProviderPool {
 
   /** Reserve one complete bounded output-stream memory window. */
   acquireSegmentStreamMemory(
+    bytes: number,
     priority: CommandPriority,
     signal?: AbortSignal
   ): Promise<ByteLease> {
@@ -882,7 +993,7 @@ export class MultiProviderPool {
         )
       );
     }
-    return runtime.acquireStreamMemory(priority, signal);
+    return runtime.acquireStreamMemory(bytes, priority, signal);
   }
 
   private resolveEarlyArtifactMetadata(
@@ -931,33 +1042,28 @@ export class MultiProviderPool {
     if (flight.growingOwner !== owner || flight.ctl.signal.aborted) return;
     flight.growingOwnerPublished = true;
     const matching = [...flight.waiters].filter(
-      (waiter) =>
-        waiter.allowGrowing &&
-        (waiter.expectedLength === undefined ||
-          waiter.expectedLength === owner.expectedLength)
+      (waiter) => waiter.allowGrowing && owner.matches(waiter)
     );
     for (const waiter of matching) {
       flight.waiters.delete(waiter);
-      waiter.deliver(owner.acquire());
+      waiter.deliver(owner.acquire(waiter));
     }
   }
 
-  private async assertArtifactLength(
+  private async assertArtifactMetadata(
     artifact: SegmentArtifact,
-    expectedLength: number | undefined
+    expectations: ArtifactExpectations
   ): Promise<void> {
-    if (expectedLength === undefined || artifact.length === expectedLength) {
+    try {
+      assertMetadataExpectations(artifact.metadata, expectations, 'Stored');
+      if (artifact.length !== artifact.metadata.size) {
+        throw artifactMetadataMismatch('Stored');
+      }
       return;
+    } catch (error) {
+      await artifact.release();
+      throw error;
     }
-    await artifact.release();
-    throw this.segmentLengthMismatch('Stored');
-  }
-
-  private segmentLengthMismatch(prefix = 'Decoded'): UsenetSpoolError {
-    return new UsenetSpoolError(
-      'USENET_SPOOL_IO',
-      `${prefix} segment length differs from the exact file range`
-    );
   }
 
   /** The single flight behind {@link fetchSegmentShared}. */

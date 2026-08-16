@@ -96,6 +96,8 @@ export class ArticleNotFoundError extends Error {
  */
 export function definitiveLossKind(err: unknown): HoleKind | undefined {
   if (err instanceof ArticleNotFoundError && err.allProviders) return 'missing';
+  // Locator-only metadata failures intentionally do not inherit from
+  // YencDecodeError: an unsuitable header does not prove BODY corruption.
   if (err instanceof YencDecodeError && err.terminal) return 'undecodable';
   return undefined;
 }

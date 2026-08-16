@@ -1,7 +1,7 @@
 import { createLogger } from '../../logging/logger.js';
 import { ConnectionOptions, NntpConnection } from './connection.js';
 import { NntpError } from './errors.js';
-import { YencDecodeError } from '../pool/yenc.js';
+import { YencDecodeError, YencMetadataError } from '../pool/yenc.js';
 import { UsenetSpoolError } from '../spool/errors.js';
 import {
   CommandPriority,
@@ -810,7 +810,7 @@ export class ProviderWorkerPool {
       this.dispatch();
       return;
     }
-    if (err instanceof YencDecodeError) {
+    if (err instanceof YencDecodeError || err instanceof YencMetadataError) {
       req.reject(err);
       this.dispatch();
       return;

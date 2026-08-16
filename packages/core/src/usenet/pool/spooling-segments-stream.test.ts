@@ -12,6 +12,7 @@ import {
   type NzbSegmentRef,
   type SegmentData,
 } from '../types.js';
+import type { EngineResourcePlan } from '../resource-plan.js';
 import type { ByteLease } from './byte-budget.js';
 import { ByteBudget } from './byte-budget.js';
 import { FileStream, type FileStreamPool } from './file-stream.js';
@@ -30,12 +31,14 @@ import {
   type SpoolingSegmentArtifactSource,
 } from './spooling-segments-stream.js';
 import { reapIdleStreams } from './tracked-stream.js';
-import { YencDecodeError } from './yenc.js';
+import { YencMetadataError } from './yenc.js';
+import type { DecodedSegmentMetadata } from './streaming-yenc-article-decoder.js';
 
 interface FetchCall {
   readonly segment: NzbSegmentRef;
   readonly signal: AbortSignal | undefined;
   readonly expectedLength: number | undefined;
+  readonly expectedByteRange: readonly [number, number] | undefined;
   readonly allowGrowing: boolean;
 }
 
@@ -43,6 +46,7 @@ interface MetadataCall {
   readonly segment: NzbSegmentRef;
   readonly signal: AbortSignal | undefined;
   readonly requireByteRange: boolean;
+  readonly allowStandalonePart: boolean;
 }
 
 type FetchHandler = (call: FetchCall) => Promise<SegmentArtifact>;
@@ -59,6 +63,7 @@ class TestArtifactSource implements FileStreamPool {
   activeStreamLeases = 0;
   peakStreamLeases = 0;
   streamLeaseReleases = 0;
+  readonly streamLeaseRequests: number[] = [];
 
   private readonly callWaiters = new Set<{
     readonly count: number;
@@ -85,6 +90,7 @@ class TestArtifactSource implements FileStreamPool {
       segment,
       signal,
       expectedLength: options?.expectedLength,
+      expectedByteRange: options?.expectedByteRange,
       allowGrowing: options?.allowGrowing ?? false,
     };
     this.calls.push(call);
@@ -96,7 +102,8 @@ class TestArtifactSource implements FileStreamPool {
     return this.handler(call);
   }
 
-  acquireSegmentStreamMemory(): Promise<ByteLease> {
+  acquireSegmentStreamMemory(bytes: number): Promise<ByteLease> {
+    this.streamLeaseRequests.push(bytes);
     this.activeStreamLeases++;
     this.peakStreamLeases = Math.max(
       this.peakStreamLeases,
@@ -104,7 +111,7 @@ class TestArtifactSource implements FileStreamPool {
     );
     let released = false;
     return Promise.resolve({
-      bytes: 64,
+      bytes,
       release: () => {
         if (released) return;
         released = true;
@@ -171,6 +178,7 @@ class TestArtifactSource implements FileStreamPool {
       segment,
       signal,
       requireByteRange: options.requireByteRange ?? false,
+      allowStandalonePart: options.allowStandalonePart ?? false,
     });
     if (this.metadataHandler) {
       return this.metadataHandler(segment, signal, options);
@@ -198,17 +206,21 @@ class TestArtifactSource implements FileStreamPool {
 }
 
 class BufferArtifact implements SegmentArtifact {
-  readonly metadata;
+  readonly metadata: DecodedSegmentMetadata;
   readonly length: number;
   readonly storage: 'spool' = 'spool';
   releaseCalls = 0;
+  readerHighWaterMark: number | undefined;
 
   private reader: Readable | undefined;
   private released = false;
 
-  constructor(private readonly body: Buffer) {
+  constructor(
+    private readonly body: Buffer,
+    metadata: Omit<DecodedSegmentMetadata, 'size'> = {}
+  ) {
     this.length = body.length;
-    this.metadata = { size: body.length };
+    this.metadata = { ...metadata, size: body.length };
   }
 
   createReadStream(options: SegmentArtifactReadOptions = {}): Readable {
@@ -221,6 +233,7 @@ class BufferArtifact implements SegmentArtifact {
         highWaterMark: options.highWaterMark,
       }
     );
+    this.readerHighWaterMark = options.highWaterMark;
     if (options.signal) addAbortSignal(options.signal, reader);
     this.reader = reader;
     return reader;
@@ -359,11 +372,35 @@ class BudgetedArtifactSource extends TestArtifactSource {
   }
 
   override acquireSegmentStreamMemory(
+    bytes: number,
     priority: CommandPriority,
     signal?: AbortSignal
   ): Promise<ByteLease> {
-    return this.budget.acquire(this.leaseBytes, { priority, signal });
+    assert.equal(bytes, this.leaseBytes);
+    this.streamLeaseRequests.push(bytes);
+    return this.budget.acquire(bytes, { priority, signal });
   }
+}
+
+function spoolingResourcePlan(
+  readerHighWaterMarkBytes: number
+): EngineResourcePlan {
+  return {
+    mode: 'segment_spooling',
+    arenaBytes: 1,
+    segmentSpooling: {
+      memoryBudgetBytes: 24 * readerHighWaterMarkBytes,
+      perStreamBufferBytes: 4 * readerHighWaterMarkBytes,
+      spoolBytes: 1024,
+      minFreeDiskBytes: 0,
+      decoderChunkBytes: 1,
+      writerQueueBytes: readerHighWaterMarkBytes,
+      readerHighWaterMarkBytes,
+      perDownloadBaseLeaseBytes: 2,
+      maxOpenSpoolFiles: 8,
+      orphanTtlMs: 60_000,
+    },
+  };
 }
 
 function segment(index: number): NzbSegmentRef {
@@ -651,6 +688,123 @@ test('spooling FileStream open without knownSize uses only bounded scalar metada
   assert.equal(source.bufferingCalls, 0);
   assert.equal(source.metadataCalls, 1);
   assert.equal(source.calls.length, 2);
+  assert.deepEqual(
+    source.calls.map((call) => call.expectedByteRange),
+    [
+      [0, 4],
+      [4, 8],
+    ]
+  );
+});
+
+test('standalone yEnc parts build an exact bounded prefix map and stream byte-identically', async () => {
+  const bodies = [Buffer.from('abcd'), Buffer.from('efgh'), Buffer.from('ij')];
+  const source = new TestArtifactSource(
+    (call) => {
+      const index = Number(call.segment.messageId.split('-')[1]);
+      const body = bodies[index];
+      assert(body);
+      return Promise.resolve(
+        new BufferArtifact(body, {
+          fileSize: body.length,
+          totalParts: 1,
+        })
+      );
+    },
+    (candidate, signal, options) => {
+      assert.notEqual(signal?.aborted, true);
+      assert.equal(options.requireByteRange, true);
+      assert.equal(options.allowStandalonePart, true);
+      const index = Number(candidate.messageId.split('-')[1]);
+      const body = bodies[index];
+      assert(body);
+      return Promise.resolve({
+        fileSize: body.length,
+        totalParts: 1,
+        decodedSize: body.length,
+        layout: 'standalone-part',
+      });
+    }
+  );
+  const file = new FileStream(
+    source,
+    { segments: bodies.map((_, index) => segment(index)) },
+    'standalone-prefix-map',
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      streamingMode: 'segment_spooling',
+      prefetchSegments: 1,
+    }
+  );
+
+  await file.open();
+  assert.equal(file.size(), 10);
+  assert.equal(source.metadataCalls, bodies.length);
+  assert.equal(source.calls.length, 0);
+  assert.equal(source.sharedCalls, 0);
+  assert.equal(source.bufferingCalls, 0);
+
+  assert.deepEqual(
+    await collect(file.createReadStream()),
+    Buffer.concat(bodies)
+  );
+  assert.deepEqual(
+    source.calls.map((call) => call.expectedLength),
+    [4, 4, 2]
+  );
+  assert(source.calls.every((call) => call.expectedByteRange === undefined));
+
+  assert.equal(
+    (await collect(file.createReadStream({ start: 8, end: 10 }))).toString(),
+    'ij'
+  );
+  assert.equal(source.calls.length, 4);
+  assert.equal(source.calls[3].segment.messageId, 'segment-2');
+  assert.equal(source.calls[3].expectedLength, 2);
+  assert.equal(source.calls[3].expectedByteRange, undefined);
+  assert.equal(source.metadataCalls, bodies.length);
+  assert.equal(source.activeStreamLeases, 0);
+});
+
+test('mixed global-range and standalone-part metadata is rejected deterministically', async () => {
+  const source = new TestArtifactSource(
+    () => Promise.reject(new Error('mixed layout must not fetch an artifact')),
+    (candidate) => {
+      if (candidate.messageId === 'segment-0') {
+        return Promise.resolve({
+          fileSize: 4,
+          totalParts: 1,
+          decodedSize: 4,
+          layout: 'standalone-part',
+        });
+      }
+      return Promise.resolve({
+        byteRange: [4, 8],
+        fileSize: 8,
+        totalParts: 2,
+        decodedSize: 4,
+        layout: 'global-range',
+      });
+    }
+  );
+  const file = new FileStream(
+    source,
+    { segments: [segment(0), segment(1)] },
+    'mixed-layout',
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      streamingMode: 'segment_spooling',
+      prefetchSegments: 1,
+    }
+  );
+
+  await assert.rejects(file.open(), (error: unknown) => {
+    assert(error instanceof YencMetadataError);
+    assert.equal(error.code, 'inconsistent_layout');
+    return true;
+  });
+  assert.equal(source.metadataCalls, 2);
+  assert.equal(source.calls.length, 0);
 });
 
 test('nonzero spooling seek probes only scalar metadata and reuses one target artifact', async () => {
@@ -660,7 +814,11 @@ test('nonzero spooling seek probes only scalar metadata and reuses one target ar
     ['segment-2', [5, 11]],
     ['segment-3', [11, 20]],
   ]);
-  const located = new BufferArtifact(Buffer.from('DDDDDDDDD'));
+  const located = new BufferArtifact(Buffer.from('DDDDDDDDD'), {
+    byteRange: [11, 20],
+    fileSize: 20,
+    totalParts: 4,
+  });
   const source = new TestArtifactSource(
     (call) => {
       assert.equal(call.segment.messageId, 'segment-3');
@@ -676,6 +834,7 @@ test('nonzero spooling seek probes only scalar metadata and reuses one target ar
         fileSize: 20,
         totalParts: 4,
         decodedSize: range[1] - range[0],
+        layout: 'global-range',
       });
     }
   );
@@ -702,6 +861,7 @@ test('nonzero spooling seek probes only scalar metadata and reuses one target ar
   assert.equal(source.calls[0].segment.messageId, 'segment-3');
   assert.equal(source.calls[0].allowGrowing, true);
   assert.equal(source.calls[0].expectedLength, 9);
+  assert.deepEqual(source.calls[0].expectedByteRange, [11, 20]);
   assert.equal(source.sharedCalls, 0);
   assert.equal(source.bufferingCalls, 0);
   assert.deepEqual(
@@ -752,14 +912,13 @@ test('destroy during bounded metadata search aborts before target-artifact admis
 });
 
 test('unusable locator metadata fails typed before creating a target artifact', async () => {
-  const decodeFailure = new YencDecodeError(
+  const metadataFailure = new YencMetadataError(
     'invalid_header',
-    'article undecodable on all providers: invalid_header',
-    { terminal: true }
+    'article metadata unusable on all providers (invalid_header)'
   );
   const source = new TestArtifactSource(
     () => Promise.reject(new Error('target artifact must not be admitted')),
-    () => Promise.reject(decodeFailure)
+    () => Promise.reject(metadataFailure)
   );
   const file = new FileStream(
     source,
@@ -780,7 +939,7 @@ test('unusable locator metadata fails typed before creating a target artifact', 
   stream.once('error', streamError.resolve);
   stream.resume();
 
-  assert.equal(await streamError.promise, decodeFailure);
+  assert.equal(await streamError.promise, metadataFailure);
   await closeEvent(stream);
   assert.equal(source.metadataCalls, 1);
   assert.equal(source.calls.length, 0);
@@ -1103,6 +1262,7 @@ test('stream memory lease remains held while unread output is queued', async () 
   await immediate();
 
   assert(stream.readableLength > 0);
+  assert.deepEqual(source.streamLeaseRequests, [8]);
   assert.equal(source.activeStreamLeases, 1);
   assert.equal(source.streamLeaseReleases, 0);
 
@@ -1173,9 +1333,10 @@ test('two queued streams cannot overbook the shared byte budget', async () => {
     peakBytes: 8,
   });
 
+  const secondReadable = once(second, 'readable');
   assert.equal((await collect(first)).toString(), 'data');
   await closeEvent(first);
-  await once(second, 'readable');
+  await secondReadable;
   assert.equal(budget.stats().usedBytes, 8);
   assert.equal((await collect(second)).toString(), 'data');
   await closeEvent(second);
@@ -1200,11 +1361,13 @@ test('FileStream relay retains the stream lease until its outer queue drains', a
   );
   await file.open();
   const outer = file.createReadStream();
+  const outerReadable = once(outer, 'readable');
   outer.read(0);
-  await once(outer, 'readable');
+  await outerReadable;
   await immediate();
 
   assert(outer.readableLength > 0);
+  assert.equal(source.streamLeaseRequests[0], 3 * outer.readableHighWaterMark);
   assert.equal(source.activeStreamLeases, 1);
   assert.equal(source.streamLeaseReleases, 0);
 
@@ -1213,6 +1376,91 @@ test('FileStream relay retains the stream lease until its outer queue drains', a
   assert.equal(source.activeStreamLeases, 0);
   assert.equal(source.streamLeaseReleases, 1);
   assert.equal(artifact.releaseCalls, 1);
+});
+
+test('FileStream reserves one atomic 3H window for reader, stream, and relay', async () => {
+  const highWaterMark = 4;
+  const body = Buffer.from('data');
+  const artifact = new BufferArtifact(body);
+  const source = new TestArtifactSource(() => Promise.resolve(artifact));
+  const file = new FileStream(
+    source,
+    { segments: [segment(0)], knownSize: body.length },
+    'three-queue-budget',
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      streamingMode: 'segment_spooling',
+      prefetchSegments: 1,
+    },
+    undefined,
+    undefined,
+    spoolingResourcePlan(highWaterMark)
+  );
+  await file.open();
+  const outer = file.createReadStream();
+  const outerReadable = once(outer, 'readable');
+  outer.read(0);
+  await outerReadable;
+
+  assert.equal(outer.readableHighWaterMark, highWaterMark);
+  assert.equal(outer.readableLength, highWaterMark);
+  assert.equal(artifact.readerHighWaterMark, highWaterMark);
+  assert.deepEqual(source.streamLeaseRequests, [3 * highWaterMark]);
+
+  assert.deepEqual(await collect(outer), body);
+  await closeEvent(outer);
+  assert.equal(source.streamLeaseReleases, 1);
+});
+
+test('a second FileStream cannot overbook an atomic 3H relay window', async () => {
+  const highWaterMark = 4;
+  const budget = new ByteBudget(3 * highWaterMark, { maxWaiters: 2 });
+  const source = new BudgetedArtifactSource(
+    () => Promise.resolve(new BufferArtifact(Buffer.from('data'))),
+    budget,
+    3 * highWaterMark
+  );
+  const createFile = (id: string): FileStream =>
+    new FileStream(
+      source,
+      { segments: [{ messageId: id, bytes: 4 }], knownSize: 4 },
+      id,
+      {
+        ...DEFAULT_ENGINE_OPTIONS,
+        streamingMode: 'segment_spooling',
+        prefetchSegments: 1,
+      },
+      undefined,
+      undefined,
+      spoolingResourcePlan(highWaterMark)
+    );
+  const firstFile = createFile('first-relay-budget');
+  const secondFile = createFile('second-relay-budget');
+  await Promise.all([firstFile.open(), secondFile.open()]);
+  const first = firstFile.createReadStream();
+  const firstReadable = once(first, 'readable');
+  first.read(0);
+  await firstReadable;
+  const second = secondFile.createReadStream();
+  second.read(0);
+  await immediate();
+
+  assert.deepEqual(budget.stats(), {
+    maxBytes: 3 * highWaterMark,
+    usedBytes: 3 * highWaterMark,
+    waiting: 1,
+    peakBytes: 3 * highWaterMark,
+  });
+
+  assert.equal((await collect(first)).toString(), 'data');
+  await closeEvent(first);
+  await once(second, 'readable');
+  assert.equal(budget.stats().usedBytes, 3 * highWaterMark);
+  assert.equal((await collect(second)).toString(), 'data');
+  await closeEvent(second);
+  assert.equal(budget.stats().usedBytes, 0);
+  assert.deepEqual(source.streamLeaseRequests, [12, 12]);
+  budget.close();
 });
 
 test('client destruction aborts every planned fetch and leaves no lease', async () => {

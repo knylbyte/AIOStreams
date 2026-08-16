@@ -22,6 +22,9 @@ export interface SegmentArtifactReadOptions {
 /** Where the decoded bytes backing a {@link SegmentArtifact} currently live. */
 export type SegmentArtifactStorage = 'arena' | 'disk-cache' | 'spool' | 'zero';
 
+/** How bounded yEnc metadata maps one article into its logical NZB file. */
+export type SegmentRangeLayout = 'global-range' | 'standalone-part';
+
 /** Scalar-only metadata used by the buffer-free direct spooling locator. */
 export interface SegmentRangeMetadata {
   readonly byteRange?: readonly [number, number];
@@ -29,18 +32,24 @@ export interface SegmentRangeMetadata {
   readonly totalParts?: number;
   readonly name?: string;
   readonly decodedSize?: number;
+  /** Explicit on strict probes; legacy/fake sources may omit it for inference. */
+  readonly layout?: SegmentRangeLayout;
 }
 
 /** Strictness required by a file-offset locator using scalar yEnc metadata. */
 export interface SegmentRangeMetadataFetchOptions {
-  /** Multipart files require an exact `=ypart` range for offset arithmetic. */
+  /** Require global `=ypart`, unless a strict standalone part is allowed. */
   readonly requireByteRange?: boolean;
+  /** Accept an exact single-part `=ybegin size` as a local standalone length. */
+  readonly allowStandalonePart?: boolean;
 }
 
 /** Delivery policy for one independently validated artifact waiter. */
 export interface SegmentArtifactFetchOptions {
   /** Exact file-grid length asserted independently after producer completion. */
   readonly expectedLength?: number;
+  /** Exact authoritative global yEnc range asserted independently per waiter. */
+  readonly expectedByteRange?: readonly [number, number];
   /**
    * Permit resolution after the first committed byte. Successful reader EOF
    * still waits for BODY, decoder, sink and final-length validation.

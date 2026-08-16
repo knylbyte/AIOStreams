@@ -47,6 +47,33 @@ export class YencDecodeError extends Error {
   }
 }
 
+export type YencMetadataErrorCode =
+  | 'no_start_found'
+  | 'invalid_header'
+  | 'inconsistent_layout';
+
+/**
+ * A bounded locator could not derive trustworthy scalar offsets. This does
+ * not prove that the complete article body is missing or undecodable and must
+ * therefore never populate the global body-miss cache.
+ */
+export class YencMetadataError extends Error {
+  override readonly cause?: unknown;
+
+  constructor(
+    readonly code: YencMetadataErrorCode,
+    message: string,
+    options: { readonly cause?: unknown } = {}
+  ) {
+    super(message);
+    this.name = 'YencMetadataError';
+    if (options.cause !== undefined) this.cause = options.cause;
+    Error.captureStackTrace?.(this, YencMetadataError);
+  }
+}
+
+export type YencMetadataLayout = 'global-range' | 'standalone-part';
+
 const CR = 0x0d;
 const LF = 0x0a;
 const EQ = 0x3d; // '='
@@ -226,6 +253,8 @@ export interface YencHeadCaptureOptions {
   readonly strictYencMetadata?: boolean;
   /** Require a valid multipart `=ypart begin/end` range. */
   readonly requireByteRange?: boolean;
+  /** Permit an exact non-multipart `=ybegin size` as a standalone part. */
+  readonly allowStandalonePart?: boolean;
 }
 
 /**
@@ -252,7 +281,8 @@ export class YencHeadCapture {
   private decoding = true;
   private countToEnd = false;
   private decodedCount = 0;
-  private headerFailure: YencDecodeError | undefined;
+  private headerFailure: YencMetadataError | undefined;
+  private layoutValue: YencMetadataLayout | undefined;
 
   byteRange?: [number, number];
   fileSize?: number;
@@ -294,6 +324,7 @@ export class YencHeadCapture {
     totalParts?: number;
     name?: string;
     size?: number;
+    layout?: YencMetadataLayout;
   } {
     if (!this.headerParsed) this.tryParseHeader(true);
     if (this.headerFailure) throw this.headerFailure;
@@ -303,24 +334,28 @@ export class YencHeadCapture {
         this.fileSize === undefined ||
         this.fileSize <= 0
       ) {
-        throw new YencDecodeError(
+        throw new YencMetadataError(
           'invalid_header',
-          'yEnc metadata probe failed: invalid =ybegin size',
-          { terminal: true }
+          'yEnc metadata probe failed: invalid =ybegin size'
         );
       }
-      if (this.options.requireByteRange && !this.byteRange) {
-        throw new YencDecodeError(
+      if (
+        this.options.requireByteRange &&
+        !this.byteRange &&
+        !(
+          this.options.allowStandalonePart &&
+          this.layoutValue === 'standalone-part'
+        )
+      ) {
+        throw new YencMetadataError(
           'invalid_header',
-          'yEnc metadata probe failed: valid =ypart range required',
-          { terminal: true }
+          'yEnc metadata probe failed: valid =ypart range required'
         );
       }
       if (this.byteRange && this.byteRange[1] > this.fileSize) {
-        throw new YencDecodeError(
+        throw new YencMetadataError(
           'invalid_header',
-          'yEnc metadata probe failed: =ypart exceeds =ybegin size',
-          { terminal: true }
+          'yEnc metadata probe failed: =ypart exceeds =ybegin size'
         );
       }
     }
@@ -342,6 +377,7 @@ export class YencHeadCapture {
       totalParts: this.totalParts,
       name: this.name,
       size,
+      layout: this.layoutValue,
     };
   }
 
@@ -374,12 +410,11 @@ export class YencHeadCapture {
       code: 'no_start_found' | 'invalid_header' = 'no_start_found'
     ): void => {
       if (this.options.strictYencMetadata) {
-        this.headerFailure = new YencDecodeError(
+        this.headerFailure = new YencMetadataError(
           code,
           code === 'no_start_found'
             ? 'yEnc metadata probe failed: no_start_found'
-            : 'yEnc metadata probe failed: invalid_header',
-          { terminal: true }
+            : 'yEnc metadata probe failed: invalid_header'
         );
         this.headerParsed = true;
         this.decoding = false;
@@ -418,10 +453,13 @@ export class YencHeadCapture {
     const isMultipart =
       declaredPart !== undefined ||
       (declaredTotal !== undefined && declaredTotal > 1);
-    const requirePart = isMultipart || this.options.requireByteRange === true;
+    const part = text.slice(dataStart).match(/^=ypart ([^\r\n]*)\r?\n/);
+    const requirePart =
+      isMultipart ||
+      (this.options.requireByteRange === true &&
+        this.options.allowStandalonePart !== true);
     let byteRange: [number, number] | undefined;
-    if (requirePart) {
-      const part = text.slice(dataStart).match(/^=ypart ([^\r\n]*)\r?\n/);
+    if (part || requirePart) {
       if (!part) {
         const nextLineComplete = /\r?\n/.test(text.slice(dataStart));
         if (
@@ -466,6 +504,7 @@ export class YencHeadCapture {
       return;
     }
     this.byteRange = byteRange;
+    this.layoutValue = byteRange ? 'global-range' : 'standalone-part';
     this.headerParsed = true;
     // Hand everything past the header lines to the decoder (latin1 keeps a
     // 1:1 char↔byte mapping, so the text offset IS the byte offset).

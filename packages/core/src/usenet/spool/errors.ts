@@ -8,6 +8,7 @@ export type UsenetSpoolErrorCode =
   | 'USENET_SPOOL_CLOSED'
   | 'USENET_SPOOL_ABORTED'
   | 'USENET_SPOOL_INVALID_ARGUMENT'
+  | 'USENET_SPOOL_METADATA_MISMATCH'
   | 'USENET_MEMORY_BUDGET';
 
 /** Stable, credential-free error taxonomy for transient spool operations. */

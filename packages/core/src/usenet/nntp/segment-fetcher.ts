@@ -13,6 +13,8 @@ import {
   decodeArticle,
   YencDecodeError,
   YencHeadCapture,
+  YencMetadataError,
+  type YencMetadataLayout,
 } from '../pool/yenc.js';
 import {
   CommandPriority,
@@ -56,12 +58,14 @@ export interface SegmentHeadData {
   totalParts?: number;
   name?: string;
   size?: number;
+  layout?: YencMetadataLayout;
 }
 
 /** Validation required by an authoritative file-offset metadata probe. */
 export interface SegmentHeadFetchOptions {
   readonly strictYencMetadata?: boolean;
   readonly requireByteRange?: boolean;
+  readonly allowStandalonePart?: boolean;
 }
 
 /** One provider-attempt-local sink and the resource it is filling. */
@@ -670,6 +674,7 @@ export class LocalSegmentFetcher implements SegmentFetcher {
   ): Promise<T> {
     const notFound = new Set<string>();
     const undecodable = new Map<string, YencDecodeError>();
+    const unusableMetadata = new Map<string, YencMetadataError>();
     let lastTransient: NntpError | null = null;
     let lastUnreachable: NntpError | null = null;
     let triedAny = false;
@@ -687,7 +692,10 @@ export class LocalSegmentFetcher implements SegmentFetcher {
       if (
         pool.isBackup &&
         !escalationLogged &&
-        (notFound.size > 0 || undecodable.size > 0 || lastTransient)
+        (notFound.size > 0 ||
+          undecodable.size > 0 ||
+          unusableMetadata.size > 0 ||
+          lastTransient)
       ) {
         escalationLogged = true;
         logger.debug(
@@ -747,6 +755,21 @@ export class LocalSegmentFetcher implements SegmentFetcher {
           );
           continue;
         }
+        if (err instanceof YencMetadataError) {
+          // The bounded locator could not establish trustworthy offsets. The
+          // BODY may still be perfectly decodable, so do not demote affinity,
+          // record a body miss, or report provider corruption.
+          unusableMetadata.set(pool.id, err);
+          logger.debug(
+            {
+              provider: pool.label,
+              messageId: segment.messageId,
+              code: err.code,
+            },
+            'segment metadata unusable for seeking on provider'
+          );
+          continue;
+        }
         if (
           err instanceof NntpError &&
           (err.kind === 'auth_failed' || err.kind === 'no_providers')
@@ -768,7 +791,11 @@ export class LocalSegmentFetcher implements SegmentFetcher {
     if (!triedAny) {
       throw new NntpError('no_providers', 'no usable providers available');
     }
-    if (notFound.size === 0 && undecodable.size === 0) {
+    if (
+      notFound.size === 0 &&
+      undecodable.size === 0 &&
+      unusableMetadata.size === 0
+    ) {
       // No provider actually reported the article missing (430) or handed back
       // a corrupt copy. The fetch failed because providers were
       // unreachable/at-capacity/transient: surface THAT, never a false
@@ -781,6 +808,23 @@ export class LocalSegmentFetcher implements SegmentFetcher {
       );
     }
     const exhausted = !lastTransient && !lastUnreachable;
+    if (unusableMetadata.size > 0) {
+      const first = unusableMetadata.values().next().value!;
+      logger.debug(
+        {
+          messageId: segment.messageId,
+          unusableMetadataOn: [...unusableMetadata.keys()],
+          notFoundOn: [...notFound],
+          code: first.code,
+        },
+        'article metadata unusable on every provider holding it'
+      );
+      throw new YencMetadataError(
+        first.code,
+        `article metadata unusable on all providers (${first.code})`,
+        { cause: first }
+      );
+    }
     if (undecodable.size > 0) {
       // report the corruption rather than a miss.
       const first = undecodable.values().next().value!;

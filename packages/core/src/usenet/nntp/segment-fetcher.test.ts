@@ -16,7 +16,7 @@ import {
 import type { StatsEvent } from '../stats/types.js';
 import { UsenetSpoolError } from '../spool/errors.js';
 import { NntpError } from './errors.js';
-import { YencDecodeError } from '../pool/yenc.js';
+import { YencDecodeError, YencMetadataError } from '../pool/yenc.js';
 import {
   ProviderWorkerPool,
   type WorkerPoolOptions,
@@ -1301,6 +1301,44 @@ test('pool close cancels every deferred command turn and releases listeners', as
   fetcher.close();
 });
 
+test('strict range metadata accepts an exact standalone yEnc article', async (context) => {
+  const server = await AutomaticNntpServer.create(
+    context,
+    articleResponse('standalone.bin', Buffer.from('abc'))
+  );
+  const fetcher = new LocalSegmentFetcher(
+    [provider('standalone-metadata', server.port, 0)],
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      dialTimeoutMs: 1000,
+      segmentStallTimeoutMs: 1000,
+      segmentTimeoutMs: 5000,
+    },
+    new NoopStats()
+  );
+  context.after(() => fetcher.close());
+
+  const metadata = await fetcher.fetchHead(
+    { messageId: 'strict-standalone' },
+    'strict-standalone-nzb',
+    CommandPriority.High,
+    0,
+    undefined,
+    undefined,
+    {
+      strictYencMetadata: true,
+      requireByteRange: true,
+      allowStandalonePart: true,
+    }
+  );
+
+  assert.equal(metadata.layout, 'standalone-part');
+  assert.equal(metadata.byteRange, undefined);
+  assert.equal(metadata.fileSize, 3);
+  assert.equal(metadata.size, 3);
+  assert.deepEqual(server.commands, ['BODY <strict-standalone>']);
+});
+
 test('strict range metadata fails over from malformed yEnc to a valid provider', async (context) => {
   const malformed = await AutomaticNntpServer.create(
     context,
@@ -1317,6 +1355,7 @@ test('strict range metadata fails over from malformed yEnc to a valid provider',
     ],
     {
       ...DEFAULT_ENGINE_OPTIONS,
+      circuitBreakerThreshold: 1,
       dialTimeoutMs: 1000,
       segmentStallTimeoutMs: 1000,
       segmentTimeoutMs: 5000,
@@ -1332,14 +1371,20 @@ test('strict range metadata fails over from malformed yEnc to a valid provider',
     0,
     undefined,
     undefined,
-    { strictYencMetadata: true, requireByteRange: true }
+    {
+      strictYencMetadata: true,
+      requireByteRange: true,
+      allowStandalonePart: true,
+    }
   );
 
   assert.deepEqual(metadata.byteRange, [100, 105]);
+  assert.equal(metadata.layout, 'global-range');
   assert.equal(metadata.fileSize, 1234);
   assert.equal(metadata.size, 5);
   assert.deepEqual(malformed.commands, ['BODY <strict-range-failover>']);
   assert.deepEqual(valid.commands, ['BODY <strict-range-failover>']);
+  assert(fetcher.info().every((entry) => entry.tripped === false));
 });
 
 test('strict range metadata rejects when every provider response is unusable', async (context) => {
@@ -1368,6 +1413,7 @@ test('strict range metadata rejects when every provider response is unusable', a
     ],
     {
       ...DEFAULT_ENGINE_OPTIONS,
+      circuitBreakerThreshold: 1,
       dialTimeoutMs: 1000,
       segmentStallTimeoutMs: 1000,
       segmentTimeoutMs: 5000,
@@ -1384,14 +1430,19 @@ test('strict range metadata rejects when every provider response is unusable', a
       0,
       undefined,
       undefined,
-      { strictYencMetadata: true, requireByteRange: true }
+      {
+        strictYencMetadata: true,
+        requireByteRange: true,
+        allowStandalonePart: true,
+      }
     ),
     (error: unknown) => {
-      assert(error instanceof YencDecodeError);
-      assert.match(error.message, /undecodable on all providers/);
+      assert(error instanceof YencMetadataError);
+      assert.match(error.message, /metadata unusable on all providers/);
       return true;
     }
   );
   assert.deepEqual(first.commands, ['BODY <strict-range-invalid>']);
   assert.deepEqual(second.commands, ['BODY <strict-range-invalid>']);
+  assert(fetcher.info().every((entry) => entry.tripped === false));
 });

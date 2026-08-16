@@ -26,11 +26,16 @@ export interface CommonSegmentReadOptions {
   readonly bufferingBufferSizeBytes: number;
   /** Resource-plan HWM, required and used only by segment spooling. */
   readonly spoolingReaderHighWaterMarkBytes?: number;
+  /** FileStream relay HWM; omitted for a direct two-queue spool stream. */
+  readonly spoolingRelayHighWaterMarkBytes?: number;
   readonly skipBytes?: number;
   readonly limitBytes?: number;
   readonly priority: CommandPriority;
   readonly signal?: AbortSignal;
   readonly sizeForSegment?: (idx: number) => number | undefined;
+  readonly byteRangeForSegment?: (
+    idx: number
+  ) => readonly [number, number] | undefined;
   readonly onHole?: (
     idx: number,
     bytes: number,
@@ -80,11 +85,13 @@ export function createSegmentReadStream(
     nzbHash: options.nzbHash,
     maxPrefetchSegments: options.maxPrefetchSegments,
     readerHighWaterMarkBytes,
+    relayHighWaterMarkBytes: options.spoolingRelayHighWaterMarkBytes,
     skipBytes: options.skipBytes,
     limitBytes: options.limitBytes,
     priority: options.priority,
     signal: options.signal,
     sizeForSegment: options.sizeForSegment,
+    byteRangeForSegment: options.byteRangeForSegment,
     onHole: options.onHole,
     knownHoles: options.knownHoles,
     initialArtifact: options.initialSpoolingArtifact,

@@ -33,11 +33,16 @@ import {
 } from '../types.js';
 import { ByteBudget } from './byte-budget.js';
 import { SegmentCache } from './segment-cache.js';
-import type { SegmentArtifact } from './segment-artifact.js';
+import {
+  ArenaSegmentArtifact,
+  type SegmentArtifact,
+  type SegmentArtifactFetchOptions,
+} from './segment-artifact.js';
+import type { SegmentArtifactCacheLookup } from './segment-artifact.js';
 import { SegmentSpoolingRuntime } from './segment-spooling-runtime.js';
 import { MultiProviderPool } from './multi-provider-pool.js';
 import { SpoolingSegmentsStream } from './spooling-segments-stream.js';
-import { YencDecodeError } from './yenc.js';
+import { YencDecodeError, YencMetadataError } from './yenc.js';
 
 const KIBIBYTE_BYTES = 1024;
 const MEBIBYTE_BYTES = KIBIBYTE_BYTES * KIBIBYTE_BYTES;
@@ -57,12 +62,16 @@ interface FakeBehavior {
   readonly bodyWritten?: PromiseWithResolvers<void>;
   readonly errorAfterBody?: Error;
   readonly headerExpectedSize?: number;
+  readonly headerByteRange?: readonly [number, number];
   readonly metadataSize?: number;
+  readonly metadataByteRange?: readonly [number, number];
+  readonly metadataFileSize?: number;
   readonly error?: Error;
 }
 
 class FakeSegmentFetcher implements SegmentFetcher {
   readonly behaviors = new Map<string, FakeBehavior>();
+  readonly headResults = new Map<string, SegmentHeadData | Error>();
   streamingCalls = 0;
   bufferingCalls = 0;
   headCalls = 0;
@@ -109,8 +118,8 @@ class FakeSegmentFetcher implements SegmentFetcher {
       await behavior.gate;
       if (behavior.error) throw behavior.error;
       attempt.onHeader?.({
-        byteRange: [0, behavior.body.length],
-        fileSize: behavior.body.length,
+        byteRange: behavior.headerByteRange ?? [0, behavior.body.length],
+        fileSize: behavior.metadataFileSize ?? behavior.body.length,
         totalParts: 1,
         name: 'streaming.bin',
         expectedSize: behavior.headerExpectedSize ?? behavior.body.length,
@@ -142,8 +151,8 @@ class FakeSegmentFetcher implements SegmentFetcher {
       return {
         value: attempt.value,
         metadata: {
-          byteRange: [0, behavior.body.length],
-          fileSize: behavior.body.length,
+          byteRange: behavior.metadataByteRange ?? [0, behavior.body.length],
+          fileSize: behavior.metadataFileSize ?? behavior.body.length,
           totalParts: 1,
           name: 'streaming.bin',
           size: behavior.metadataSize ?? behavior.body.length,
@@ -175,6 +184,9 @@ class FakeSegmentFetcher implements SegmentFetcher {
     this.headCalls++;
     this.lastHeadOptions = options;
     onWireStart?.();
+    const configured = this.headResults.get(segment.messageId);
+    if (configured instanceof Error) throw configured;
+    if (configured) return configured;
     const body = this.behaviors.get(segment.messageId)?.body ?? Buffer.alloc(0);
     return {
       head: Buffer.from(body.subarray(0, want)),
@@ -183,6 +195,7 @@ class FakeSegmentFetcher implements SegmentFetcher {
       totalParts: 1,
       name: 'metadata.bin',
       size: body.length,
+      layout: 'global-range',
     };
   }
 
@@ -372,6 +385,7 @@ interface HarnessOptions {
   readonly maxConcurrentDownloads?: number;
   readonly memoryBudget?: ByteBudget;
   readonly spoolManager?: SpoolManager;
+  readonly artifactCache?: SegmentArtifactCacheLookup;
 }
 
 async function createHarness(
@@ -392,6 +406,7 @@ async function createHarness(
     cacheRoot,
     memoryBudget: options.memoryBudget,
     spoolManager: options.spoolManager,
+    artifactCache: options.artifactCache,
   });
   const cache = new SegmentCache({ arenaBytes: 2 * MEBIBYTE_BYTES });
   const engineOptions: EngineOptions = {
@@ -492,13 +507,235 @@ test('network single-flight validates each waiter expected length independently'
   const artifact = await matching;
   await assert.rejects(mismatching, (error: unknown) => {
     assert(error instanceof UsenetSpoolError);
-    assert.equal(error.code, 'USENET_SPOOL_IO');
+    assert.equal(error.code, 'USENET_SPOOL_METADATA_MISMATCH');
     return true;
   });
   assert.deepEqual(await readArtifact(artifact), body);
   assert.equal(fetcher.streamingCalls, 1);
   assert.equal(runtime.spoolManager.stats().artifacts, 0);
   assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+});
+
+test('locator range mismatch is typed and never enters the body miss cache', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const body = Buffer.from('data');
+  fetcher.behaviors.set('range-mismatch', {
+    body,
+    headerByteRange: [8, 12],
+    metadataByteRange: [8, 12],
+    metadataFileSize: 12,
+  });
+  const managerRoot = await mkdtemp(path.join(tmpdir(), 'range-mismatch-'));
+  const manager = new CountingSpoolManager({
+    plan: spoolingPlan(),
+    engineId: 'range-mismatch',
+    cacheRoot: managerRoot,
+  });
+  context.after(async () => {
+    await Promise.allSettled([manager.close()]);
+    await rm(managerRoot, { recursive: true, force: true });
+  });
+  const { pool, runtime } = await createHarness(context, fetcher, {
+    spoolManager: manager,
+  });
+
+  await assert.rejects(
+    pool.fetchSegmentArtifact(
+      { messageId: 'range-mismatch', bytes: body.length },
+      'nzb',
+      undefined,
+      CommandPriority.High,
+      { expectedLength: 4, expectedByteRange: [4, 8] }
+    ),
+    (error: unknown) => {
+      assert(error instanceof UsenetSpoolError);
+      assert.equal(error.code, 'USENET_SPOOL_METADATA_MISMATCH');
+      return true;
+    }
+  );
+  assert.equal(manager.disposeCalls, 1);
+  const valid = await pool.fetchSegmentArtifact(
+    { messageId: 'range-mismatch', bytes: body.length },
+    'nzb',
+    undefined,
+    CommandPriority.High,
+    { expectedLength: 4, expectedByteRange: [8, 12] }
+  );
+  assert.deepEqual(await readArtifact(valid), body);
+  assert.equal(fetcher.streamingCalls, 2);
+  assert.equal(manager.disposeCalls, 2);
+  assert.equal(runtime.spoolManager.stats().artifacts, 0);
+});
+
+test('one network flight validates equal lengths against each waiter range', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const started = Promise.withResolvers<void>();
+  const gate = Promise.withResolvers<void>();
+  const body = Buffer.from('data');
+  fetcher.behaviors.set('per-waiter-range', {
+    body,
+    started,
+    gate: gate.promise,
+  });
+  const { pool, runtime } = await createHarness(context, fetcher);
+  const matching = pool.fetchSegmentArtifact(
+    { messageId: 'per-waiter-range', bytes: body.length },
+    'nzb',
+    undefined,
+    CommandPriority.High,
+    { expectedLength: 4, expectedByteRange: [0, 4] }
+  );
+  const mismatching = pool.fetchSegmentArtifact(
+    { messageId: 'per-waiter-range', bytes: body.length },
+    'nzb',
+    undefined,
+    CommandPriority.High,
+    { expectedLength: 4, expectedByteRange: [4, 8] }
+  );
+  await started.promise;
+  gate.resolve();
+
+  const artifact = await matching;
+  await assert.rejects(mismatching, (error: unknown) => {
+    assert(error instanceof UsenetSpoolError);
+    assert.equal(error.code, 'USENET_SPOOL_METADATA_MISMATCH');
+    return true;
+  });
+  assert.deepEqual(await readArtifact(artifact), body);
+  assert.equal(fetcher.streamingCalls, 1);
+  assert.equal(runtime.spoolManager.stats().artifacts, 0);
+});
+
+test('growing handles validate header and final ranges independently', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const afterFirstChunkGate = Promise.withResolvers<void>();
+  const body = Buffer.from('data');
+  fetcher.behaviors.set('growing-range-validation', {
+    body,
+    firstChunkBytes: 2,
+    afterFirstChunkGate: afterFirstChunkGate.promise,
+    headerByteRange: [0, 4],
+    metadataByteRange: [4, 8],
+    metadataFileSize: 8,
+  });
+  const { pool, runtime } = await createHarness(context, fetcher);
+  const headerWaiter = await pool.fetchSegmentArtifact(
+    { messageId: 'growing-range-validation', bytes: body.length },
+    'nzb',
+    undefined,
+    CommandPriority.High,
+    {
+      expectedLength: 4,
+      expectedByteRange: [0, 4],
+      allowGrowing: true,
+    }
+  );
+  const finalWaiter = pool.fetchSegmentArtifact(
+    { messageId: 'growing-range-validation', bytes: body.length },
+    'nzb',
+    undefined,
+    CommandPriority.High,
+    {
+      expectedLength: 4,
+      expectedByteRange: [4, 8],
+      allowGrowing: true,
+    }
+  );
+  let finalWaiterSettled = false;
+  void finalWaiter.finally(() => {
+    finalWaiterSettled = true;
+  });
+  const headerReader = headerWaiter.createReadStream();
+  const headerResult = new Promise<void>((resolve, reject) => {
+    headerReader.once('end', resolve);
+    headerReader.once('error', reject);
+    headerReader.resume();
+  });
+  await Promise.resolve();
+  assert.equal(finalWaiterSettled, false);
+  afterFirstChunkGate.resolve();
+
+  await assert.rejects(headerResult, (error: unknown) => {
+    assert(error instanceof UsenetSpoolError);
+    assert.equal(error.code, 'USENET_SPOOL_METADATA_MISMATCH');
+    return true;
+  });
+  const finalArtifact = await finalWaiter;
+  assert.deepEqual(await readArtifact(finalArtifact), body);
+  await headerWaiter.release();
+  assert.equal(fetcher.streamingCalls, 1);
+  assert.equal(runtime.spoolManager.stats().artifacts, 0);
+});
+
+test('arena and file-backed hits enforce the same byte-range expectations', async (context) => {
+  await context.test('arena', async (subtest) => {
+    const fetcher = new FakeSegmentFetcher();
+    const { pool, cache } = await createHarness(subtest, fetcher);
+    const lease = cache.arena.checkout(MEBIBYTE_BYTES);
+    assert(lease);
+    Buffer.from('data').copy(lease.slot);
+    cache.arena.commit(lease, 'arena-range', {
+      body: lease.slot.subarray(0, 4),
+      byteRange: [0, 4],
+      fileSize: 8,
+      size: 4,
+    });
+    await assert.rejects(
+      pool.fetchSegmentArtifact(
+        { messageId: 'arena-range' },
+        'nzb',
+        undefined,
+        CommandPriority.High,
+        { expectedLength: 4, expectedByteRange: [4, 8] }
+      ),
+      (error: unknown) => {
+        assert(error instanceof UsenetSpoolError);
+        assert.equal(error.code, 'USENET_SPOOL_METADATA_MISMATCH');
+        return true;
+      }
+    );
+    assert.equal(cache.arena.stats().pinned, 0);
+    assert.equal(fetcher.streamingCalls, 0);
+  });
+
+  await context.test('file-backed extension point', async (subtest) => {
+    const fetcher = new FakeSegmentFetcher();
+    let releases = 0;
+    const artifactCache: SegmentArtifactCacheLookup = {
+      acquire: () =>
+        Promise.resolve(
+          new ArenaSegmentArtifact({
+            data: {
+              body: Buffer.from('data'),
+              byteRange: [0, 4],
+              fileSize: 8,
+              size: 4,
+            },
+            owned: true,
+            release: () => {
+              releases++;
+            },
+          })
+        ),
+    };
+    const { pool } = await createHarness(subtest, fetcher, { artifactCache });
+    await assert.rejects(
+      pool.fetchSegmentArtifact(
+        { messageId: 'l2-range' },
+        'nzb',
+        undefined,
+        CommandPriority.High,
+        { expectedLength: 4, expectedByteRange: [4, 8] }
+      ),
+      (error: unknown) => {
+        assert(error instanceof UsenetSpoolError);
+        assert.equal(error.code, 'USENET_SPOOL_METADATA_MISMATCH');
+        return true;
+      }
+    );
+    assert.equal(releases, 1);
+    assert.equal(fetcher.streamingCalls, 0);
+  });
 });
 
 test('undefined and exact network waiters receive independent valid handles', async (context) => {
@@ -581,7 +818,7 @@ test('a late contradictory waiter cannot join an already published growing owner
   assert.deepEqual(await correctRead, body);
   await assert.rejects(contradictory, (error: unknown) => {
     assert(error instanceof UsenetSpoolError);
-    assert.equal(error.code, 'USENET_SPOOL_IO');
+    assert.equal(error.code, 'USENET_SPOOL_METADATA_MISMATCH');
     return true;
   });
   assert.equal(fetcher.streamingCalls, 1);
@@ -766,7 +1003,7 @@ test('growing readers reject both larger and smaller final decoded lengths', asy
       validationGate.resolve();
       await assert.rejects(readerResult, (error: unknown) => {
         assert(error instanceof UsenetSpoolError);
-        assert.equal(error.code, 'USENET_SPOOL_IO');
+        assert.equal(error.code, 'USENET_SPOOL_METADATA_MISMATCH');
         return true;
       });
       assert.equal(artifact.metadata.size, scenario.body.length);
@@ -908,11 +1145,15 @@ test('a future SpoolingSegmentsStream task waits for complete provider failover'
   assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
 });
 
-test('stream memory reserves exactly the inner and outer reader high-water marks', async (context) => {
+test('stream memory atomically reserves the requested bounded queue bytes', async (context) => {
   const fetcher = new FakeSegmentFetcher();
   const { pool, runtime } = await createHarness(context, fetcher);
-  const lease = await pool.acquireSegmentStreamMemory(CommandPriority.High);
-  assert.equal(lease.bytes, 2 * runtime.plan.readerHighWaterMarkBytes);
+  const bytes = 2 * runtime.plan.readerHighWaterMarkBytes;
+  const lease = await pool.acquireSegmentStreamMemory(
+    bytes,
+    CommandPriority.High
+  );
+  assert.equal(lease.bytes, bytes);
   assert.equal(runtime.memoryBudget.stats().usedBytes, lease.bytes);
   lease.release();
   lease.release();
@@ -937,11 +1178,13 @@ test('range metadata probes retain only scalar fields and honor abort', async (c
     totalParts: 1,
     name: 'metadata.bin',
     decodedSize: body.length,
+    layout: 'global-range',
   });
   assert.equal(fetcher.headCalls, 1);
   assert.deepEqual(fetcher.lastHeadOptions, {
     strictYencMetadata: true,
     requireByteRange: undefined,
+    allowStandalonePart: undefined,
   });
   assert.equal(fetcher.streamingCalls, 0);
   assert.equal(fetcher.bufferingCalls, 0);
@@ -961,17 +1204,87 @@ test('range metadata probes retain only scalar fields and honor abort', async (c
   assert.equal(fetcher.headCalls, 1);
 });
 
+test('locator-only metadata failure never poisons the body miss cache', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const body = Buffer.from('valid standalone body');
+  fetcher.headResults.set(
+    'metadata-does-not-poison-body',
+    new YencMetadataError(
+      'invalid_header',
+      'synthetic locator-only metadata failure'
+    )
+  );
+  fetcher.behaviors.set('metadata-does-not-poison-body', { body });
+  const { pool } = await createHarness(context, fetcher);
+
+  await assert.rejects(
+    pool.fetchSegmentRangeMetadata(
+      { messageId: 'metadata-does-not-poison-body' },
+      'nzb',
+      undefined,
+      CommandPriority.High,
+      { requireByteRange: true, allowStandalonePart: true }
+    ),
+    YencMetadataError
+  );
+
+  const artifact = await pool.fetchSegmentArtifact(
+    { messageId: 'metadata-does-not-poison-body', bytes: body.length },
+    'nzb',
+    undefined
+  );
+  assert.deepEqual(await readArtifact(artifact), body);
+  assert.equal(fetcher.headCalls, 1);
+  assert.equal(fetcher.streamingCalls, 1);
+});
+
+test('artifact range expectations reject invalid scalar constraints before I/O', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const { pool } = await createHarness(context, fetcher);
+  const invalid: readonly SegmentArtifactFetchOptions[] = [
+    { expectedByteRange: [-1, 3] },
+    { expectedByteRange: [3, 3] },
+    { expectedByteRange: [0, Number.NaN] },
+    { expectedByteRange: [0, 1.5] },
+    { expectedLength: 3, expectedByteRange: [0, 4] },
+  ];
+
+  for (const options of invalid) {
+    await assert.rejects(
+      pool.fetchSegmentArtifact(
+        { messageId: 'invalid-artifact-expectation' },
+        'nzb',
+        undefined,
+        CommandPriority.High,
+        options
+      ),
+      (error: unknown) => {
+        assert(error instanceof UsenetSpoolError);
+        assert.equal(error.code, 'USENET_SPOOL_INVALID_ARGUMENT');
+        return true;
+      }
+    );
+  }
+  assert.equal(fetcher.streamingCalls, 0);
+});
+
 test('bounded stream admission preserves download-memory progress', async (context) => {
   const fetcher = new FakeSegmentFetcher();
   const { pool, runtime } = await createHarness(context, fetcher);
   const active = await Promise.all(
     Array.from({ length: 4 }, () =>
-      pool.acquireSegmentStreamMemory(CommandPriority.High)
+      pool.acquireSegmentStreamMemory(
+        2 * runtime.plan.readerHighWaterMarkBytes,
+        CommandPriority.High
+      )
     )
   );
   let fifthGranted = false;
   const fifthPromise = pool
-    .acquireSegmentStreamMemory(CommandPriority.High)
+    .acquireSegmentStreamMemory(
+      2 * runtime.plan.readerHighWaterMarkBytes,
+      CommandPriority.High
+    )
     .then((lease) => {
       fifthGranted = true;
       return lease;

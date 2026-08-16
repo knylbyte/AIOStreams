@@ -9,6 +9,7 @@ import {
   type SegmentArtifactFetchOptions,
 } from './segment-artifact.js';
 import type { CommandPriority, NzbSegmentRef } from '../types.js';
+import { YencMetadataError } from './yenc.js';
 
 const logger = createLogger('usenet/spooling-segments');
 
@@ -22,6 +23,7 @@ export interface SpoolingSegmentArtifactSource {
     options?: SegmentArtifactFetchOptions
   ): Promise<SegmentArtifact>;
   acquireSegmentStreamMemory(
+    bytes: number,
     priority: CommandPriority,
     signal?: AbortSignal
   ): Promise<ByteLease>;
@@ -35,6 +37,8 @@ export interface SpoolingSegmentsStreamOptions {
   /** Hard bound on planned fetch/artifact tasks retained by this stream. */
   readonly maxPrefetchSegments: number;
   readonly readerHighWaterMarkBytes: number;
+  /** Additional bounded relay queue owned by a wrapping FileStream. */
+  readonly relayHighWaterMarkBytes?: number;
   /** Bytes discarded from the first relevant artifact. */
   readonly skipBytes?: number;
   /** Exact post-skip output cap. */
@@ -42,6 +46,10 @@ export interface SpoolingSegmentsStreamOptions {
   readonly priority: CommandPriority;
   readonly signal?: AbortSignal;
   readonly sizeForSegment?: (idx: number) => number | undefined;
+  /** Authoritative global yEnc range, never an estimate or local prefix. */
+  readonly byteRangeForSegment?:
+    | ((idx: number) => readonly [number, number] | undefined)
+    | undefined;
   readonly onHole?: (
     idx: number,
     bytes: number,
@@ -91,9 +99,10 @@ function isPositiveSafeInteger(value: number): boolean {
  *   for complete provider failover and producer validation;
  * - exactly one artifact reader may feed the outer Readable at a time;
  * - output order is monotonically increasing by local segment index;
- * - the stream-level memory lease covers the inner and outer Readable HWMs,
- *   is acquired before dispatch, and remains held until producer resources
- *   are detached AND every retained output queue is drained or destroyed;
+ * - one pre-dispatch stream-memory lease covers the artifact reader and this
+ *   stream (`2H`), plus the optional FileStream relay (`3H`); it remains held
+ *   until producer resources are detached AND every owned output queue is
+ *   drained or destroyed;
  * - satisfying a finite byte range stops further output immediately, but
  *   successful EOF is linearized only by the active artifact reader's
  *   producer-validated `end` event;
@@ -105,10 +114,14 @@ export class SpoolingSegmentsStream extends Readable {
   private readonly nzbHash: string;
   private readonly maxPrefetchSegments: number;
   private readonly readerHighWaterMarkBytes: number;
+  private readonly streamMemoryBytes: number;
   private readonly priority: CommandPriority;
   private readonly externalSignal: AbortSignal | undefined;
   private readonly sizeForSegment:
     | ((idx: number) => number | undefined)
+    | undefined;
+  private readonly byteRangeForSegment:
+    | ((idx: number) => readonly [number, number] | undefined)
     | undefined;
   private readonly onHole:
     | ((idx: number, bytes: number, kind: HoleKind) => HoleDecision)
@@ -132,6 +145,7 @@ export class SpoolingSegmentsStream extends Readable {
   private rangeSatisfied = false;
   private streamLifecycleEnded = false;
   private streamLeaseRetained = false;
+  private artifactLayout: 'global-range' | 'standalone-part' | undefined;
 
   constructor(options: SpoolingSegmentsStreamOptions) {
     if (!isPositiveSafeInteger(options.maxPrefetchSegments)) {
@@ -140,6 +154,22 @@ export class SpoolingSegmentsStream extends Readable {
     if (!isPositiveSafeInteger(options.readerHighWaterMarkBytes)) {
       throw new RangeError(
         'Spooling reader high-water mark must be a safe positive integer'
+      );
+    }
+    if (
+      options.relayHighWaterMarkBytes !== undefined &&
+      !isPositiveSafeInteger(options.relayHighWaterMarkBytes)
+    ) {
+      throw new RangeError(
+        'Spooling relay high-water mark must be a safe positive integer'
+      );
+    }
+    const streamMemoryBytes =
+      2 * options.readerHighWaterMarkBytes +
+      (options.relayHighWaterMarkBytes ?? 0);
+    if (!isPositiveSafeInteger(streamMemoryBytes)) {
+      throw new RangeError(
+        'Spooling stream memory window must be a safe positive integer'
       );
     }
     const skipBytes = options.skipBytes ?? 0;
@@ -162,9 +192,11 @@ export class SpoolingSegmentsStream extends Readable {
     this.nzbHash = options.nzbHash;
     this.maxPrefetchSegments = options.maxPrefetchSegments;
     this.readerHighWaterMarkBytes = options.readerHighWaterMarkBytes;
+    this.streamMemoryBytes = streamMemoryBytes;
     this.priority = options.priority;
     this.externalSignal = options.signal;
     this.sizeForSegment = options.sizeForSegment;
+    this.byteRangeForSegment = options.byteRangeForSegment;
     this.onHole = options.onHole;
     this.knownHoles = options.knownHoles;
     this.initialArtifact = options.initialArtifact;
@@ -247,6 +279,7 @@ export class SpoolingSegmentsStream extends Readable {
     }
     try {
       const lease = await this.pool.acquireSegmentStreamMemory(
+        this.streamMemoryBytes,
         this.priority,
         this.controller.signal
       );
@@ -295,6 +328,7 @@ export class SpoolingSegmentsStream extends Readable {
       }
 
       const expectedLength = this.sizeForSegment?.(idx);
+      const expectedByteRange = this.byteRangeForSegment?.(idx);
       task.settled = this.pool
         .fetchSegmentArtifact(
           this.segments[idx],
@@ -303,6 +337,7 @@ export class SpoolingSegmentsStream extends Readable {
           this.priority,
           {
             expectedLength,
+            expectedByteRange,
             allowGrowing: idx === 0,
           }
         )
@@ -359,7 +394,39 @@ export class SpoolingSegmentsStream extends Readable {
       this.destroy(new Error('Spooling segment task settled without storage'));
       return;
     }
+    try {
+      this.acceptArtifactLayout(artifact);
+    } catch (error) {
+      this.destroy(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
     this.startArtifactReader(task, artifact);
+  }
+
+  private acceptArtifactLayout(artifact: SegmentArtifact): void {
+    if (artifact.storage === 'zero') return;
+    const range = artifact.metadata.byteRange;
+    const layout = range ? 'global-range' : 'standalone-part';
+    if (
+      !range &&
+      artifact.metadata.totalParts !== undefined &&
+      artifact.metadata.totalParts > 1
+    ) {
+      throw new YencMetadataError(
+        'invalid_header',
+        'Multipart yEnc artifact is missing its global byte range'
+      );
+    }
+    if (this.artifactLayout === undefined) {
+      this.artifactLayout = layout;
+      return;
+    }
+    if (this.artifactLayout !== layout) {
+      throw new YencMetadataError(
+        'inconsistent_layout',
+        'Logical file mixes global yEnc ranges with standalone parts'
+      );
+    }
   }
 
   private startArtifactReader(
@@ -424,15 +491,19 @@ export class SpoolingSegmentsStream extends Readable {
       output = output.subarray(0, this.limitRemaining);
     }
     this.limitRemaining -= output.length;
-    if (output.length > 0 && !this.push(output)) {
-      this.backpressured = true;
-      active.reader.pause();
-    }
+    const accepted = output.length === 0 || this.push(output);
     if (this.limitRemaining === 0) {
       // The reader's endExclusive matches the satisfied range. It may already
       // have emitted every requested byte while its producer-completion gate
       // is still pending, so only its validated `end` may finish this stream.
       this.rangeSatisfied = true;
+    }
+    if (!accepted) {
+      this.backpressured = true;
+      // Once the exact finite range is satisfied there can be no additional
+      // payload before endExclusive. Keep the reader flowing so its validated
+      // end/error gate cannot deadlock behind a full output queue.
+      if (!this.rangeSatisfied) active.reader.pause();
     }
   }
 
