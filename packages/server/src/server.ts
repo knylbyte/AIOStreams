@@ -1,5 +1,8 @@
 ﻿import app from './app.js';
 
+import type { Server } from 'node:http';
+import { ShutdownCoordinator, shutdownAdmission } from './shutdown.js';
+
 import {
   Env,
   config as appConfig,
@@ -41,6 +44,7 @@ import {
 } from '@aiostreams/core';
 
 const logger = createLogger('server');
+let httpServer: Server | undefined;
 
 async function initialiseDatabase() {
   try {
@@ -316,6 +320,7 @@ async function start() {
         `Server running on port ${appConfig.bootstrap.port}: ${JSON.stringify(server.address())}`
       );
     });
+    httpServer = server;
   } catch (error) {
     if (error instanceof ConfigStartupError) throw error;
     logger.error('Failed to start server:', error);
@@ -324,41 +329,58 @@ async function start() {
 }
 
 let shutdownPromise: Promise<void> | undefined;
+let shutdownCoordinator: ShutdownCoordinator | undefined;
+let usenetShutdownPromise: Promise<void> | undefined;
+
+function beginUsenetShutdown(): Promise<void> {
+  if (!usenetShutdownPromise) {
+    // closeAll() publishes the engine-registry fence synchronously. Attach a
+    // rejection observer immediately because session/analytics cleanup may run
+    // before the coordinator reaches the engine barrier.
+    usenetShutdownPromise = shutdownUsenetEngines();
+    void usenetShutdownPromise.catch(() => undefined);
+  }
+  return usenetShutdownPromise;
+}
 
 function shutdown(): Promise<void> {
-  shutdownPromise ??= shutdownOnce();
+  shutdownPromise ??= shutdownCoordinatorInstance().close();
   return shutdownPromise;
 }
 
-async function shutdownOnce() {
-  const errors: unknown[] = [];
-  const runCleanup = async (
-    label: string,
-    operation: () => Promise<unknown>
-  ): Promise<void> => {
-    try {
-      await operation();
-    } catch (error) {
-      errors.push(error);
+function shutdownCoordinatorInstance(): ShutdownCoordinator {
+  shutdownCoordinator ??= new ShutdownCoordinator({
+    admission: shutdownAdmission,
+    server: () => httpServer,
+    stopTasks: () => TaskManager.stopAll(),
+    sealStreams: () => {
+      streamRegistry.sealAndCloseAll('stale');
+      beginUsenetShutdown();
+    },
+    beforeListenerClose: [
+      { label: 'stream sessions', run: flushStreamSessions },
+      { label: 'analytics', run: stopAnalytics },
+      // Exclusive stable segment-cache writer handoff: all NNTP, readers,
+      // spool files, leases and the final index snapshot finish here.
+      { label: 'usenet engines', run: beginUsenetShutdown },
+    ],
+    afterListenerClose: [
+      { label: 'disk caches', run: flushAllDiskCaches },
+      { label: 'cache service', run: () => Cache.close() },
+      {
+        label: 'search services',
+        run: async () => {
+          RegexAccess.cleanup();
+          SelAccess.cleanup();
+        },
+      },
+      { label: 'database', run: closeDb },
+    ],
+    onCleanupError: (label, error) => {
       logger.error({ err: error, cleanup: label }, 'shutdown cleanup failed');
-    }
-  };
-  TaskManager.stopAll();
-  // Write live sessions out so the next boot doesn't reclaim them as stale.
-  streamRegistry.closeAll('stale');
-  await runCleanup('stream sessions', flushStreamSessions);
-  await runCleanup('analytics', stopAnalytics);
-  // This is the exclusive stable segment-cache writer handoff: all NNTP,
-  // readers, spool files, leases and the final index snapshot finish here.
-  await runCleanup('usenet engines', shutdownUsenetEngines);
-  await runCleanup('disk caches', flushAllDiskCaches);
-  await runCleanup('cache service', () => Cache.close());
-  RegexAccess.cleanup();
-  SelAccess.cleanup();
-  await runCleanup('database', closeDb);
-  if (errors.length > 0) {
-    throw new AggregateError(errors, 'One or more shutdown cleanups failed');
-  }
+    },
+  });
+  return shutdownCoordinator;
 }
 
 process.on('unhandledRejection', (reason) => {

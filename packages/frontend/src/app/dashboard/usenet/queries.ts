@@ -95,6 +95,9 @@ export interface ResourceStats {
     files: number;
     openFiles: number;
     waiting: number;
+    writeBytesPerSec: number;
+    readBytesPerSec: number;
+    cleanupErrors: number;
   };
   arena: {
     usedBytes: number;

@@ -14,6 +14,7 @@ import { StatsAccumulator } from './stats/accumulator.js';
 import { SpoolManager } from './spool/manager.js';
 import type { SpoolFileHandle, SpoolFileSystem } from './spool/types.js';
 import type { SegmentSpoolingPlan } from './resource-plan.js';
+import type { Nzb } from './nzb/model.js';
 import {
   DEFAULT_ENGINE_OPTIONS,
   type EngineOptions,
@@ -229,6 +230,26 @@ interface E2eHarness {
   readonly runtime?: SegmentSpoolingRuntime;
   readonly options: EngineOptions;
   readonly plan?: SegmentSpoolingPlan;
+  readonly waitForPoolIdle: () => Promise<void>;
+}
+
+/** Single-waiter barrier fed by the pool's bounded operation-owner count. */
+class PoolIdleBarrier {
+  private active = 0;
+  private waiter: PromiseWithResolvers<void> | undefined;
+
+  readonly observe = (active: number): void => {
+    this.active = active;
+    if (active !== 0 || !this.waiter) return;
+    this.waiter.resolve();
+    this.waiter = undefined;
+  };
+
+  wait(): Promise<void> {
+    if (this.active === 0) return Promise.resolve();
+    this.waiter ??= Promise.withResolvers<void>();
+    return this.waiter.promise;
+  }
 }
 
 async function createHarness(
@@ -251,6 +272,7 @@ async function createHarness(
     segmentStallTimeoutMs: 2_000,
   };
   const cache = new SegmentCache({ arenaBytes: 4 * MEBIBYTE_BYTES });
+  const idle = new PoolIdleBarrier();
   const plan =
     mode === 'segment_spooling' ? (options.plan ?? testPlan()) : undefined;
   const runtime = plan
@@ -272,13 +294,22 @@ async function createHarness(
     engineOptions,
     cache,
     new StatsAccumulator(),
-    { spooling: runtime }
+    {
+      spooling: runtime,
+      onActiveOperationCountChanged: idle.observe,
+    }
   );
   context.after(async () => {
     await Promise.allSettled([pool.close(), cache.close()]);
     await fs.rm(cacheRoot, { recursive: true, force: true });
   });
-  return { pool, runtime, options: engineOptions, plan };
+  return {
+    pool,
+    runtime,
+    options: engineOptions,
+    plan,
+    waitForPoolIdle: () => idle.wait(),
+  };
 }
 
 function fileStream(
@@ -434,6 +465,122 @@ test('fragmented pipelined yEnc streams preserve range, slow-player and bufferin
   assert.deepEqual(await collect(bufferingFile.createReadStream()), expected);
 });
 
+test('two active clients share one flight while one aborts independently', async (context) => {
+  const body = Buffer.alloc(96 * KIBIBYTE_BYTES, 0x5a);
+  const response = articleResponse(body, 1, 1, 0, body.length);
+  const providerGate = Promise.withResolvers<void>();
+  const providerFinished = Promise.withResolvers<void>();
+  const server = await FakeNntpServer.create(context, () => ({
+    response,
+    gate: providerGate.promise,
+    fragmentBytes: 1024,
+    onWritten: providerFinished.resolve,
+  }));
+  const harness = await createHarness(
+    context,
+    [provider('parallel-clients', server.port)],
+    'segment_spooling'
+  );
+  const file = fileStream(harness, [body]);
+  await file.open();
+
+  const first = file.createReadStream();
+  const second = file.createReadStream();
+  const firstResult = collect(first);
+  const secondResult = collect(second);
+  await server.waitForBodyCount(1);
+  assert.equal(server.bodyCommands.length, 1, 'single-flight network fetch');
+
+  first.destroy(new Error('client closed'));
+  providerGate.resolve();
+  await assert.rejects(firstResult, /client closed/);
+  assert.deepEqual(await secondResult, body);
+  await providerFinished.promise;
+  await harness.waitForPoolIdle();
+
+  assert.equal(server.bodyCommands.length, 1);
+  assert(harness.runtime);
+  assert.equal(harness.runtime.stats().memory.usedBytes, 0);
+  assert.equal(harness.runtime.stats().spool.budget.reservedBytes, 0);
+  assert.equal(harness.runtime.stats().spool.files.openFiles, 0);
+  assert.equal(harness.runtime.stats().spool.artifacts, 0);
+});
+
+test('engine close terminates an active provider/read pipeline and reaches zero owners', async (context) => {
+  // Load through the integration entry first; importing index.ts as a fresh
+  // root would traverse the legacy integration/index cycle in the opposite
+  // direction before UsenetEngineRegistry has initialized.
+  await import('./integration/engine.js');
+  const { UsenetEngine } = await import('./index.js');
+  const body = Buffer.alloc(48 * KIBIBYTE_BYTES, 0x39);
+  const response = articleResponse(body, 1, 1, 0, body.length);
+  const playbackGate = Promise.withResolvers<void>();
+  const server = await FakeNntpServer.create(
+    context,
+    (_messageId, occurrence) => ({
+      response,
+      gate: occurrence === 1 ? undefined : playbackGate.promise,
+      fragmentBytes: 512,
+    })
+  );
+  const engine = new UsenetEngine([provider('engine-close', server.port)], {
+    ...DEFAULT_ENGINE_OPTIONS,
+    streamingMode: 'segment_spooling',
+    maxConcurrentDownloads: 2,
+    prefetchSegments: 2,
+    segmentDiskCacheBytes: 0,
+    segmentSpoolingMemoryBudgetBytes: 16 * MEBIBYTE_BYTES,
+    segmentSpoolingStreamBufferBytes: 2 * MEBIBYTE_BYTES,
+    segmentSpoolingSpoolBytes: 64 * MEBIBYTE_BYTES,
+    segmentSpoolingMinFreeDiskBytes: 0,
+  });
+  context.after(() => engine.close());
+  const nzb: Nzb = {
+    hash: 'engine-close-e2e',
+    meta: {},
+    files: [
+      {
+        subject: '"stream.bin" yEnc',
+        groups: ['alt.binaries.test'],
+        encodedSize: body.length + 512,
+        filename: 'stream.bin',
+        segments: [
+          {
+            number: 1,
+            bytes: body.length + 512,
+            messageId: 'engine-close-segment',
+          },
+        ],
+      },
+    ],
+  };
+  const file = await engine.openFileStream(nzb, { fileIndex: 0 });
+  const reader = file.createReadStream();
+  reader.on('error', () => undefined);
+  reader.resume();
+  await server.waitForBodyCount(2);
+  const readerClosed = new Promise<void>((resolve) =>
+    reader.once('close', resolve)
+  );
+
+  const closing = engine.close();
+  await Promise.all([closing, readerClosed]);
+  playbackGate.resolve();
+  await engine.close();
+
+  const resources = engine.liveStats().resources;
+  assert.equal(resources.memory.usedBytes, 0);
+  assert.equal(resources.memory.waiting, 0);
+  assert.equal(resources.spool.reservedBytes, 0);
+  assert.equal(resources.spool.actualBytes, 0);
+  assert.equal(resources.spool.openFiles, 0);
+  assert.equal(resources.spool.files, 0);
+  assert.equal(resources.spool.sessions, 0);
+  assert.equal(engine.poolInfo().globalDownloadsInUse, 0);
+  assert.equal(engine.poolInfo().globalDownloadsWaiting, 0);
+  assert.equal(engine.poolInfo().globalDownloadsOnWire, 0);
+});
+
 test('out-of-order completed spools remain ordered and provider 430 fails over', async (context) => {
   const bodies = [Buffer.from('first-'), Buffer.from('second')];
   const expected = Buffer.concat(bodies);
@@ -568,9 +715,11 @@ test('slow disk, ENOSPC, EACCES and client abort leave no spool ownership', asyn
   }
 
   const providerGate = Promise.withResolvers<void>();
+  const providerFinished = Promise.withResolvers<void>();
   const abortServer = await FakeNntpServer.create(context, () => ({
     response,
     gate: providerGate.promise,
+    onWritten: providerFinished.resolve,
   }));
   const abortHarness = await createHarness(
     context,
@@ -587,11 +736,12 @@ test('slow disk, ENOSPC, EACCES and client abort leave no spool ownership', asyn
   aborted.destroy(new Error('client closed'));
   providerGate.resolve();
   await closed;
+  await providerFinished.promise;
+  await abortHarness.waitForPoolIdle();
   assert(abortHarness.runtime);
-  // The on-wire BODY owns its download lease until the connection finishes or
-  // the engine closes. Closing the pool is the deterministic shutdown barrier;
-  // it must absorb the client abort without leaving any owner behind.
-  await abortHarness.pool.close();
+  // The on-wire BODY may finish consistently after the last reader leaves, but
+  // client abort alone must retire the flight and every owner. Pool shutdown is
+  // deliberately not used as a cleanup crutch in this assertion.
   assert.equal(abortHarness.runtime.stats().memory.usedBytes, 0);
   assert.equal(abortHarness.runtime.stats().spool.budget.reservedBytes, 0);
   assert.equal(abortHarness.runtime.stats().spool.files.openFiles, 0);

@@ -28,6 +28,7 @@ import type {
   SpoolScheduler,
 } from './types.js';
 import type { GrowingSpoolArtifact } from './growing-artifact.js';
+import type { UsenetResourceEventObserver } from '../pool/resource-events.js';
 
 function testPlan(
   overrides: Partial<SegmentSpoolingPlan> = {}
@@ -54,6 +55,7 @@ interface TestManagerOptions {
   readonly idGenerator?: () => string;
   readonly scheduler?: SpoolScheduler;
   readonly maxArtifacts?: number;
+  readonly onEvent?: UsenetResourceEventObserver;
 }
 
 async function testManager(
@@ -71,6 +73,7 @@ async function testManager(
     idGenerator: options.idGenerator ?? (() => `test-id-${nextId++}`),
     scheduler: options.scheduler,
     maxArtifacts: options.maxArtifacts,
+    onEvent: options.onEvent,
   };
   const manager = new SpoolManager(managerOptions);
   context.after(async () => {
@@ -2062,6 +2065,72 @@ test('retains disk accounting until manager cleanup removes a failed creation', 
   assert.equal(manager.stats().budget.reservedBytes, 0);
   assert.equal(manager.stats().artifacts, 0);
   assert.deepEqual(await filesBelow(cacheRoot), []);
+});
+
+test('spool throughput rates come from committed writes and delivered reader bytes', async (context) => {
+  let now = 0;
+  const { manager } = await testManager(context, { clock: () => now });
+  const memory = new ByteBudget(16);
+  const artifact = await manager.createArtifact({
+    sessionId: 'rate-session',
+    segmentId: 'rate-segment',
+    initialReservationBytes: 16,
+  });
+  await writeText(artifact, memory, 'abcdef');
+  await artifact.complete();
+  assert.equal(
+    (await collect(artifact.createReadStream())).toString(),
+    'abcdef'
+  );
+
+  now = 1000;
+  const stats = manager.stats();
+  assert.equal(stats.writeBytesPerSec, 6);
+  assert.equal(stats.readBytesPerSec, 6);
+  assert.equal(stats.cleanupErrors, 0);
+  await artifact.dispose();
+});
+
+test('successful namespace fallback reconciles sessions after artifact dispose failure', async (context) => {
+  let failReadyRemoval = true;
+  const fileSystem: Partial<SpoolFileSystem> = {
+    rm: async (target, options) => {
+      if (failReadyRemoval && target.endsWith('.ready') && !options.recursive) {
+        failReadyRemoval = false;
+        const error = new Error('synthetic artifact cleanup failure');
+        Object.defineProperty(error, 'code', { value: 'EACCES' });
+        throw error;
+      }
+      await rm(target, options);
+    },
+  };
+  const events: string[] = [];
+  const { manager } = await testManager(context, {
+    fileSystem,
+    onEvent: (event) => events.push(event.type),
+  });
+  const memory = new ByteBudget(8);
+  const artifact = await manager.createArtifact({
+    sessionId: 'fallback-session',
+    segmentId: 'fallback-segment',
+    initialReservationBytes: 8,
+  });
+  await writeText(artifact, memory, 'data');
+  await artifact.complete();
+  assert.equal(manager.stats().sessions, 1);
+
+  await assert.rejects(manager.close(), { code: 'USENET_SPOOL_UNAVAILABLE' });
+  const stats = manager.stats();
+  assert.equal(stats.budget.reservedBytes, 0);
+  assert.equal(stats.budget.actualBytes, 0);
+  assert.equal(stats.files.openFiles, 0);
+  assert.equal(stats.artifacts, 0);
+  assert.equal(stats.sessions, 0);
+  assert.equal(stats.cleanupErrors, 1);
+  assert.equal(
+    events.filter((event) => event === 'spool_cleanup_error').length,
+    1
+  );
 });
 
 test('close waits for global initialization before cleaning its namespace', async (context) => {

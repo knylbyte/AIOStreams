@@ -76,6 +76,7 @@ import {
   resolveEngineResourcePlan,
   type EngineResourcePlan,
 } from './resource-plan.js';
+import { EngineRetirementBarrier } from './engine-retirement.js';
 
 const logger = createLogger('usenet/engine');
 
@@ -1194,6 +1195,9 @@ export class UsenetEngine {
         files: spool?.artifacts ?? 0,
         openFiles: spool?.files.openFiles ?? 0,
         waiting: (spool?.budget.waiting ?? 0) + (spool?.files.waiting ?? 0),
+        writeBytesPerSec: spool?.writeBytesPerSec ?? 0,
+        readBytesPerSec: spool?.readBytesPerSec ?? 0,
+        cleanupErrors: spool?.cleanupErrors ?? 0,
       },
       arena: {
         usedBytes: cache.arenaBytes ?? 0,
@@ -1314,8 +1318,9 @@ export class UsenetEngineRegistry {
   private engines = new Map<string, UsenetEngine>();
   private evictionTimer?: NodeJS.Timeout;
   /** Fail-closed writer handoff for the stable segment-cache namespace. */
-  private retirement: Promise<void> = Promise.resolve();
+  private readonly retirement = new EngineRetirementBarrier();
   private closed = false;
+  private closePromise: Promise<void> | undefined;
 
   constructor(private idleEvictMs = 5 * 60_000) {
     this.evictionTimer = setInterval(() => this.evictIdle(), 60_000);
@@ -1334,13 +1339,17 @@ export class UsenetEngineRegistry {
     );
     for (;;) {
       if (this.closed) throw new Error('Usenet engine registry is closed');
-      const barrier = this.retirement;
+      const barrier = this.retirement.snapshot();
       await barrier;
       // A concurrent invalidation may have published a new barrier while this
       // caller awaited the previous one. Observe the newest handoff first.
-      if (barrier !== this.retirement) continue;
+      if (barrier !== this.retirement.snapshot()) continue;
+      if (this.closed) throw new Error('Usenet engine registry is closed');
+      const retirementError = this.retirement.error();
+      if (retirementError) throw retirementError;
       let engine = this.engines.get(key);
       if (engine) {
+        if (this.closed) throw new Error('Usenet engine registry is closed');
         engine.lastUsedAt = Date.now();
         return engine;
       }
@@ -1356,9 +1365,16 @@ export class UsenetEngineRegistry {
         }
       }
       if (stale.length > 0) {
-        this.beginRetirement(stale, 'provider-change');
+        // The next loop iteration observes the latched failure after awaiting
+        // the always-settled tail. Consume this operation's rejection here so
+        // the intentionally fire-and-observe-later handoff cannot surface as
+        // an unhandled rejection.
+        void this.beginRetirement(stale, 'provider-change').catch(
+          () => undefined
+        );
         continue;
       }
+      if (this.closed) throw new Error('Usenet engine registry is closed');
       engine = new UsenetEngine(providers, options);
       this.engines.set(key, engine);
       engine.lastUsedAt = Date.now();
@@ -1415,23 +1431,29 @@ export class UsenetEngineRegistry {
     return this.beginRetirement(engines, 'invalidation');
   }
 
-  async closeAll(): Promise<void> {
-    if (this.closed) return this.retirement;
+  closeAll(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
     if (this.evictionTimer) clearInterval(this.evictionTimer);
     this.evictionTimer = undefined;
     const engines = [...this.engines.values()];
     this.engines.clear();
-    await this.beginRetirement(engines, 'process-shutdown');
+    const current = this.beginRetirement(engines, 'process-shutdown');
+    this.closePromise = (async () => {
+      await current.catch(() => undefined);
+      await this.retirement.snapshot();
+      const error = this.retirement.error();
+      if (error) throw error;
+    })();
+    return this.closePromise;
   }
 
   private beginRetirement(
     engines: readonly UsenetEngine[],
     reason: string
   ): Promise<void> {
-    if (engines.length === 0) return this.retirement;
-    const previous = this.retirement;
-    const next = previous.then(async () => {
+    if (engines.length === 0) return this.retirement.snapshot();
+    return this.retirement.enqueue(async () => {
       logger.info(
         { reason, engines: engines.length },
         'waiting for exclusive usenet engine cleanup'
@@ -1450,7 +1472,5 @@ export class UsenetEngineRegistry {
         'exclusive usenet engine cleanup completed'
       );
     });
-    this.retirement = next;
-    return next;
   }
 }

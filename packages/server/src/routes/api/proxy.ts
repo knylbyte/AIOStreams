@@ -424,9 +424,16 @@ router.all(
             clientIp,
             reason: session.verdict.reason,
           });
-          res
-            .status(302)
-            .redirect(`/static/${StaticFiles.CONTENT_PROXY_LIMIT_REACHED}`);
+          if (session.verdict.reason === 'shutdown') {
+            res
+              .status(503)
+              .setHeader('Connection', 'close')
+              .json({ error: 'Server is shutting down', success: false });
+          } else {
+            res
+              .status(302)
+              .redirect(`/static/${StaticFiles.CONTENT_PROXY_LIMIT_REACHED}`);
+          }
           return;
         }
         // A full-buffered player never notices a clean FIN.

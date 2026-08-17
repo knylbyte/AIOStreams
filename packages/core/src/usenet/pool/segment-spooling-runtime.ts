@@ -8,6 +8,14 @@ import type { ByteBudgetStats, ByteLease } from './byte-budget.js';
 import type { SpoolManagerStats } from '../spool/types.js';
 import type { SegmentArtifactCacheLookup } from './segment-artifact.js';
 import { resolveSegmentStreamMemoryBytes } from '../stream-queue-budget.js';
+import type {
+  SegmentStreamCleanupCause,
+  UsenetResourceEventObserver,
+  UsenetResourceLifecycleEvent,
+} from './resource-events.js';
+import { createLogger } from '../../logging/logger.js';
+
+const logger = createLogger('usenet/resources');
 
 export interface SegmentSpoolingRuntimeOptions {
   readonly plan: SegmentSpoolingPlan;
@@ -16,6 +24,8 @@ export interface SegmentSpoolingRuntimeOptions {
   readonly artifactCache?: SegmentArtifactCacheLookup;
   readonly memoryBudget?: ByteBudget;
   readonly spoolManager?: SpoolManager;
+  readonly clock?: () => number;
+  readonly onEvent?: UsenetResourceEventObserver;
 }
 
 /** Resource-owner snapshot used by the engine dashboard contract. */
@@ -34,6 +44,7 @@ interface MemoryWaiter {
   readonly resolve: (lease: ByteLease) => void;
   readonly reject: (error: unknown) => void;
   onAbort?: () => void;
+  readonly enqueuedAt: number;
 }
 
 const MAX_MEMORY_WAITERS = 1024;
@@ -70,9 +81,13 @@ export class SegmentSpoolingRuntime {
   private nextKind: MemoryRequestKind = 'download';
   private closedError: Error | undefined;
   private closePromise: Promise<void> | undefined;
+  private readonly clock: () => number;
+  private readonly onEvent: UsenetResourceEventObserver | undefined;
 
   constructor(options: SegmentSpoolingRuntimeOptions) {
     this.plan = options.plan;
+    this.clock = options.clock ?? Date.now;
+    this.onEvent = options.onEvent;
     this.memoryBudget =
       options.memoryBudget ?? new ByteBudget(options.plan.memoryBudgetBytes);
     this.streamAdmissionMaxBytes = Math.floor(
@@ -97,6 +112,8 @@ export class SegmentSpoolingRuntime {
         plan: options.plan,
         engineId: options.engineId,
         cacheRoot: options.cacheRoot,
+        clock: this.clock,
+        onEvent: (event) => this.observeEvent(event),
       });
     this.artifactCache = options.artifactCache;
   }
@@ -211,6 +228,14 @@ export class SegmentSpoolingRuntime {
     };
   }
 
+  recordPromotion(outcome: 'success' | 'skipped' | 'failed'): void {
+    this.observeEvent({ type: 'promotion_result', outcome });
+  }
+
+  recordStreamCleanup(cause: SegmentStreamCleanupCause): void {
+    this.observeEvent({ type: 'stream_cleanup', cause });
+  }
+
   /** Point-in-time accounting from the actual global resource owners. */
   stats(): SegmentSpoolingRuntimeStats {
     const memory = this.memoryBudget.stats();
@@ -293,17 +318,26 @@ export class SegmentSpoolingRuntime {
         signal,
         resolve,
         reject,
+        enqueuedAt: this.clock(),
       };
       if (signal) {
         waiter.onAbort = () => {
           if (!this.removeMemoryWaiter(waiter)) return;
           this.removeMemoryAbortListener(waiter);
+          this.emitMemoryWaitEnd(waiter, 'aborted');
           reject(abortError(signal));
           this.drainMemoryWaiters();
         };
         signal.addEventListener('abort', waiter.onAbort, { once: true });
       }
       this.memoryQueue(waiter.kind, waiter.priority).push(waiter);
+      this.observeEvent({
+        type: 'memory_wait_start',
+        kind: waiter.kind,
+        bytes: waiter.bytes,
+        priority: waiter.priority,
+        queueDepth: this.memoryWaitingCount,
+      });
       this.drainMemoryWaiters();
     });
   }
@@ -354,6 +388,7 @@ export class SegmentSpoolingRuntime {
         this.contendedHighGrants = 0;
       }
       this.nextKind = waiter.kind === 'download' ? 'stream' : 'download';
+      this.emitMemoryWaitEnd(waiter, 'granted');
       waiter.resolve(lease);
     }
   }
@@ -445,6 +480,7 @@ export class SegmentSpoolingRuntime {
         const waiter = queue.shift();
         assert(waiter);
         this.removeMemoryAbortListener(waiter);
+        this.emitMemoryWaitEnd(waiter, 'closed');
         waiter.reject(error);
       }
     }
@@ -458,5 +494,29 @@ export class SegmentSpoolingRuntime {
       this.memoryBudget.stats().usedBytes <= this.memoryBudget.stats().maxBytes
     );
     assert(this.memoryWaitingCount <= MAX_MEMORY_WAITERS);
+  }
+
+  private emitMemoryWaitEnd(
+    waiter: MemoryWaiter,
+    outcome: 'granted' | 'aborted' | 'closed'
+  ): void {
+    this.observeEvent({
+      type: 'memory_wait_end',
+      kind: waiter.kind,
+      bytes: waiter.bytes,
+      priority: waiter.priority,
+      queueDepth: this.memoryWaitingCount,
+      waitMs: Math.max(0, this.clock() - waiter.enqueuedAt),
+      outcome,
+    });
+  }
+
+  private observeEvent(event: UsenetResourceLifecycleEvent): void {
+    try {
+      this.onEvent?.(event);
+    } catch {
+      // Observability is not part of the ownership path.
+    }
+    logger.debug(event, `usenet resource event: ${event.type}`);
   }
 }

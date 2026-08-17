@@ -50,6 +50,7 @@ import type { GrowingSpoolArtifact } from '../spool/growing-artifact.js';
 import { UsenetSpoolError } from '../spool/errors.js';
 import { resolveEstimatedDecodedSegmentBytes } from '../resource-plan.js';
 import type { ByteLease } from './byte-budget.js';
+import type { SegmentStreamCleanupCause } from './resource-events.js';
 
 const logger = createLogger('usenet/multi-provider-pool');
 
@@ -160,6 +161,7 @@ interface SharedFlight {
    * warms the cache.
    */
   ctl: AbortController;
+  task?: Promise<void>;
 }
 
 /** One caller waiting for an independently releasable file-backed handle. */
@@ -178,12 +180,15 @@ interface ArtifactFlight {
   onWire: boolean;
   growingOwner?: SharedSpoolArtifactOwner;
   growingOwnerPublished: boolean;
+  task?: Promise<void>;
 }
 
 /** Optional construction seams used by the engine and deterministic tests. */
 export interface MultiProviderPoolDependencies {
   readonly fetcher?: SegmentFetcher;
   readonly spooling?: SegmentSpoolingRuntime;
+  /** Deterministic lifecycle seam; receives only the bounded owner count. */
+  readonly onActiveOperationCountChanged?: (active: number) => void;
 }
 
 class SharedSpoolArtifactOwner {
@@ -308,6 +313,10 @@ const MISS_CACHE_MAX = 16_384;
 /** Hard bounds for callbacks retained by the Block-6 single-flight layer. */
 const ARTIFACT_FLIGHT_MAX = 16_384;
 const ARTIFACT_WAITERS_PER_FLIGHT_MAX = 1024;
+const SHARED_FLIGHT_MAX = 16_384;
+const SHARED_WAITERS_PER_FLIGHT_MAX = 1024;
+const HEAD_FLIGHT_MAX = 16_384;
+const ACTIVE_OPERATION_MAX = 65_536;
 
 /**
  * Coordinates segment fetches: owns the segment cache, single-flight de-dupe and
@@ -320,6 +329,13 @@ export class MultiProviderPool {
   private globalDownloads: PrioritySemaphore;
   private readonly spooling: SegmentSpoolingRuntime | undefined;
   private closePromise: Promise<void> | undefined;
+  private closedError: UsenetSpoolError | undefined;
+  private readonly closeController = new AbortController();
+  /** Bounded by the sum of the finite flight/admission limits above. */
+  private readonly activeOperations = new Set<Promise<void>>();
+  private readonly onActiveOperationCountChanged:
+    | ((active: number) => void)
+    | undefined;
   /** Single-flight coordinator for shared (arena-backed) segment fetches. */
   private sharedInflight = new Map<string, SharedFlight>();
   /** Single-flight coordinator for file-backed segment artifacts. */
@@ -335,6 +351,48 @@ export class MultiProviderPool {
    * Budget permits whose transfer has actually started on a connection.
    */
   private onWireCount = 0;
+
+  private assertOpen(): void {
+    if (this.closedError) throw this.closedError;
+  }
+
+  private operationSignal(signal?: AbortSignal): AbortSignal {
+    return signal
+      ? AbortSignal.any([signal, this.closeController.signal])
+      : this.closeController.signal;
+  }
+
+  private trackOperation<T>(operation: () => Promise<T>): Promise<T> {
+    this.assertOpen();
+    if (this.activeOperations.size >= ACTIVE_OPERATION_MAX) {
+      return Promise.reject(
+        new UsenetSpoolError(
+          'USENET_SPOOL_CAPACITY',
+          'Usenet fetch operation capacity reached'
+        )
+      );
+    }
+    const task = operation();
+    const settled = task.then(
+      () => undefined,
+      () => undefined
+    );
+    this.activeOperations.add(settled);
+    this.notifyActiveOperationCount();
+    void settled.finally(() => {
+      this.activeOperations.delete(settled);
+      this.notifyActiveOperationCount();
+    });
+    return task;
+  }
+
+  private notifyActiveOperationCount(): void {
+    try {
+      this.onActiveOperationCountChanged?.(this.activeOperations.size);
+    } catch {
+      // Test/diagnostic observers never participate in resource ownership.
+    }
+  }
 
   /**
    * Negative cache of definitive all-providers verdicts
@@ -413,6 +471,8 @@ export class MultiProviderPool {
     this.fetcher =
       dependencies.fetcher ?? new LocalSegmentFetcher(providers, opts, stats);
     this.spooling = dependencies.spooling;
+    this.onActiveOperationCountChanged =
+      dependencies.onActiveOperationCountChanged;
 
     // The global download budget is a HARD ceiling on concurrent in-flight
     // BODY/ARTICLE downloads. It is auto-sized (in buildUsenetEngineOptions) to
@@ -441,6 +501,7 @@ export class MultiProviderPool {
     signal: AbortSignal | undefined,
     priority: CommandPriority = CommandPriority.High
   ): Promise<SegmentData> {
+    this.assertOpen();
     const h = await this.fetchSegmentShared(segment, nzbHash, signal, priority);
     try {
       return h.owned ? h.data : { ...h.data, body: Buffer.from(h.data.body) };
@@ -461,6 +522,11 @@ export class MultiProviderPool {
     signal: AbortSignal | undefined,
     priority: CommandPriority = CommandPriority.High
   ): Promise<SharedSegment> {
+    try {
+      this.assertOpen();
+    } catch (error) {
+      return Promise.reject(error);
+    }
     const id = segment.messageId;
     const hit = this.arena.acquire(id);
     if (hit) return Promise.resolve(hit);
@@ -475,10 +541,26 @@ export class MultiProviderPool {
     let flight = this.sharedInflight.get(id);
     const isNew = !flight;
     if (!flight) {
+      if (this.sharedInflight.size >= SHARED_FLIGHT_MAX) {
+        return Promise.reject(
+          new UsenetSpoolError(
+            'USENET_SPOOL_CAPACITY',
+            'Shared segment flight capacity reached'
+          )
+        );
+      }
       flight = { waiters: new Set(), ctl: new AbortController() };
       this.sharedInflight.set(id, flight);
     }
     const joined = flight;
+    if (joined.waiters.size >= SHARED_WAITERS_PER_FLIGHT_MAX) {
+      return Promise.reject(
+        new UsenetSpoolError(
+          'USENET_SPOOL_CAPACITY',
+          'Shared segment waiter capacity reached'
+        )
+      );
+    }
     const p = new Promise<SharedSegment>((resolve, reject) => {
       // An aborting waiter deregisters itself before delivery, so pins are
       // granted only to waiters that will consume them. While any waiter
@@ -487,15 +569,23 @@ export class MultiProviderPool {
       // cancels a still-queued acquire via the flight controller. Waiters
       // without a signal never deregister.
       let onAbort: (() => void) | undefined;
+      let settled = false;
       const done = (): void => {
         if (onAbort) signal!.removeEventListener('abort', onAbort);
       };
       const waiter: SharedWaiter = {
         deliver: (h) => {
+          if (settled) {
+            h.release();
+            return;
+          }
+          settled = true;
           done();
           resolve(h);
         },
         fail: (e) => {
+          if (settled) return;
+          settled = true;
           done();
           reject(e);
         },
@@ -503,6 +593,8 @@ export class MultiProviderPool {
       joined.waiters.add(waiter);
       if (signal) {
         onAbort = () => {
+          if (settled) return;
+          settled = true;
           joined.waiters.delete(waiter);
           if (joined.waiters.size === 0) {
             // Deregister BEFORE aborting so a new caller starts a fresh
@@ -517,7 +609,19 @@ export class MultiProviderPool {
         signal.addEventListener('abort', onAbort, { once: true });
       }
     });
-    if (isNew) void this.runShared(segment, nzbHash, priority, joined);
+    if (isNew) {
+      joined.task = this.trackOperation(() =>
+        this.runShared(segment, nzbHash, priority, joined)
+      );
+      void joined.task.catch((error: unknown) => {
+        if (this.sharedInflight.get(id) === joined) {
+          this.sharedInflight.delete(id);
+        }
+        const waiters = [...joined.waiters];
+        joined.waiters.clear();
+        for (const waiter of waiters) waiter.fail(error);
+      });
+    }
     return p;
   }
 
@@ -536,6 +640,7 @@ export class MultiProviderPool {
     priority: CommandPriority = CommandPriority.High,
     options: SegmentArtifactFetchOptions = {}
   ): Promise<SegmentArtifact> {
+    this.assertOpen();
     const expectations = validateArtifactExpectations(options);
     const allowGrowing = options.allowGrowing ?? false;
     if (typeof allowGrowing !== 'boolean') {
@@ -549,6 +654,10 @@ export class MultiProviderPool {
     if (pinned) {
       const artifact = new ArenaSegmentArtifact(pinned);
       await this.assertArtifactMetadata(artifact, expectations);
+      if (this.closedError) {
+        await artifact.release();
+        throw this.closedError;
+      }
       return artifact;
     }
     if (signal?.aborted) throw new NntpError('connection', 'aborted');
@@ -564,11 +673,16 @@ export class MultiProviderPool {
     if (runtime.artifactCache) {
       const persistent = await runtime.artifactCache.acquire(id, signal);
       if (persistent) {
-        if (signal?.aborted) {
+        if (signal?.aborted || this.closedError) {
           await persistent.release();
+          if (this.closedError) throw this.closedError;
           throw new NntpError('connection', 'aborted');
         }
         await this.assertArtifactMetadata(persistent, expectations);
+        if (this.closedError) {
+          await persistent.release();
+          throw this.closedError;
+        }
         return persistent;
       }
     }
@@ -598,6 +712,7 @@ export class MultiProviderPool {
     priority: CommandPriority = CommandPriority.High,
     options: SegmentRangeMetadataFetchOptions = {}
   ): Promise<SegmentRangeMetadata> {
+    this.assertOpen();
     const id = segment.messageId;
     const pinned = this.arena.acquire(id);
     if (pinned) {
@@ -624,6 +739,7 @@ export class MultiProviderPool {
     const persistent = await this.spooling?.artifactCache?.acquire(id, signal);
     if (persistent) {
       try {
+        this.assertOpen();
         const metadata: SegmentRangeMetadata = {
           byteRange: persistent.metadata.byteRange,
           fileSize: persistent.metadata.fileSize,
@@ -645,45 +761,51 @@ export class MultiProviderPool {
 
     const cached = this.cachedMiss(id);
     if (cached !== undefined) throw this.cachedMissError(id, cached);
-    const releaseGlobal = await this.globalDownloads.acquire(priority, signal);
-    const wire = this.wireTracker();
-    try {
-      const head = await this.fetcher.fetchHead(
-        segment,
-        nzbHash,
+    return this.trackOperation(async () => {
+      const operationSignal = this.operationSignal(signal);
+      const releaseGlobal = await this.globalDownloads.acquire(
         priority,
-        0,
-        wire.start,
-        signal,
-        {
-          strictYencMetadata: true,
-          requireByteRange: options.requireByteRange,
-          allowStandalonePart: options.allowStandalonePart,
-        }
+        operationSignal
       );
-      const metadata = {
-        byteRange: head.byteRange,
-        fileSize: head.fileSize,
-        totalParts: head.totalParts,
-        name: head.name,
-        decodedSize: head.size,
-        layout: head.layout,
-      };
-      if (!this.isUsableRangeMetadata(metadata, options)) {
-        throw new YencMetadataError(
-          'invalid_header',
-          'yEnc metadata probe returned unusable range metadata'
+      const wire = this.wireTracker();
+      try {
+        const head = await this.fetcher.fetchHead(
+          segment,
+          nzbHash,
+          priority,
+          0,
+          wire.start,
+          operationSignal,
+          {
+            strictYencMetadata: true,
+            requireByteRange: options.requireByteRange,
+            allowStandalonePart: options.allowStandalonePart,
+          }
         );
+        const metadata = {
+          byteRange: head.byteRange,
+          fileSize: head.fileSize,
+          totalParts: head.totalParts,
+          name: head.name,
+          decodedSize: head.size,
+          layout: head.layout,
+        };
+        if (!this.isUsableRangeMetadata(metadata, options)) {
+          throw new YencMetadataError(
+            'invalid_header',
+            'yEnc metadata probe returned unusable range metadata'
+          );
+        }
+        return metadata;
+      } catch (error) {
+        const kind = definitiveLossKind(error);
+        if (kind) this.recordMiss(id, kind);
+        throw error;
+      } finally {
+        wire.end();
+        releaseGlobal();
       }
-      return metadata;
-    } catch (error) {
-      const kind = definitiveLossKind(error);
-      if (kind) this.recordMiss(id, kind);
-      throw error;
-    } finally {
-      wire.end();
-      releaseGlobal();
-    }
+    });
   }
 
   private isUsableRangeMetadata(
@@ -732,6 +854,11 @@ export class MultiProviderPool {
     expectations: ArtifactExpectations,
     allowGrowing: boolean
   ): Promise<SegmentArtifact> {
+    try {
+      this.assertOpen();
+    } catch (error) {
+      return Promise.reject(error);
+    }
     const id = segment.messageId;
     let flight = this.artifactInflight.get(id);
     const isNew = flight === undefined;
@@ -821,7 +948,17 @@ export class MultiProviderPool {
       }
     });
     if (isNew) {
-      void this.runArtifactFlight(segment, nzbHash, priority, joined);
+      joined.task = this.trackOperation(() =>
+        this.runArtifactFlight(segment, nzbHash, priority, joined)
+      );
+      void joined.task.catch((error: unknown) => {
+        if (this.artifactInflight.get(id) === joined) {
+          this.artifactInflight.delete(id);
+        }
+        const waiters = [...joined.waiters];
+        joined.waiters.clear();
+        for (const waiter of waiters) waiter.fail(error);
+      });
     }
     return promise;
   }
@@ -873,6 +1010,7 @@ export class MultiProviderPool {
               segmentBytes: segment.bytes,
             }),
             signal: flight.ctl.signal,
+            priority,
           });
           const sink = new SpoolingSegmentSink(
             artifact,
@@ -921,6 +1059,7 @@ export class MultiProviderPool {
           wire.start();
         }
       );
+      this.assertOpen();
       unownedArtifact = result.value;
       let owner = flight.growingOwner;
       if (owner?.owns(result.value)) {
@@ -1013,13 +1152,20 @@ export class MultiProviderPool {
     metadata: DecodedSegmentMetadata,
     owner: SharedSpoolArtifactOwner
   ): void {
-    if (runtime.artifactCache?.promotionEnabled === false) return;
+    if (runtime.artifactCache?.promotionEnabled === false) {
+      runtime.recordPromotion('skipped');
+      return;
+    }
     const promote = runtime.artifactCache?.promote;
-    if (!promote) return;
+    if (!promote) {
+      runtime.recordPromotion('skipped');
+      return;
+    }
     let source: ReturnType<GrowingSpoolArtifact['acquirePromotion']>;
     try {
       source = artifact.acquirePromotion();
     } catch (error) {
+      runtime.recordPromotion('skipped');
       logger.debug({ err: error }, 'segment cache promotion was skipped');
       return;
     }
@@ -1034,11 +1180,25 @@ export class MultiProviderPool {
       );
     } catch (error) {
       source.release();
+      runtime.recordPromotion('failed');
       logger.debug({ err: error }, 'segment cache promotion failed to start');
       return;
     }
     const protectedPromotion = promotion
+      .then(
+        (installed) => {
+          runtime.recordPromotion(installed ? 'success' : 'skipped');
+          return installed;
+        },
+        (error: unknown) => {
+          runtime.recordPromotion('failed');
+          logger.debug({ err: error }, 'segment cache promotion failed');
+          return false;
+        }
+      )
       .catch((error: unknown) => {
+        // The event observer is user-provided and isolated by the runtime, but
+        // preserve best-effort playback even if a future hook changes shape.
         logger.debug({ err: error }, 'segment cache promotion failed');
         return false;
       })
@@ -1052,6 +1212,11 @@ export class MultiProviderPool {
     priority: CommandPriority,
     signal?: AbortSignal
   ): Promise<ByteLease> {
+    try {
+      this.assertOpen();
+    } catch (error) {
+      return Promise.reject(error);
+    }
     const runtime = this.spooling;
     if (!runtime) {
       return Promise.reject(
@@ -1062,6 +1227,10 @@ export class MultiProviderPool {
       );
     }
     return runtime.acquireStreamMemory(bytes, priority, signal);
+  }
+
+  recordSegmentStreamCleanup(cause: SegmentStreamCleanupCause): void {
+    this.spooling?.recordStreamCleanup(cause);
   }
 
   private resolveEarlyArtifactMetadata(
@@ -1145,6 +1314,7 @@ export class MultiProviderPool {
     let lease: ArenaLease | null | undefined;
     try {
       let data = await this.cache.getAsync(id);
+      this.assertOpen();
       if (data) {
         // Disk hit: promote into the arena (one memcpy) when a slot is free,
         // so serve-path re-touches stop paying the disk round-trip.
@@ -1191,6 +1361,11 @@ export class MultiProviderPool {
         this.sharedInflight.delete(id);
       }
       for (const w of flight.waiters) w.fail(err);
+    } finally {
+      if (this.sharedInflight.get(id) === flight) {
+        this.sharedInflight.delete(id);
+      }
+      flight.waiters.clear();
     }
   }
 
@@ -1209,6 +1384,7 @@ export class MultiProviderPool {
     priority: CommandPriority,
     out: () => Buffer
   ): Promise<SegmentData> {
+    this.assertOpen();
     // Arena hit: copy into the caller's slot to keep the stream's
     // `body.buffer === slot.buffer` bookkeeping intact; oversized bodies fall
     // back to an owned copy.
@@ -1232,6 +1408,7 @@ export class MultiProviderPool {
     }
     // Disk hits return owned bodies (fresh deserialize) and ignore `out`.
     const fromDisk = await this.cache.getAsync(segment.messageId);
+    this.assertOpen();
     if (fromDisk) return fromDisk;
     return awaitAbortable(
       this.runFetch(segment, nzbHash, priority, out, signal),
@@ -1239,7 +1416,7 @@ export class MultiProviderPool {
     );
   }
 
-  private async runFetch(
+  private runFetch(
     segment: NzbSegmentRef,
     nzbHash: string,
     priority: CommandPriority,
@@ -1251,10 +1428,27 @@ export class MultiProviderPool {
      */
     signal?: AbortSignal
   ): Promise<SegmentData> {
+    return this.trackOperation(() =>
+      this.runFetchOnce(segment, nzbHash, priority, out, signal)
+    );
+  }
+
+  private async runFetchOnce(
+    segment: NzbSegmentRef,
+    nzbHash: string,
+    priority: CommandPriority,
+    out?: () => Buffer,
+    signal?: AbortSignal
+  ): Promise<SegmentData> {
+    const operationSignal = this.operationSignal(signal);
     let releaseGlobal: () => void;
     try {
-      releaseGlobal = await this.globalDownloads.acquire(priority, signal);
-    } catch {
+      releaseGlobal = await this.globalDownloads.acquire(
+        priority,
+        operationSignal
+      );
+    } catch (error) {
+      if (this.closedError) throw this.closedError;
       throw new NntpError('connection', 'aborted');
     }
     const wire = this.wireTracker();
@@ -1264,9 +1458,10 @@ export class MultiProviderPool {
         nzbHash,
         priority,
         out,
-        signal,
+        operationSignal,
         wire.start
       );
+      this.assertOpen();
       // Write-through for ALL priorities, including import probes that still take
       // the full path (par2, mid-volume header reads). RAM is protected by the
       // bounded pending-write queue, not by skipping the writes. Slot-backed
@@ -1299,6 +1494,7 @@ export class MultiProviderPool {
     priority: CommandPriority,
     want: number
   ): Promise<SegmentHeadData> {
+    this.assertOpen();
     const fromHit = (d: SegmentData): SegmentHeadData => ({
       head: Buffer.from(d.body.subarray(0, want)),
       byteRange: d.byteRange,
@@ -1318,27 +1514,38 @@ export class MultiProviderPool {
 
     let shared = this.inflightHeads.get(segment.messageId);
     if (!shared) {
-      const promise = (async (): Promise<SegmentHeadData> => {
-        const fromDisk = await this.cache.getAsync(segment.messageId);
-        if (fromDisk) return fromHit(fromDisk);
-        const releaseGlobal = await this.globalDownloads.acquire(
-          priority,
-          undefined
+      if (this.inflightHeads.size >= HEAD_FLIGHT_MAX) {
+        throw new UsenetSpoolError(
+          'USENET_SPOOL_CAPACITY',
+          'Segment head flight capacity reached'
         );
-        const wire = this.wireTracker();
-        try {
-          return await this.fetcher.fetchHead(
-            segment,
-            nzbHash,
+      }
+      const promise = this.trackOperation(
+        async (): Promise<SegmentHeadData> => {
+          const fromDisk = await this.cache.getAsync(segment.messageId);
+          this.assertOpen();
+          if (fromDisk) return fromHit(fromDisk);
+          const operationSignal = this.operationSignal();
+          const releaseGlobal = await this.globalDownloads.acquire(
             priority,
-            want,
-            wire.start
+            operationSignal
           );
-        } finally {
-          wire.end();
-          releaseGlobal();
+          const wire = this.wireTracker();
+          try {
+            return await this.fetcher.fetchHead(
+              segment,
+              nzbHash,
+              priority,
+              want,
+              wire.start,
+              operationSignal
+            );
+          } finally {
+            wire.end();
+            releaseGlobal();
+          }
         }
-      })();
+      );
       shared = promise;
       this.inflightHeads.set(segment.messageId, promise);
       void promise
@@ -1349,7 +1556,7 @@ export class MultiProviderPool {
           }
         });
     }
-    return awaitAbortable(shared, signal);
+    return awaitAbortable(shared, this.operationSignal(signal));
   }
 
   /**
@@ -1362,12 +1569,15 @@ export class MultiProviderPool {
     signal: AbortSignal | undefined,
     nzbHash?: string
   ): Promise<boolean> {
+    this.assertOpen();
     if (this.arena.has(messageId)) return true;
-    return this.fetcher.statSegment(
-      messageId,
-      nzbHash,
-      CommandPriority.Low,
-      signal
+    return this.trackOperation(() =>
+      this.fetcher.statSegment(
+        messageId,
+        nzbHash,
+        CommandPriority.Low,
+        this.operationSignal(signal)
+      )
     );
   }
 
@@ -1383,13 +1593,16 @@ export class MultiProviderPool {
     nzbHash?: string,
     providerIds?: readonly string[]
   ): Promise<StatDetail> {
+    this.assertOpen();
     if (this.arena.has(messageId)) return { present: true, answered: true };
-    return this.fetcher.statSegmentDetailed(
-      messageId,
-      nzbHash,
-      CommandPriority.Low,
-      signal,
-      providerIds
+    return this.trackOperation(() =>
+      this.fetcher.statSegmentDetailed(
+        messageId,
+        nzbHash,
+        CommandPriority.Low,
+        this.operationSignal(signal),
+        providerIds
+      )
     );
   }
 
@@ -1403,22 +1616,26 @@ export class MultiProviderPool {
     providerId: string,
     signal?: AbortSignal
   ): Promise<'ok' | 'not_found' | 'unreachable'> {
-    const releaseGlobal = await this.globalDownloads.acquire(
-      CommandPriority.Low,
-      signal
-    );
-    const wire = this.wireTracker();
-    try {
-      return await this.fetcher.probeBodyOnProvider(
-        segment,
-        providerId,
-        signal,
-        wire.start
+    this.assertOpen();
+    return this.trackOperation(async () => {
+      const operationSignal = this.operationSignal(signal);
+      const releaseGlobal = await this.globalDownloads.acquire(
+        CommandPriority.Low,
+        operationSignal
       );
-    } finally {
-      wire.end();
-      releaseGlobal();
-    }
+      const wire = this.wireTracker();
+      try {
+        return await this.fetcher.probeBodyOnProvider(
+          segment,
+          providerId,
+          operationSignal,
+          wire.start
+        );
+      } finally {
+        wire.end();
+        releaseGlobal();
+      }
+    });
   }
 
   /** Configured provider ids, in priority order. */
@@ -1457,25 +1674,54 @@ export class MultiProviderPool {
 
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
-    this.closePromise = this.closeOnce();
-    return this.closePromise;
-  }
-
-  private async closeOnce(): Promise<void> {
     const error = new UsenetSpoolError(
       'USENET_SPOOL_CLOSED',
       'Segment artifact pool is closed'
     );
+    this.closedError = error;
+    this.closeController.abort(error);
+    this.globalDownloads.close(error);
+
+    for (const flight of this.sharedInflight.values()) {
+      flight.ctl.abort(error);
+      const waiters = [...flight.waiters];
+      flight.waiters.clear();
+      for (const waiter of waiters) waiter.fail(error);
+    }
     for (const flight of this.artifactInflight.values()) {
       flight.ctl.abort(error);
       const waiters = [...flight.waiters];
       flight.waiters.clear();
       for (const waiter of waiters) waiter.fail(error);
     }
+
+    const errors: unknown[] = [];
+    try {
+      this.fetcher.close();
+    } catch (fetcherError) {
+      errors.push(fetcherError);
+    }
+    this.closePromise = this.closeOnce(errors);
+    return this.closePromise;
+  }
+
+  private async closeOnce(errors: unknown[]): Promise<void> {
+    // No operation can enter after closedError is published, so this snapshot
+    // is the complete bounded flight set owned by this pool.
+    await Promise.allSettled([...this.activeOperations]);
+    this.sharedInflight.clear();
     this.artifactInflight.clear();
-    this.fetcher.close();
+    this.inflightHeads.clear();
+    this.missCache.clear();
     if (this.spooling) {
-      await this.spooling.close();
+      try {
+        await this.spooling.close();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, 'Usenet provider pool close failed');
     }
   }
 }

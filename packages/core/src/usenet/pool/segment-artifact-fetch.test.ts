@@ -39,7 +39,10 @@ import {
   type SegmentArtifactFetchOptions,
 } from './segment-artifact.js';
 import type { SegmentArtifactCacheLookup } from './segment-artifact.js';
-import { SegmentSpoolingRuntime } from './segment-spooling-runtime.js';
+import {
+  SegmentSpoolingRuntime,
+  type SegmentSpoolingRuntimeOptions,
+} from './segment-spooling-runtime.js';
 import { MultiProviderPool } from './multi-provider-pool.js';
 import { SpoolingSegmentsStream } from './spooling-segments-stream.js';
 import { YencDecodeError, YencMetadataError } from './yenc.js';
@@ -226,6 +229,35 @@ class FakeSegmentFetcher implements SegmentFetcher {
   }
 }
 
+class GatedBufferingFetcher extends FakeSegmentFetcher {
+  readonly started = Promise.withResolvers<void>();
+  readonly gate = Promise.withResolvers<void>();
+  readonly finished = Promise.withResolvers<void>();
+
+  override async fetchBody(
+    segment: NzbSegmentRef,
+    _nzbHash: string,
+    _priority: CommandPriority,
+    _out?: () => Buffer,
+    signal?: AbortSignal,
+    onWireStart?: () => void
+  ): Promise<SegmentData> {
+    this.bufferingCalls++;
+    onWireStart?.();
+    this.started.resolve();
+    try {
+      await this.gate.promise;
+      if (signal?.aborted) throw new NntpError('connection', 'aborted');
+      const body = Buffer.from(
+        this.behaviors.get(segment.messageId)?.body ?? 'buffering-body'
+      );
+      return { body, size: body.length, name: 'buffering.bin' };
+    } finally {
+      this.finished.resolve();
+    }
+  }
+}
+
 class LateFailoverSegmentFetcher extends FakeSegmentFetcher {
   readonly firstChunkWritten = Promise.withResolvers<void>();
   readonly failFirstAttempt = Promise.withResolvers<void>();
@@ -387,6 +419,7 @@ interface HarnessOptions {
   readonly memoryBudget?: ByteBudget;
   readonly spoolManager?: SpoolManager;
   readonly artifactCache?: SegmentArtifactCacheLookup;
+  readonly onEvent?: SegmentSpoolingRuntimeOptions['onEvent'];
 }
 
 async function createHarness(
@@ -408,6 +441,7 @@ async function createHarness(
     memoryBudget: options.memoryBudget,
     spoolManager: options.spoolManager,
     artifactCache: options.artifactCache,
+    onEvent: options.onEvent,
   });
   const cache = new SegmentCache({ arenaBytes: 2 * MEBIBYTE_BYTES });
   const engineOptions: EngineOptions = {
@@ -423,8 +457,7 @@ async function createHarness(
     { fetcher, spooling: runtime }
   );
   context.after(async () => {
-    pool.close();
-    await Promise.allSettled([runtime.close(), cache.close()]);
+    await Promise.allSettled([pool.close(), runtime.close(), cache.close()]);
     await rm(cacheRoot, { recursive: true, force: true });
   });
   return { pool, runtime, cache, cacheRoot };
@@ -1730,6 +1763,8 @@ test(
     const started = Promise.withResolvers<void>();
     const gate = Promise.withResolvers<void>();
     const copied = Promise.withResolvers<void>();
+    const promoted = Promise.withResolvers<void>();
+    const promotionOutcomes: string[] = [];
     const artifactCache: SegmentArtifactCacheLookup = {
       promotionEnabled: true,
       acquire: () => Promise.resolve(undefined),
@@ -1744,6 +1779,11 @@ test(
     };
     const { pool, runtime } = await createHarness(context, fetcher, {
       artifactCache,
+      onEvent: (event) => {
+        if (event.type !== 'promotion_result') return;
+        promotionOutcomes.push(event.outcome);
+        if (event.outcome === 'success') promoted.resolve();
+      },
     });
     const artifact = await pool.fetchSegmentArtifact(
       { messageId: 'promoted-artifact', bytes: body.length },
@@ -1756,6 +1796,8 @@ test(
 
     gate.resolve();
     await copied.promise;
+    await promoted.promise;
+    assert.deepEqual(promotionOutcomes, ['success']);
     await runtime.close();
     assert.equal(runtime.spoolManager.stats().artifacts, 0);
     assert.equal(runtime.spoolManager.stats().budget.reservedBytes, 0);
@@ -1982,4 +2024,176 @@ test('promotion release after runtime close is inert and frees its bytes', async
       return error.code === 'USENET_SPOOL_CLOSED';
     }
   );
+});
+
+test('pool close rejects and awaits an on-wire buffering shared flight', async (context) => {
+  const fetcher = new GatedBufferingFetcher();
+  fetcher.behaviors.set('buffering-close', { body: Buffer.from('complete') });
+  const { pool } = await createHarness(context, fetcher);
+  const pending = pool.fetchSegmentShared(
+    { messageId: 'buffering-close' },
+    'nzb',
+    undefined
+  );
+  await fetcher.started.promise;
+
+  let closeSettled = false;
+  const closing = pool.close().finally(() => {
+    closeSettled = true;
+  });
+  await assert.rejects(pending, { code: 'USENET_SPOOL_CLOSED' });
+  await Promise.resolve();
+  assert.equal(closeSettled, false);
+
+  fetcher.gate.resolve();
+  await closing;
+  await fetcher.finished.promise;
+  assert.equal(pool.poolInfo().globalDownloadsInUse, 0);
+  assert.equal(pool.poolInfo().globalDownloadsWaiting, 0);
+  assert.equal(pool.poolInfo().globalDownloadsOnWire, 0);
+});
+
+test('pool close owns an artifact flight paused before spool creation', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const creationStarted = Promise.withResolvers<void>();
+  const creationGate = Promise.withResolvers<void>();
+  fetcher.behaviors.set('close-before-create', {
+    body: Buffer.from('never retained'),
+  });
+  const cacheRoot = await mkdtemp(path.join(tmpdir(), 'close-before-create-'));
+  const manager = new GatedSpoolManager(
+    {
+      plan: spoolingPlan(),
+      engineId: 'close-before-create',
+      cacheRoot,
+    },
+    creationStarted,
+    creationGate.promise
+  );
+  context.after(async () => {
+    await Promise.allSettled([manager.close()]);
+    await rm(cacheRoot, { recursive: true, force: true });
+  });
+  const { pool, runtime } = await createHarness(context, fetcher, {
+    spoolManager: manager,
+  });
+  const pending = pool.fetchSegmentArtifact(
+    { messageId: 'close-before-create' },
+    'nzb',
+    undefined
+  );
+  await creationStarted.promise;
+  const closing = pool.close();
+  await assert.rejects(pending, { code: 'USENET_SPOOL_CLOSED' });
+  creationGate.resolve();
+  await closing;
+
+  assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+  assert.equal(manager.stats().artifacts, 0);
+  assert.equal(manager.stats().budget.reservedBytes, 0);
+  assert.equal(manager.stats().files.openFiles, 0);
+});
+
+test('pool close awaits an on-wire artifact flight and leaves every owner at zero', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const started = Promise.withResolvers<void>();
+  const gate = Promise.withResolvers<void>();
+  fetcher.behaviors.set('close-on-wire', {
+    body: Buffer.from('artifact data'),
+    started,
+    gate: gate.promise,
+  });
+  const { pool, runtime } = await createHarness(context, fetcher);
+  const pending = pool.fetchSegmentArtifact(
+    { messageId: 'close-on-wire' },
+    'nzb',
+    undefined
+  );
+  await started.promise;
+
+  let closeSettled = false;
+  const closing = pool.close().finally(() => {
+    closeSettled = true;
+  });
+  await assert.rejects(pending, { code: 'USENET_SPOOL_CLOSED' });
+  await Promise.resolve();
+  assert.equal(closeSettled, false);
+  gate.resolve();
+  await closing;
+
+  assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+  assert.equal(runtime.spoolManager.stats().artifacts, 0);
+  assert.equal(runtime.spoolManager.stats().budget.reservedBytes, 0);
+  assert.equal(runtime.spoolManager.stats().files.openFiles, 0);
+  assert.equal(pool.poolInfo().globalDownloadsInUse, 0);
+  assert.equal(pool.poolInfo().globalDownloadsWaiting, 0);
+  assert.equal(pool.poolInfo().globalDownloadsOnWire, 0);
+});
+
+test('every work-producing pool API fails closed after close', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const { pool } = await createHarness(context, fetcher);
+  await pool.close();
+  const segment = { messageId: 'after-close' };
+  const operations: Array<Promise<unknown>> = [
+    pool.fetchSegment(segment, 'nzb', undefined),
+    pool.fetchSegmentShared(segment, 'nzb', undefined),
+    pool.fetchSegmentArtifact(segment, 'nzb', undefined),
+    pool.fetchSegmentRangeMetadata(segment, 'nzb', undefined),
+    pool.fetchSegmentInto(segment, 'nzb', undefined, CommandPriority.High, () =>
+      Buffer.alloc(64)
+    ),
+    pool.fetchSegmentHead(segment, 'nzb', undefined, CommandPriority.High, 16),
+    pool.statSegment(segment.messageId, undefined),
+    pool.statSegmentDetailed(segment.messageId, undefined),
+    pool.probeBodyOnProvider(segment, 'provider'),
+    pool.acquireSegmentStreamMemory(64, CommandPriority.High),
+  ];
+
+  for (const operation of operations) {
+    await assert.rejects(operation, { code: 'USENET_SPOOL_CLOSED' });
+  }
+  assert.equal(fetcher.bufferingCalls, 0);
+  assert.equal(fetcher.streamingCalls, 0);
+  assert.equal(fetcher.headCalls, 0);
+});
+
+test('memory wait lifecycle emits one start/end pair with fake-clock latency', async (context) => {
+  let now = 1_000;
+  const events: Array<{ readonly type: string; readonly waitMs?: number }> = [];
+  const cacheRoot = await mkdtemp(path.join(tmpdir(), 'memory-wait-events-'));
+  const runtime = new SegmentSpoolingRuntime({
+    plan: spoolingPlan(),
+    engineId: 'memory-wait-events',
+    cacheRoot,
+    memoryBudget: new ByteBudget(spoolingPlan().perDownloadBaseLeaseBytes),
+    clock: () => now,
+    onEvent: (event) => events.push(event),
+  });
+  context.after(async () => {
+    await runtime.close();
+    await rm(cacheRoot, { recursive: true, force: true });
+  });
+  const first = await runtime.acquireDownloadMemory(CommandPriority.High);
+  const second = runtime.acquireDownloadMemory(CommandPriority.High);
+  assert.deepEqual(
+    events.filter((event) => event.type.startsWith('memory_wait')),
+    [
+      {
+        type: 'memory_wait_start',
+        kind: 'download',
+        bytes: spoolingPlan().perDownloadBaseLeaseBytes,
+        priority: CommandPriority.High,
+        queueDepth: 1,
+      },
+    ]
+  );
+  now += 275;
+  first.release();
+  const granted = await second;
+  granted.release();
+  const waits = events.filter((event) => event.type.startsWith('memory_wait'));
+  assert.equal(waits.length, 2);
+  assert.equal(waits[1].type, 'memory_wait_end');
+  assert.equal(waits[1].waitMs, 275);
 });

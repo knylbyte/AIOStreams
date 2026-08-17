@@ -91,6 +91,9 @@ export interface ResourceStats {
     files: number;
     openFiles: number;
     waiting: number;
+    writeBytesPerSec: number;
+    readBytesPerSec: number;
+    cleanupErrors: number;
   };
   /** Pinned in-memory arena used by the compatible buffering/readAt paths. */
   arena: {

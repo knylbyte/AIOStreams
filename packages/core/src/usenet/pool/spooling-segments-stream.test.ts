@@ -42,6 +42,7 @@ import {
   resolveSegmentStreamMemoryBytes,
   resolveSegmentStreamQueuePlan,
 } from '../stream-queue-budget.js';
+import type { SegmentStreamCleanupCause } from './resource-events.js';
 
 interface FetchCall {
   readonly segment: NzbSegmentRef;
@@ -74,6 +75,7 @@ class TestArtifactSource implements FileStreamPool {
   peakStreamLeases = 0;
   streamLeaseReleases = 0;
   readonly streamLeaseRequests: number[] = [];
+  readonly cleanupCauses: SegmentStreamCleanupCause[] = [];
 
   private readonly callWaiters = new Set<{
     readonly count: number;
@@ -129,6 +131,10 @@ class TestArtifactSource implements FileStreamPool {
         this.activeStreamLeases--;
       },
     });
+  }
+
+  recordSegmentStreamCleanup(cause: SegmentStreamCleanupCause): void {
+    this.cleanupCauses.push(cause);
   }
 
   fetchSegmentInto(
@@ -445,6 +451,7 @@ function streamOptions(
     readonly firstSegmentStartByte: number;
     readonly fileEndByte: number;
     readonly layoutHint: SegmentRangeLayout;
+    readonly signal: AbortSignal;
     readonly sizeForSegment: (idx: number) => number | undefined;
     readonly byteRangeForSegment: (
       idx: number
@@ -471,6 +478,7 @@ function streamOptions(
     firstSegmentStartByte: overrides.firstSegmentStartByte,
     fileEndByte: overrides.fileEndByte,
     layoutHint: overrides.layoutHint,
+    signal: overrides.signal,
     priority: CommandPriority.High,
     sizeForSegment: overrides.sizeForSegment,
     byteRangeForSegment: overrides.byteRangeForSegment,
@@ -2693,6 +2701,7 @@ test('client destruction aborts every planned fetch and leaves no lease', async 
     )
   );
   assert.equal(source.activeStreamLeases, 0);
+  assert.deepEqual(source.cleanupCauses, ['client_close']);
 });
 
 test('the idle reaper destroys a pending spooling stream and drains its resources', async () => {
@@ -2718,6 +2727,46 @@ test('the idle reaper destroys a pending spooling stream and drains its resource
   stats.streamClosed(id);
   assert.equal(source.calls[0].signal?.aborted, true);
   assert.equal(source.activeStreamLeases, 0);
+  assert.deepEqual(source.cleanupCauses, ['idle_reaper']);
+});
+
+test('stream cleanup events classify eof, abort and engine close exactly once', async () => {
+  const eofSource = new TestArtifactSource(() =>
+    Promise.resolve(new BufferArtifact(Buffer.from('done')))
+  );
+  const eofStream = new SpoolingSegmentsStream(streamOptions(eofSource, 1));
+  assert.equal((await collect(eofStream)).toString(), 'done');
+  await closeEvent(eofStream);
+  assert.deepEqual(eofSource.cleanupCauses, ['eof']);
+
+  const abortGate = Promise.withResolvers<SegmentArtifact>();
+  const controller = new AbortController();
+  const abortSource = new TestArtifactSource((call) =>
+    abortableArtifact(abortGate.promise, call.signal)
+  );
+  const abortStream = new SpoolingSegmentsStream(
+    streamOptions(abortSource, 1, { signal: controller.signal })
+  );
+  abortStream.on('error', () => undefined);
+  abortStream.resume();
+  await abortSource.waitForCalls(1);
+  controller.abort();
+  await closeEvent(abortStream);
+  assert.deepEqual(abortSource.cleanupCauses, ['abort']);
+
+  const engineGate = Promise.withResolvers<SegmentArtifact>();
+  const engineSource = new TestArtifactSource((call) =>
+    abortableArtifact(engineGate.promise, call.signal)
+  );
+  const engineStream = new SpoolingSegmentsStream(
+    streamOptions(engineSource, 1)
+  );
+  engineStream.on('error', () => undefined);
+  engineStream.resume();
+  await engineSource.waitForCalls(1);
+  engineStream.destroy(new Error('usenet engine closed'));
+  await closeEvent(engineStream);
+  assert.deepEqual(engineSource.cleanupCauses, ['engine_close']);
 });
 
 test('a future segment failure is observed only after earlier output', async () => {

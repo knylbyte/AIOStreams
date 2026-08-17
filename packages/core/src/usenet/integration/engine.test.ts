@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { Readable } from 'node:stream';
 import test from 'node:test';
 import {
   buildUsenetEngineOptions,
@@ -215,6 +216,9 @@ test('engine live stats are sourced from spooling memory, disk and file owners',
       sessions: resources.spool.sessions,
       files: resources.spool.files,
       openFiles: resources.spool.openFiles,
+      writeBytesPerSec: resources.spool.writeBytesPerSec,
+      readBytesPerSec: resources.spool.readBytesPerSec,
+      cleanupErrors: resources.spool.cleanupErrors,
     },
     {
       memoryUsed: 0,
@@ -223,6 +227,9 @@ test('engine live stats are sourced from spooling memory, disk and file owners',
       sessions: 0,
       files: 0,
       openFiles: 0,
+      writeBytesPerSec: 0,
+      readBytesPerSec: 0,
+      cleanupErrors: 0,
     }
   );
   await engine.close();
@@ -272,4 +279,97 @@ test('registry waits for the previous stable cache writer before replacement', a
   assert.notEqual(second, first);
   assert.equal(replacementResolved, true);
   await registry.closeAll();
+});
+
+test('registry close fences all getters waiting behind an active retirement', async () => {
+  const { UsenetEngineRegistry } = await import('../index.js');
+  const registry = new UsenetEngineRegistry(60_000);
+  const provider: ProviderConfig = {
+    id: 'shutdown-first',
+    host: '127.0.0.1',
+    port: 119,
+    tls: false,
+    maxConnections: 1,
+    priority: 0,
+  };
+  const first = await registry.get([provider], {
+    ...DEFAULT_ENGINE_OPTIONS,
+    segmentDiskCacheBytes: 0,
+  });
+  const closeStarted = Promise.withResolvers<void>();
+  const permitClose = Promise.withResolvers<void>();
+  const originalClose = first.close.bind(first);
+  first.close = async () => {
+    closeStarted.resolve();
+    await permitClose.promise;
+    await originalClose();
+  };
+
+  const replacementProviders = [
+    { ...provider, id: 'shutdown-next', port: 120 },
+  ];
+  const getters = Array.from({ length: 4 }, () =>
+    registry.get(replacementProviders, {
+      ...DEFAULT_ENGINE_OPTIONS,
+      segmentDiskCacheBytes: 0,
+    })
+  );
+  const getterOutcomes = Promise.allSettled(getters);
+  await closeStarted.promise;
+  const firstClose = registry.closeAll();
+  const secondClose = registry.closeAll();
+  assert.equal(secondClose, firstClose);
+  permitClose.resolve();
+
+  await firstClose;
+  for (const outcome of await getterOutcomes) {
+    assert.equal(outcome.status, 'rejected');
+    if (outcome.status === 'rejected') {
+      assert.match(String(outcome.reason), /registry is closed/);
+    }
+  }
+  assert.equal(registry.size, 0);
+  await assert.rejects(
+    registry.get(replacementProviders, {
+      ...DEFAULT_ENGINE_OPTIONS,
+      segmentDiskCacheBytes: 0,
+    }),
+    /registry is closed/
+  );
+});
+
+test('stream registry shutdown seal destroys active reads and refuses later admission', async () => {
+  const { StreamRegistry } = await import('../../stream-sessions/registry.js');
+  const registry = new StreamRegistry(() => ({ ok: true }));
+  const input = {
+    transport: 'usenet' as const,
+    username: '',
+    targetKey: 'shutdown-test',
+  };
+  const opened = registry.open(input);
+  assert.equal(opened.ok, true);
+  if (!opened.ok) return;
+  const stream = new Readable({ read() {} });
+  stream.on('error', () => undefined);
+  let killed = 0;
+  opened.handle.attach(stream);
+  opened.handle.onKill(() => {
+    killed++;
+  });
+
+  registry.sealAndCloseAll('stale');
+
+  assert.equal(killed, 1);
+  assert.equal(stream.destroyed, true);
+  assert.equal(registry.isSealed, true);
+  assert.deepEqual(registry.open(input), {
+    ok: false,
+    verdict: {
+      ok: false,
+      reason: 'shutdown',
+      message: 'Server is shutting down',
+    },
+  });
+  registry.sealAndCloseAll('stale');
+  assert.equal(killed, 1);
 });

@@ -9,6 +9,8 @@ import type {
   SpoolBudgetStats,
   SpoolStatFs,
 } from './types.js';
+import type { UsenetResourceEventObserver } from '../pool/resource-events.js';
+import { CommandPriority } from '../types.js';
 
 const DEFAULT_MAX_WAITERS = 1024;
 
@@ -16,9 +18,11 @@ interface BudgetWaiter {
   readonly bytes: number;
   readonly reservation?: SpoolReservation;
   readonly signal?: AbortSignal;
+  readonly priority: CommandPriority;
   readonly resolve: (lease: SpoolBudgetLease) => void;
   readonly reject: (error: Error) => void;
   onAbort?: () => void;
+  readonly enqueuedAt: number;
 }
 
 export interface SpoolBudgetOptions {
@@ -26,6 +30,8 @@ export interface SpoolBudgetOptions {
   readonly minFreeDiskBytes: number;
   readonly statfs: () => Promise<SpoolStatFs>;
   readonly maxWaiters?: number;
+  readonly clock?: () => number;
+  readonly onEvent?: UsenetResourceEventObserver;
 }
 
 function isPositiveSafeInteger(value: number): boolean {
@@ -76,6 +82,8 @@ export class SpoolBudget {
   private draining = false;
   private drainRequested = false;
   private closedError: Error | undefined;
+  private readonly clock: () => number;
+  private readonly onEvent: UsenetResourceEventObserver | undefined;
 
   constructor(options: SpoolBudgetOptions) {
     if (!isPositiveSafeInteger(options.maxBytes)) {
@@ -101,13 +109,18 @@ export class SpoolBudget {
     this.minFreeDiskBytes = options.minFreeDiskBytes;
     this.statfs = options.statfs;
     this.maxWaiters = maxWaiters;
+    this.clock = options.clock ?? Date.now;
+    this.onEvent = options.onEvent;
     this.assertInvariants();
   }
 
   /** Reserve initial capacity, waiting event-driven when the hard cap is busy. */
   reserve(
     bytes: number,
-    options: { readonly signal?: AbortSignal } = {}
+    options: {
+      readonly signal?: AbortSignal;
+      readonly priority?: CommandPriority;
+    } = {}
   ): Promise<SpoolBudgetLease> {
     try {
       this.validateBytes(bytes);
@@ -118,7 +131,12 @@ export class SpoolBudget {
     } catch (error) {
       return Promise.reject(error);
     }
-    return this.enqueue(bytes, undefined, options.signal);
+    return this.enqueue(
+      bytes,
+      undefined,
+      options.signal,
+      options.priority ?? CommandPriority.High
+    );
   }
 
   /** Immutable accounting snapshot for diagnostics and deterministic tests. */
@@ -146,6 +164,7 @@ export class SpoolBudget {
       const waiter = this.waiters.shift();
       assert(waiter, 'non-empty spool-budget queue must have a head');
       this.removeAbortListener(waiter);
+      this.emitWaitEnd(waiter, 'closed');
       waiter.reject(error);
     }
     this.assertInvariants();
@@ -154,7 +173,8 @@ export class SpoolBudget {
   private grow(
     reservation: SpoolReservation,
     bytes: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    priority = CommandPriority.High
   ): Promise<void> {
     try {
       this.validateBytes(bytes);
@@ -166,13 +186,16 @@ export class SpoolBudget {
     } catch (error) {
       return Promise.reject(error);
     }
-    return this.enqueue(bytes, reservation, signal).then(() => undefined);
+    return this.enqueue(bytes, reservation, signal, priority).then(
+      () => undefined
+    );
   }
 
   private enqueue(
     bytes: number,
     reservation: SpoolReservation | undefined,
-    signal: AbortSignal | undefined
+    signal: AbortSignal | undefined,
+    priority: CommandPriority
   ): Promise<SpoolBudgetLease> {
     if (signal?.aborted) return Promise.reject(spoolAbortError(signal.reason));
     if (this.waiters.length >= this.maxWaiters) {
@@ -189,8 +212,10 @@ export class SpoolBudget {
         bytes,
         reservation,
         signal,
+        priority,
         resolve,
         reject,
+        enqueuedAt: this.clock(),
       };
       if (signal) {
         waiter.onAbort = () => {
@@ -198,6 +223,7 @@ export class SpoolBudget {
           if (index < 0) return;
           this.waiters.splice(index, 1);
           this.removeAbortListener(waiter);
+          this.emitWaitEnd(waiter, 'aborted');
           reject(spoolAbortError(signal.reason));
           this.assertInvariants();
           this.drain();
@@ -205,6 +231,13 @@ export class SpoolBudget {
         signal.addEventListener('abort', waiter.onAbort, { once: true });
       }
       this.waiters.push(waiter);
+      this.emit({
+        type: 'spool_wait_start',
+        kind: 'spool',
+        bytes,
+        priority,
+        queueDepth: this.waiters.length,
+      });
       this.assertInvariants();
       this.drain();
     });
@@ -235,6 +268,7 @@ export class SpoolBudget {
       const reservation = waiter.reservation;
       if (reservation && !reservation.active) {
         this.shiftWaiter(waiter);
+        this.emitWaitEnd(waiter, 'closed');
         waiter.reject(
           new UsenetSpoolError(
             'USENET_SPOOL_CLOSED',
@@ -248,6 +282,7 @@ export class SpoolBudget {
         waiter.bytes > this.maxBytes - reservation.reservedBytes
       ) {
         this.shiftWaiter(waiter);
+        this.emitWaitEnd(waiter, 'capacity_rejected');
         waiter.reject(this.capacityError(waiter.bytes));
         continue;
       }
@@ -258,6 +293,7 @@ export class SpoolBudget {
       } catch (error) {
         if (this.waiters[0] !== waiter) continue;
         this.shiftWaiter(waiter);
+        this.emitWaitEnd(waiter, 'disk_rejected');
         waiter.reject(
           error instanceof UsenetSpoolError
             ? error
@@ -274,9 +310,11 @@ export class SpoolBudget {
         this.peakReservedBytes,
         this.reservedBytes
       );
-      const lease = reservation ?? this.createReservation(waiter.bytes);
+      const lease =
+        reservation ?? this.createReservation(waiter.bytes, waiter.priority);
       if (reservation) reservation.addReserved(waiter.bytes);
       this.assertInvariants();
+      this.emitWaitEnd(waiter, 'granted');
       waiter.resolve(lease);
     }
   }
@@ -295,6 +333,13 @@ export class SpoolBudget {
       requiredBeforeMargin > freeBytes ||
       this.minFreeDiskBytes > freeBytes - requiredBeforeMargin
     ) {
+      this.emit({
+        type: 'disk_safety_warning',
+        requestedBytes,
+        freeBytes,
+        requiredBytes: requiredBeforeMargin,
+        minFreeDiskBytes: this.minFreeDiskBytes,
+      });
       throw new UsenetSpoolError(
         'USENET_SPOOL_DISK_FULL',
         'Spool reservation would violate the configured free-disk margin'
@@ -316,6 +361,34 @@ export class SpoolBudget {
     }
   }
 
+  private emitWaitEnd(
+    waiter: BudgetWaiter,
+    outcome:
+      | 'granted'
+      | 'aborted'
+      | 'closed'
+      | 'capacity_rejected'
+      | 'disk_rejected'
+  ): void {
+    this.emit({
+      type: 'spool_wait_end',
+      kind: 'spool',
+      bytes: waiter.bytes,
+      priority: waiter.priority,
+      queueDepth: this.waiters.length,
+      waitMs: Math.max(0, this.clock() - waiter.enqueuedAt),
+      outcome,
+    });
+  }
+
+  private emit(event: Parameters<UsenetResourceEventObserver>[0]): void {
+    try {
+      this.onEvent?.(event);
+    } catch {
+      // Observability must never affect resource ownership.
+    }
+  }
+
   private recordWritten(reservation: SpoolReservation, bytes: number): void {
     reservation.assertActive();
     this.validateBytes(bytes);
@@ -331,11 +404,14 @@ export class SpoolBudget {
     this.assertInvariants();
   }
 
-  private createReservation(initialBytes: number): SpoolReservation {
+  private createReservation(
+    initialBytes: number,
+    priority: CommandPriority
+  ): SpoolReservation {
     let reservation: SpoolReservation;
     reservation = new SpoolReservation(
       initialBytes,
-      (bytes, signal) => this.grow(reservation, bytes, signal),
+      (bytes, signal) => this.grow(reservation, bytes, signal, priority),
       (bytes) => this.recordWritten(reservation, bytes),
       () => this.release(reservation)
     );
@@ -350,6 +426,7 @@ export class SpoolBudget {
       if (waiter.reservation !== reservation) continue;
       this.waiters.splice(index, 1);
       this.removeAbortListener(waiter);
+      this.emitWaitEnd(waiter, 'closed');
       waiter.reject(
         new UsenetSpoolError(
           'USENET_SPOOL_CLOSED',

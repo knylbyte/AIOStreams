@@ -470,6 +470,13 @@ function ResourcePanel({ resources }: { resources: ResourceStats }) {
                 <p className="text-xs text-[--muted]">
                   {item.openFiles} open · {item.waiting} waiting
                 </p>
+                <p className="text-xs text-[--muted]">
+                  {formatBytes(item.writeBytesPerSec)}/s write ·{' '}
+                  {formatBytes(item.readBytesPerSec)}/s read
+                  {item.cleanupErrors > 0
+                    ? ` · ${item.cleanupErrors} cleanup errors`
+                    : ''}
+                </p>
               </>
             )}
           </div>

@@ -38,6 +38,8 @@ export interface GrowingSpoolArtifactOptions {
   readonly openFile: OpenManagedSpoolFile;
   readonly signal?: AbortSignal;
   readonly onDisposed: () => void;
+  readonly onWriteBytes?: (bytes: number) => void;
+  readonly onReadBytes?: (bytes: number) => void;
 }
 
 function isPositiveSafeInteger(value: number): boolean {
@@ -68,6 +70,7 @@ export class GrowingSpoolArtifact implements GrowingReadableSource {
   private readonly fileSystem: SpoolFileSystem;
   private readonly openFile: OpenManagedSpoolFile;
   private readonly onDisposed: () => void;
+  private readonly onReadBytes: ((bytes: number) => void) | undefined;
   private readonly writer: SpoolWriter;
   private readonly readers = new Set<GrowingFileReader>();
   private readonly changeWaiters = new Set<ChangeWaiter>();
@@ -100,10 +103,14 @@ export class GrowingSpoolArtifact implements GrowingReadableSource {
     this.fileSystem = options.fileSystem;
     this.openFile = options.openFile;
     this.onDisposed = options.onDisposed;
+    this.onReadBytes = options.onReadBytes;
     this.writer = new SpoolWriter({
       file: writerFile,
       maxQueueBytes: options.writerQueueBytes,
-      onCommitted: (bytes) => this.commitWritten(bytes),
+      onCommitted: (bytes) => {
+        this.commitWritten(bytes);
+        options.onWriteBytes?.(bytes);
+      },
       onFailed: (error) => this.transitionFailed(error),
     });
     this.assertInvariants();
@@ -224,6 +231,7 @@ export class GrowingSpoolArtifact implements GrowingReadableSource {
       highWaterMark,
       signal: options.signal,
       completion: options.completion,
+      onReadBytes: this.onReadBytes,
       onClosed: () => this.readerClosed(reader),
     });
     this.readers.add(reader);

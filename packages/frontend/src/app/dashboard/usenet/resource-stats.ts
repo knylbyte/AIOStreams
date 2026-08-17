@@ -19,6 +19,9 @@ export type ResourceSummaryItem =
       readonly sessions: number;
       readonly openFiles: number;
       readonly waiting: number;
+      readonly writeBytesPerSec: number;
+      readonly readBytesPerSec: number;
+      readonly cleanupErrors: number;
     };
 
 export function streamingModeLabel(
@@ -68,6 +71,9 @@ export function resourceSummaryItems(
       sessions: resources.spool.sessions,
       openFiles: resources.spool.openFiles,
       waiting: resources.spool.waiting,
+      writeBytesPerSec: resources.spool.writeBytesPerSec,
+      readBytesPerSec: resources.spool.readBytesPerSec,
+      cleanupErrors: resources.spool.cleanupErrors,
     }
   );
   return items;

@@ -18,6 +18,7 @@ import { checkAdmission } from './limits.js';
 import { recordedClientIp } from './client-ip.js';
 import { instanceId } from './instance-id.js';
 import type {
+  AdmissionVerdict,
   LiveStreamSession,
   StreamEndReason,
   StreamHandle,
@@ -140,8 +141,17 @@ export class StreamRegistry {
   private finalised: Session[] = [];
   private readSeq = 0;
   private lastRefreshAt = 0;
+  /** Synchronous admission fence published before process shutdown awaits. */
+  private sealed = false;
 
   readonly instanceId = instanceId();
+
+  constructor(
+    private readonly admissionOverride?: (
+      input: StreamOpenInput,
+      now: number
+    ) => AdmissionVerdict
+  ) {}
 
   /**
    * Start (or join) a session. Admission runs only on create, or on resume
@@ -151,6 +161,16 @@ export class StreamRegistry {
    * two concurrent opens pass the same limit.
    */
   open(input: StreamOpenInput, now = Date.now()): StreamOpenResult {
+    if (this.sealed) {
+      return {
+        ok: false,
+        verdict: {
+          ok: false,
+          reason: 'shutdown',
+          message: 'Server is shutting down',
+        },
+      };
+    }
     const key = identityKey(input.username, input.clientIp, input.targetKey);
     const existing = this.byKey.get(key);
 
@@ -204,6 +224,7 @@ export class StreamRegistry {
   }
 
   private admit(input: StreamOpenInput, now: number) {
+    if (this.admissionOverride) return this.admissionOverride(input, now);
     const usage = bandwidthSnapshot(now);
     let liveUser = 0;
     let liveGlobal = 0;
@@ -605,6 +626,21 @@ export class StreamRegistry {
   /** Stop everything (process shutdown). */
   closeAll(reason: StreamEndReason = 'stale'): void {
     for (const s of [...this.byId.values()]) this.finalise(s, reason);
+  }
+
+  /**
+   * Atomically stop all future admissions and close every current read.
+   * The seal is permanent for this process-owned registry: requests which
+   * entered HTTP middleware before shutdown but reach session admission later
+   * are refused as well.
+   */
+  sealAndCloseAll(reason: StreamEndReason = 'stale'): void {
+    this.sealed = true;
+    this.closeAll(reason);
+  }
+
+  get isSealed(): boolean {
+    return this.sealed;
   }
 }
 

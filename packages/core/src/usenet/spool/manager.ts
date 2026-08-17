@@ -32,6 +32,11 @@ import type {
   SpoolScheduledTask,
   SpoolScheduler,
 } from './types.js';
+import type {
+  UsenetResourceEventObserver,
+  UsenetResourceLifecycleEvent,
+} from '../pool/resource-events.js';
+import type { CommandPriority } from '../types.js';
 
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -40,17 +45,23 @@ const LIVENESS_LOCK_DIRECTORY = '.liveness-locks';
 const LIVENESS_LOCK_SUFFIX = '.lock';
 const HASHED_NAMESPACE = /^[a-f0-9]{64}$/;
 const HASHED_ARTIFACT = /^[a-f0-9]{64}\.(?:partial|ready)$/;
+let spoolLoggerPromise:
+  | Promise<
+      ReturnType<(typeof import('../../logging/logger.js'))['createLogger']>
+    >
+  | undefined;
 
 /** Avoid pulling the application config graph into the standalone spool API. */
 function logSpool(
-  level: 'debug' | 'info',
+  level: 'debug' | 'info' | 'warn',
   fields: Record<string, unknown>,
   message: string
 ): void {
-  void import('../../logging/logger.js')
-    .then(({ createLogger }) => {
-      createLogger('usenet/spool-manager')[level](fields, message);
-    })
+  spoolLoggerPromise ??= import('../../logging/logger.js').then(
+    ({ createLogger }) => createLogger('usenet/spool-manager')
+  );
+  void spoolLoggerPromise
+    .then((logger) => logger[level](fields, message))
     .catch(() => undefined);
 }
 
@@ -63,6 +74,7 @@ export interface SpoolManagerOptions {
   readonly idGenerator?: SpoolIdGenerator;
   readonly scheduler?: SpoolScheduler;
   readonly maxArtifacts?: number;
+  readonly onEvent?: UsenetResourceEventObserver;
 }
 
 export interface CreateSpoolArtifactOptions {
@@ -70,6 +82,7 @@ export interface CreateSpoolArtifactOptions {
   readonly segmentId: string;
   readonly initialReservationBytes: number;
   readonly signal?: AbortSignal;
+  readonly priority?: CommandPriority;
 }
 
 interface PendingArtifactCleanup {
@@ -80,6 +93,34 @@ interface PendingArtifactCleanup {
 
 interface NamespaceControlLease {
   release(): Promise<void>;
+}
+
+/** Fixed-state byte-rate meter driven only by the injected clock. */
+class ByteRateMeter {
+  private windowStartedAt: number;
+  private windowBytes = 0;
+  private previousRate = 0;
+
+  constructor(private readonly clock: SpoolClock) {
+    this.windowStartedAt = clock();
+  }
+
+  record(bytes: number): void {
+    this.windowBytes += bytes;
+  }
+
+  value(): number {
+    const now = this.clock();
+    const elapsed = Math.max(0, now - this.windowStartedAt);
+    if (elapsed === 0) return this.previousRate;
+    const rate = Math.round((this.windowBytes * 1000) / elapsed);
+    if (elapsed >= 1000) {
+      this.previousRate = rate;
+      this.windowBytes = 0;
+      this.windowStartedAt = now;
+    }
+    return rate;
+  }
 }
 
 function hashId(kind: string, value: string): string {
@@ -248,6 +289,9 @@ export class SpoolManager {
   private readonly maxArtifacts: number;
   private readonly budget: SpoolBudget;
   private readonly filePool: OpenFilePool;
+  private readonly onEvent: UsenetResourceEventObserver | undefined;
+  private readonly writeRate: ByteRateMeter;
+  private readonly readRate: ByteRateMeter;
   private readonly artifacts = new Set<GrowingSpoolArtifact>();
   private readonly artifactReservations = new Map<
     GrowingSpoolArtifact,
@@ -268,6 +312,7 @@ export class SpoolManager {
   private artifactSequence = 0;
   private processNamespaceOwned = false;
   private closed = false;
+  private cleanupErrors = 0;
 
   constructor(options: SpoolManagerOptions) {
     if (!options.engineId) {
@@ -293,6 +338,9 @@ export class SpoolManager {
       ...options.fileSystem,
     };
     this.clock = options.clock ?? Date.now;
+    this.onEvent = options.onEvent;
+    this.writeRate = new ByteRateMeter(this.clock);
+    this.readRate = new ByteRateMeter(this.clock);
     this.idGenerator = options.idGenerator ?? randomUUID;
     this.scheduler = options.scheduler ?? createNodeScheduler();
     this.heartbeatIntervalMs = Math.max(
@@ -319,6 +367,8 @@ export class SpoolManager {
       maxBytes: options.plan.spoolBytes,
       minFreeDiskBytes: options.plan.minFreeDiskBytes,
       statfs: () => this.fileSystem.statfs(this.spoolRoot),
+      clock: this.clock,
+      onEvent: (event) => this.observeEvent(event),
     });
     this.filePool = new OpenFilePool(
       options.plan.maxOpenSpoolFiles,
@@ -371,7 +421,7 @@ export class SpoolManager {
         : this.closeController.signal;
       const reservation = await this.budget.reserve(
         options.initialReservationBytes,
-        { signal }
+        { signal, priority: options.priority }
       );
       let partialPath: string | undefined;
       let readyPath: string | undefined;
@@ -401,6 +451,8 @@ export class SpoolManager {
               this.releaseArtifactSession(artifact);
             }
           },
+          onWriteBytes: (bytes) => this.writeRate.record(bytes),
+          onReadBytes: (bytes) => this.readRate.record(bytes),
         };
         try {
           artifact = await GrowingSpoolArtifact.create(artifactOptions);
@@ -424,6 +476,7 @@ export class SpoolManager {
           try {
             await this.removeUntrackedArtifactFiles(partialPath, readyPath);
           } catch (cleanupError) {
+            this.recordCleanupError('artifact creation rollback', cleanupError);
             this.pendingArtifactCleanups.add({
               partialPath,
               readyPath,
@@ -450,7 +503,28 @@ export class SpoolManager {
       files: this.filePool.stats(),
       artifacts: this.artifacts.size + this.pendingArtifactCleanups.size,
       sessions: this.sessionReferences.size,
+      writeBytesPerSec: this.writeRate.value(),
+      readBytesPerSec: this.readRate.value(),
+      cleanupErrors: this.cleanupErrors,
     };
+  }
+
+  private observeEvent(event: UsenetResourceLifecycleEvent): void {
+    try {
+      this.onEvent?.(event);
+    } catch {
+      // Metrics/log consumers never participate in resource ownership.
+    }
+    const level = event.type === 'disk_safety_warning' ? 'warn' : 'debug';
+    logSpool(level, event, `usenet resource event: ${event.type}`);
+  }
+
+  private recordCleanupError(operation: string, _error: unknown): void {
+    this.cleanupErrors++;
+    this.observeEvent({
+      type: 'spool_cleanup_error',
+      operation,
+    });
   }
 
   /** Idempotently stop new work, dispose artifacts, then remove our namespace. */
@@ -736,6 +810,7 @@ export class SpoolManager {
           path.basename(this.processRoot)
         );
       } catch (error) {
+        this.recordCleanupError('namespace control acquire', error);
         firstError = error instanceof Error ? error : new Error(String(error));
       }
     }
@@ -745,11 +820,14 @@ export class SpoolManager {
       trackedArtifacts.map(([artifact]) => artifact.dispose())
     );
     for (const result of results) {
-      if (result.status === 'rejected' && !firstError) {
-        firstError =
-          result.reason instanceof Error
-            ? result.reason
-            : new Error(String(result.reason));
+      if (result.status === 'rejected') {
+        this.recordCleanupError('artifact dispose', result.reason);
+        if (!firstError) {
+          firstError =
+            result.reason instanceof Error
+              ? result.reason
+              : new Error(String(result.reason));
+        }
       }
     }
     let namespaceRemoved = !this.processNamespaceOwned;
@@ -764,10 +842,13 @@ export class SpoolManager {
         if (isMissingSpoolError(error)) {
           namespaceRemoved = true;
         } else if (!firstError) {
+          this.recordCleanupError('process namespace remove', error);
           firstError = classifySpoolFileError(
             error,
             'removing the process spool namespace'
           );
+        } else {
+          this.recordCleanupError('process namespace remove', error);
         }
       }
     }
@@ -775,6 +856,7 @@ export class SpoolManager {
       try {
         await namespaceControl.release();
       } catch (error) {
+        this.recordCleanupError('namespace control release', error);
         if (!firstError) {
           firstError =
             error instanceof Error ? error : new Error(String(error));
@@ -787,11 +869,17 @@ export class SpoolManager {
         reservation.release();
         this.artifacts.delete(artifact);
         this.artifactReservations.delete(artifact);
+        this.releaseArtifactSession(artifact);
       }
       for (const cleanup of this.pendingArtifactCleanups) {
         cleanup.reservation.release();
         this.pendingArtifactCleanups.delete(cleanup);
       }
+      // A failed artifact.dispose() cannot run its onDisposed callback. The
+      // successful recursive namespace removal is nevertheless the physical
+      // ownership boundary, so all session/accounting maps must be reconciled.
+      this.artifactSessions.clear();
+      this.sessionReferences.clear();
     }
     if (firstError) throw firstError;
   }

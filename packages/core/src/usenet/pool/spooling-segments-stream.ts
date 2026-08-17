@@ -15,6 +15,7 @@ import {
   resolveSegmentStreamMemoryBytes,
   resolveSegmentStreamQueuePlan,
 } from '../stream-queue-budget.js';
+import type { SegmentStreamCleanupCause } from './resource-events.js';
 
 const logger = createLogger('usenet/spooling-segments');
 
@@ -32,6 +33,7 @@ export interface SpoolingSegmentArtifactSource {
     priority: CommandPriority,
     signal?: AbortSignal
   ): Promise<ByteLease>;
+  recordSegmentStreamCleanup?(cause: SegmentStreamCleanupCause): void;
 }
 
 /** Exact logical segment range with the layout that proved it. */
@@ -174,6 +176,8 @@ export class SpoolingSegmentsStream extends Readable {
   private artifactLayout: SegmentRangeLayout | undefined;
   private nextLogicalStart: number | undefined;
   private readonly fileEndByte: number | undefined;
+  private normalCompletion = false;
+  private cleanupEventEmitted = false;
 
   constructor(options: SpoolingSegmentsStreamOptions) {
     if (!isPositiveSafeInteger(options.maxPrefetchSegments)) {
@@ -773,6 +777,7 @@ export class SpoolingSegmentsStream extends Readable {
   private finishNormally(): void {
     if (this.ending || this.destroyed) return;
     this.ending = true;
+    this.normalCompletion = true;
     void this.cleanupProducer()
       .then(() => {
         if (!this.destroyed) this.push(null);
@@ -832,7 +837,30 @@ export class SpoolingSegmentsStream extends Readable {
     if (!this.readableEnded) this.discardReadableQueue(this);
     this.streamLifecycleEnded = true;
     this.releaseStreamLeaseIfUnused();
+    this.emitCleanupEvent(this.cleanupCause(error));
     callback(error);
+  }
+
+  private cleanupCause(error: Error | null): SegmentStreamCleanupCause {
+    if (!error) return this.normalCompletion ? 'eof' : 'client_close';
+    const code = 'code' in error ? error.code : undefined;
+    if (code === 'USENET_STREAM_REAPED') return 'idle_reaper';
+    if (error.message === 'usenet engine closed') return 'engine_close';
+    if (
+      error.name === 'AbortError' ||
+      error.message === 'aborted' ||
+      error.message.includes('acquisition aborted')
+    ) {
+      return 'abort';
+    }
+    if (error.message === 'client closed') return 'client_close';
+    return 'error';
+  }
+
+  private emitCleanupEvent(cause: SegmentStreamCleanupCause): void {
+    if (this.cleanupEventEmitted) return;
+    this.cleanupEventEmitted = true;
+    this.pool.recordSegmentStreamCleanup?.(cause);
   }
 
   private discardReadableQueue(reader: Readable): void {

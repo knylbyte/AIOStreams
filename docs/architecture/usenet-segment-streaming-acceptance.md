@@ -31,28 +31,37 @@ canonical concept itself is unchanged.
 ## System evidence
 
 - [x] Engine live stats and dashboard data expose mode, memory, spool, file and
-      arena accounting.
+      arena accounting, including actual-owner read/write rates and cleanup
+      errors.
 - [x] The dashboard presents resource owners without per-chunk detail.
-- [x] Provider change and process shutdown await the prior engine's spool and
-      final stable-cache index writer before replacement/exit.
+- [x] Shutdown first fences HTTP, stream-session and engine admission; provider
+      change and process shutdown then await the prior engine's spool and final
+      stable-cache index writer before replacement/exit.
 - [x] Startup orphan cleanup is heartbeat/fence protected and emits a structured
       completion record.
 - [x] Stable spool failures map to actionable user and HTTP/debrid errors.
 - [x] Local fake-NNTP E2E coverage includes fragmentation, local backpressure,
       pipelining, out-of-order completion, ranges, parallel clients, 430
-      failover, injected slow disk, ENOSPC/EACCES and client abort.
+      failover, injected slow disk, ENOSPC/EACCES, client-only abort cleanup and
+      engine-close cleanup. The parallel-client case starts both readers before
+      the shared BODY completes and aborts one without affecting the other.
 - [x] `benchmark:segment-spooling` reports `arrayBuffers`, `external`, first
       byte, throughput, event-loop lag and spool/internal-budget peaks. Its
-      correctness gates use internal byte budgets, never RSS.
+      correctness gates use internal byte budgets, never RSS. The benchmark
+      drives the actual ordered `SpoolingSegmentsStream`, deterministic
+      out-of-order completion, bounded concurrent producers and a yielding slow
+      consumer.
 
-The benchmark defaults to a short 64 MiB developer run. The concept's example
-of 500 one-MiB segments is selectable without editing source:
+The benchmark defaults to the concept's full 500 one-MiB segment run with a
+64-segment prefetch window and 60 concurrent producer slots:
 
 ```bash
-USENET_BENCHMARK_BYTES=524288000 \
-USENET_BENCHMARK_SEGMENT_BYTES=1048576 \
 pnpm -F core benchmark:segment-spooling
 ```
+
+Short diagnostic runs remain selectable through `USENET_BENCHMARK_BYTES`,
+`USENET_BENCHMARK_SEGMENT_BYTES`, `USENET_BENCHMARK_PREFETCH_SEGMENTS` and
+`USENET_BENCHMARK_MAX_CONCURRENT_DOWNLOADS`.
 
 Latency, throughput, V8 memory and event-loop values are diagnostic because
 machine and filesystem variance makes fixed CI thresholds flaky. Internal
@@ -69,5 +78,5 @@ this boundary without changing the current transport mode contract.
 The E2E suite uses a deterministic in-process NNTP server and injected
 filesystem failures. Windows rename/delete behavior is covered through the
 generic cache's deterministic Windows-style tests; a native Windows runner is
-still valuable platform evidence but is not required for the internal budget
-contract.
+still missing and remains a platform-evidence risk rather than being reported
+as proven. The `readAt()`/archive MVP boundary above also remains intentional.

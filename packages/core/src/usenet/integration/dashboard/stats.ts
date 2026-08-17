@@ -201,6 +201,9 @@ function emptyResources(options: Partial<EngineOptions>): ResourceStats {
       files: 0,
       openFiles: 0,
       waiting: 0,
+      writeBytesPerSec: 0,
+      readBytesPerSec: 0,
+      cleanupErrors: 0,
     },
     arena: {
       usedBytes: 0,

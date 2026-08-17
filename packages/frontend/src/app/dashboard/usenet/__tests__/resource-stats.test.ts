@@ -16,6 +16,9 @@ function resources(mode: ResourceStats['streamingMode']): ResourceStats {
       files: 11,
       openFiles: 12,
       waiting: 13,
+      writeBytesPerSec: 17,
+      readBytesPerSec: 18,
+      cleanupErrors: 19,
     },
     arena: { usedBytes: 14, budgetBytes: 15, exhaustions: 16 },
   };
@@ -54,6 +57,9 @@ describe('resource dashboard model', () => {
       sessions: 10,
       openFiles: 12,
       waiting: 13,
+      writeBytesPerSec: 17,
+      readBytesPerSec: 18,
+      cleanupErrors: 19,
     });
   });
 });

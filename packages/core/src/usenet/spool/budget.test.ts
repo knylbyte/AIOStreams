@@ -176,3 +176,31 @@ test('close rejects pending and future reservations without leaking accounting',
   assert.equal(budget.stats().reservedBytes, 0);
   assert.equal(budget.stats().waiting, 0);
 });
+
+test('spool wait lifecycle and disk margin warning are structured and deterministic', async () => {
+  let now = 100;
+  const events: Array<{ readonly type: string; readonly waitMs?: number }> = [];
+  const budget = new SpoolBudget({
+    maxBytes: 10,
+    minFreeDiskBytes: 5,
+    clock: () => now,
+    onEvent: (event) => events.push(event),
+    statfs: async () => {
+      now += 25;
+      return { bavail: 12, bsize: 1 };
+    },
+  });
+  const owner = await budget.reserve(5);
+  now = 350;
+  const rejected = budget.reserve(3);
+  await assert.rejects(rejected, (error) =>
+    isSpoolError(error, 'USENET_SPOOL_DISK_FULL')
+  );
+  const tail = events.slice(-3);
+  assert.deepEqual(
+    tail.map((event) => event.type),
+    ['spool_wait_start', 'disk_safety_warning', 'spool_wait_end']
+  );
+  assert.equal(tail[2].waitMs, 25);
+  owner.release();
+});

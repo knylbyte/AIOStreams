@@ -74,6 +74,7 @@ import {
 } from '@aiostreams/core';
 import { StremioTransformer } from '@aiostreams/core';
 import { createResponse } from './utils/responses.js';
+import { shutdownAdmission } from './shutdown.js';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -139,6 +140,7 @@ const __dirname = path.dirname(__filename);
 export const frontendRoot = path.join(__dirname, '../../frontend/dist');
 export const staticRoot = path.join(__dirname, './static');
 
+app.use(shutdownAdmission.middleware);
 app.use(ipMiddleware);
 app.use(loggerMiddleware);
 app.use(express.json());

@@ -111,6 +111,9 @@ export interface SpoolManagerStats {
   readonly artifacts: number;
   /** Distinct hashed stream/session owners with live transient artifacts. */
   readonly sessions: number;
+  readonly writeBytesPerSec: number;
+  readonly readBytesPerSec: number;
+  readonly cleanupErrors: number;
 }
 
 /** Byte range for a reader; `endExclusive` follows standard slice semantics. */

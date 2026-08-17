@@ -8,6 +8,7 @@ export type { StreamTransport, StreamEndReason };
 
 /** Why a stream was not admitted. Maps to the transport's refusal response. */
 export type AdmissionRefusal =
+  | 'shutdown'
   | 'banned'
   | 'blocked'
   | 'connection_user'

@@ -40,6 +40,7 @@ export class PrioritySemaphore {
   private readonly lowOdds: number;
   /** Accumulator driving the deterministic High/Low pick. */
   private lowAcc = 0;
+  private closedError: Error | undefined;
 
   /**
    * @param permits   hard capacity.
@@ -79,6 +80,7 @@ export class PrioritySemaphore {
     priority: CommandPriority = CommandPriority.High,
     signal?: AbortSignal
   ): Promise<() => void> {
+    if (this.closedError) return Promise.reject(this.closedError);
     if (signal?.aborted) {
       return Promise.reject(new Error('aborted'));
     }
@@ -124,7 +126,11 @@ export class PrioritySemaphore {
     if (next === this.limit) return;
     this.limit = next;
     // Grant any freed headroom to queued waiters (share-weighted High/Low).
-    while (this.inUseCount < this.limit && this.waiters.length > 0) {
+    while (
+      !this.closedError &&
+      this.inUseCount < this.limit &&
+      this.waiters.length > 0
+    ) {
       this.grantNext();
     }
   }
@@ -132,6 +138,20 @@ export class PrioritySemaphore {
   /** Restore the effective ceiling to the hard maximum and wake any waiters. */
   restore(): void {
     this.throttleTo(this.max);
+  }
+
+  /** Reject every queued acquire and permanently reject future acquires. */
+  close(error: Error): void {
+    if (this.closedError) return;
+    this.closedError = error;
+    const waiters = this.waiters;
+    this.waiters = [];
+    for (const waiter of waiters) {
+      if (waiter.signal && waiter.onAbort) {
+        waiter.signal.removeEventListener('abort', waiter.onAbort);
+      }
+      waiter.reject(error);
+    }
   }
 
   private makeRelease(): () => void {
@@ -147,7 +167,11 @@ export class PrioritySemaphore {
     this.inUseCount--;
     // Hand the freed permit to the next waiter, but only while we're within the
     // (possibly throttled) limit, so a lowered ceiling actually holds.
-    if (this.inUseCount < this.limit && this.waiters.length > 0) {
+    if (
+      !this.closedError &&
+      this.inUseCount < this.limit &&
+      this.waiters.length > 0
+    ) {
       this.grantNext();
     }
   }

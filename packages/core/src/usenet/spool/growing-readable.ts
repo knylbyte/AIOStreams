@@ -15,6 +15,7 @@ export interface GrowingFileReaderOptions {
   readonly signal?: AbortSignal;
   readonly completion?: Promise<void>;
   readonly onClosed: () => void;
+  readonly onReadBytes?: (bytes: number) => void;
 }
 
 function isNonNegativeSafeInteger(value: number): boolean {
@@ -40,6 +41,7 @@ export class GrowingFileReader extends Readable {
   private readonly controller = new AbortController();
   private readonly userSignal: AbortSignal | undefined;
   private readonly completion: Promise<void> | undefined;
+  private readonly onReadBytes: ((bytes: number) => void) | undefined;
   private userAbort: (() => void) | undefined;
   private position: number;
   private reading = false;
@@ -79,6 +81,7 @@ export class GrowingFileReader extends Readable {
     this.onClosed = options.onClosed;
     this.userSignal = options.signal;
     this.completion = options.completion;
+    this.onReadBytes = options.onReadBytes;
 
     if (options.signal?.aborted) {
       queueMicrotask(() =>
@@ -211,6 +214,7 @@ export class GrowingFileReader extends Readable {
           throw spoolAbortError(this.controller.signal.reason);
         }
         this.position += size;
+        this.onReadBytes?.(size);
         if (!this.push(buffer)) return;
         continue;
       }
