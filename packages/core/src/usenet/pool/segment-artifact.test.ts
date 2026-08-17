@@ -93,7 +93,7 @@ test('DiskSegmentArtifact keeps its file lease through the actual reader close e
     path: filePath,
     serializedBytes: body.length,
     confirmHit: () => undefined,
-    invalidateAsMiss: () => undefined,
+    invalidateAsMiss: () => true,
     release: () => {
       releases++;
       return Promise.resolve();

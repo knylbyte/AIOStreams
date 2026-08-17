@@ -141,8 +141,15 @@ export interface DiskFileLease {
   readonly serializedBytes: number;
   /** Finalize this provisional lookup as one successful disk hit. */
   confirmHit(): void;
-  /** Finalize it as one miss and invalidate the structurally corrupt entry. */
-  invalidateAsMiss(): void;
+  /**
+   * Finalize it as one miss and best-effort invalidate the structurally corrupt
+   * entry. Returns `true` iff this lease's miss was logically invalidated.
+   * `false` denotes either an already-finalized hit (an idempotent no-op) or
+   * saturated bounded delete admission; in the latter case the miss remains
+   * final, the entry stays logically indexed, and a later lookup may retry
+   * invalidation after capacity becomes available.
+   */
+  invalidateAsMiss(): boolean;
   /**
    * Release exactly once. A non-final process lease resolves immediately; the
    * final lease observes every bounded predecessor through the delete intent
@@ -168,6 +175,12 @@ interface MemEntry<V> {
 
 interface DiskEntry {
   size: number;
+  /**
+   * Tail of the already-full path fence that prevented this incarnation from
+   * registering its own eviction. Once resolved, the indexed incarnation is
+   * stale and can be forgotten without issuing an ABA-prone current-path rm.
+   */
+  participantBlockedBy?: ProcessPathDeleteIntent;
 }
 
 interface FileLeaseState {
@@ -772,6 +785,14 @@ function retryProcessPathDelete(
   return result.operation;
 }
 
+function processPathDeleteTail(
+  filePath: string
+): ProcessPathDeleteIntent | undefined {
+  const state = processPathOwnership.get(resolvedFilePath(filePath));
+  if (!state) return undefined;
+  return state.deleteSuccessors.at(-1) ?? state.deleteIntent;
+}
+
 /** Snapshot every live disk-backed cache for the dashboard cache page. */
 export function describeDiskCaches(): {
   name: string;
@@ -1175,6 +1196,7 @@ export class DiskBackedCache<V> {
     }
 
     let outcome: 'hit' | 'miss' | undefined;
+    let missInvalidated: boolean | undefined;
     let released = false;
     let releasePromise: Promise<void> | undefined;
     return {
@@ -1187,10 +1209,26 @@ export class DiskBackedCache<V> {
         this.diskHits++;
       },
       invalidateAsMiss: () => {
-        if (outcome) return;
+        if (outcome) return outcome === 'miss' && missInvalidated === true;
+        try {
+          this.dropDisk(fileKey);
+          missInvalidated = true;
+        } catch (error) {
+          if (
+            !(error instanceof DiskBackedCacheError) ||
+            error.code !== 'DISK_CACHE_DELETE_PARTICIPANT_LIMIT'
+          ) {
+            throw error;
+          }
+          missInvalidated = false;
+          logger.debug(
+            { name: this.opts.name, code: error.code },
+            'disk cache corrupt-entry invalidation was deferred by bounded delete admission'
+          );
+        }
         outcome = 'miss';
         this.misses++;
-        this.dropDisk(fileKey);
+        return missInvalidated;
       },
       release: () => {
         if (releasePromise) return releasePromise;
@@ -1779,28 +1817,52 @@ export class DiskBackedCache<V> {
     return cleanup;
   }
 
-  /** Evict least-recently-used disk entries until within budget. */
+  /**
+   * Evict least-recently-used disk entries until within budget.
+   *
+   * One round examines at most the number of entries present at its start and
+   * considers each Map iterator position once. A path whose bounded delete
+   * admission is saturated is skipped without allowing it to head-of-line
+   * block later candidates. This uses no side list and therefore cannot grow a
+   * helper structure with the number of blocked paths.
+   */
   private evictDisk(): void {
-    while (this.diskBytes > this.opts.maxDiskBytes && this.disk.size > 0) {
-      let oldest: string | undefined;
-      for (const fileKey of this.disk.keys()) {
-        if (!this.pendingWrites.has(fileKey)) {
-          oldest = fileKey;
-          break;
-        }
+    const candidates = this.disk.keys();
+    const candidateLimit = this.disk.size;
+    for (
+      let inspected = 0;
+      inspected < candidateLimit && this.diskBytes > this.opts.maxDiskBytes;
+      inspected++
+    ) {
+      const candidate = candidates.next();
+      if (candidate.done) break;
+      const fileKey = candidate.value;
+      if (this.pendingWrites.has(fileKey)) continue;
+      const entry = this.disk.get(fileKey);
+      if (!entry) continue;
+      if (entry.participantBlockedBy) {
+        if (entry.participantBlockedBy.status === 'unresolved') continue;
+        // The pre-existing path fence has completed. This map entry describes
+        // the pre-fence incarnation and must not publish a current-incarnation
+        // delete that could unlink a replacement installed by another cache.
+        this.forgetDiskEntry(fileKey, entry);
+        continue;
       }
-      if (oldest === undefined) break;
       try {
-        this.dropDisk(oldest);
+        this.dropDisk(fileKey);
       } catch (error) {
         if (
           error instanceof DiskBackedCacheError &&
           error.code === 'DISK_CACHE_DELETE_PARTICIPANT_LIMIT'
         ) {
-          // Admission saturation keeps the immutable LRU entry and accounting
-          // intact. A later explicit eviction may retry after the bounded
-          // process-wide participant chain has completed.
-          break;
+          // Admission saturation keeps this immutable entry and its accounting
+          // intact. Continue through the bounded LRU round so a later candidate
+          // (including a newly committed entry after pending-write release) can
+          // restore the hard logical budget.
+          entry.participantBlockedBy = processPathDeleteTail(
+            this.filePath(fileKey)
+          );
+          continue;
         }
         throw error;
       }
@@ -1821,12 +1883,17 @@ export class DiskBackedCache<V> {
     const deletion = this.startPhysicalDelete(fileKey, state);
     state.pendingDelete = true;
     this.fileLeases.set(fileKey, state);
+    this.forgetDiskEntry(fileKey, entry);
+    void deletion.catch(() => undefined);
+  }
+
+  private forgetDiskEntry(fileKey: string, entry: DiskEntry): void {
+    if (this.disk.get(fileKey) !== entry) return;
     this.disk.delete(fileKey);
     this.diskBytes -= entry.size;
     this.assertDiskAccounting();
     this.indexDirty = true;
     this.scheduleIndexFlush();
-    void deletion.catch(() => undefined);
   }
 
   private async releaseFileLease(
@@ -2356,7 +2423,9 @@ export class DiskBackedCache<V> {
       }
       this.indexDirty = false;
       const snapshot: Record<string, DiskEntry> = {};
-      for (const [k, v] of this.disk) snapshot[k] = v;
+      // Persist only the stable on-disk format. Runtime incarnation fences are
+      // deliberately process-local and must never enter the compatible index.
+      for (const [k, v] of this.disk) snapshot[k] = { size: v.size };
       try {
         await this.fileSystem.writeFile(
           this.indexPath,
@@ -2395,7 +2464,14 @@ export class DiskBackedCache<V> {
   ): Promise<void> {
     await this.ready.catch(() => undefined);
     await Promise.allSettled([...this.pendingWrites.values()]);
+    // Pending writes are excluded from eviction while they own their
+    // destination. Once settled, one bounded round must restore the hard
+    // logical disk budget or retain only already-fenced over-budget entries.
+    this.evictDisk();
     await this.retryPendingPhysicalDeletes();
+    // A shared delete chain may have released participant capacity. Retry the
+    // bounded LRU pass once, without polling or an unbounded progress loop.
+    this.evictDisk();
     await this.flushIndexForGeneration(generation, allowClosed, forceIndex);
   }
 

@@ -17,6 +17,10 @@ import type { Readable } from 'node:stream';
 import test, { type TestContext } from 'node:test';
 // Initialise the repository config/logger cycle in production order.
 import '../../config/index.js';
+import {
+  DISK_CACHE_DELETE_PARTICIPANT_LIMIT,
+  DiskBackedCache,
+} from '../../utils/disk-backed-cache.js';
 import { ByteBudget, type ByteLease } from './byte-budget.js';
 import {
   closeSegmentCacheInBackground,
@@ -325,6 +329,96 @@ test('corrupt file-backed metadata is one miss, never a provisional hit', async 
     { hits: 0, misses: 1, diskHits: 0, diskCount: 0 }
   );
   await cache.close();
+});
+
+test('corrupt file-backed metadata releases its lease under saturated delete admission', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'segment-cache-corrupt-cap-'));
+  const messageId = 'corrupt-capacity-entry';
+  const key = createHash('sha1').update(messageId).digest('hex');
+  const directory = path.join(root, 'segments');
+  const dataPath = path.join(directory, key);
+  const indexPath = path.join(root, 'segments.index.json');
+  await mkdir(directory, { recursive: true });
+  const corrupt = Buffer.alloc(4);
+  corrupt.writeUInt32LE(128 * 1024, 0);
+  await writeFile(dataPath, corrupt, { mode: 0o600 });
+  await writeFile(
+    indexPath,
+    JSON.stringify({ [key]: { size: corrupt.length } })
+  );
+
+  const openEntered = Promise.withResolvers<void>();
+  const continueOpen = Promise.withResolvers<void>();
+  let pauseOpen = true;
+  const cache = new SegmentCache({
+    arenaBytes: 0,
+    diskBytes: MEBIBYTE_BYTES,
+    diskPath: root,
+    namespace: 'segments',
+    openFile: async (target, flags, mode) => {
+      const handle = await open(target, flags, mode);
+      if (pauseOpen && flags === 'r' && String(target) === dataPath) {
+        openEntered.resolve();
+        await continueOpen.promise;
+      }
+      return handle;
+    },
+  });
+  context.after(() => cache.close());
+
+  const lookup = cache.acquire(messageId);
+  await openEntered.promise;
+  await rm(indexPath, { force: true });
+  for (let index = 0; index < DISK_CACHE_DELETE_PARTICIPANT_LIMIT; index++) {
+    const participant = new DiskBackedCache<Buffer>({
+      name: 'segments',
+      dir: root,
+      maxMemBytes: 0,
+      maxDiskBytes: MEBIBYTE_BYTES,
+      serialize: (value) => Buffer.from(value),
+      deserialize: (value) => Buffer.from(value),
+      sizeOf: (value) => value.length,
+    });
+    context.after(() => participant.close());
+    await participant.whenReady();
+  }
+  context.after(() => rm(root, { recursive: true, force: true }));
+  continueOpen.resolve();
+
+  assert.equal(await lookup, undefined);
+  assert.deepEqual(
+    {
+      hits: cache.stats().hits,
+      misses: cache.stats().misses,
+      diskHits: cache.stats().diskHits,
+      diskCount: cache.stats().diskCount,
+    },
+    { hits: 0, misses: 1, diskHits: 0, diskCount: 1 }
+  );
+
+  pauseOpen = false;
+  assert.equal(await cache.acquire(messageId), undefined);
+  assert.deepEqual(
+    { misses: cache.stats().misses, diskCount: cache.stats().diskCount },
+    { misses: 2, diskCount: 0 }
+  );
+
+  const source = await sourceFile(
+    root,
+    'replacement.ready',
+    Buffer.from('new!')
+  );
+  assert.equal(
+    await cache.promote(messageId, { size: 4 }, source, acquirePromotionMemory),
+    true
+  );
+  const replacement = await cache.acquire(messageId);
+  assert(replacement);
+  assert.deepEqual(
+    await collect(replacement.createReadStream()),
+    Buffer.from('new!')
+  );
+  await replacement.release();
 });
 
 test('transient metadata-open failure preserves the persistent entry and stats', async (context) => {

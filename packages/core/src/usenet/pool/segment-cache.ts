@@ -417,6 +417,7 @@ export class SegmentCache implements SegmentArtifactCacheLookup {
       return undefined;
     }
     if (!lease) return undefined;
+    let leaseTransferred = false;
     try {
       signal?.throwIfAborted();
       const parsed = await readDiskSegmentMetadata(
@@ -433,32 +434,32 @@ export class SegmentCache implements SegmentArtifactCacheLookup {
         parsed.metadata.size
       );
       lease.confirmHit();
+      leaseTransferred = true;
       return artifact;
     } catch (error) {
-      if (signal?.aborted) {
-        await lease.release().catch((releaseError: unknown) => {
-          logger.debug(
-            { err: releaseError },
-            'persistent segment cache abort cleanup failed'
-          );
-        });
-        throw error;
-      }
+      if (signal?.aborted) throw error;
       if (error instanceof SegmentCacheFormatError) {
-        lease.invalidateAsMiss();
-        await lease.release();
+        const invalidated = lease.invalidateAsMiss();
         logger.debug(
-          { err: error },
+          { err: error, invalidated },
           'discarded an invalid persistent segment cache entry'
         );
         return undefined;
       }
-      await lease.release();
       logger.debug(
         { err: error },
         'persistent segment cache metadata read was temporarily unavailable'
       );
       return undefined;
+    } finally {
+      if (!leaseTransferred) {
+        await lease.release().catch((releaseError: unknown) => {
+          logger.debug(
+            { err: releaseError },
+            'persistent segment cache lookup cleanup remains pending'
+          );
+        });
+      }
     }
   }
 

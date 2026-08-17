@@ -60,6 +60,7 @@ function createCache(
     ) => Promise<void>;
     readonly fileSystem?: Partial<DiskBackedCacheFileSystem>;
     readonly name?: string;
+    readonly deserialize?: (value: Buffer) => Buffer;
   }
 ): DiskBackedCache<Buffer> {
   const cache = new DiskBackedCache<Buffer>({
@@ -68,7 +69,7 @@ function createCache(
     maxMemBytes: options.maxMemBytes ?? 0,
     maxDiskBytes: options.maxDiskBytes,
     serialize: (value) => Buffer.from(value),
-    deserialize: (value) => Buffer.from(value),
+    deserialize: options.deserialize ?? ((value) => Buffer.from(value)),
     sizeOf: (value) => value.length,
     renameFile: options.renameFile,
     fileSystem: options.fileSystem,
@@ -130,9 +131,10 @@ interface SaturatedDeletePath {
 async function saturateDeleteParticipants(
   context: TestContext,
   root: string,
-  key: string
+  key: string,
+  maxDiskBytes = 16
 ): Promise<SaturatedDeletePath> {
-  const owner = createCache(context, root, { maxDiskBytes: 16 });
+  const owner = createCache(context, root, { maxDiskBytes });
   await owner.whenReady();
   assert.equal(
     await owner.installPreparedFile(
@@ -158,13 +160,47 @@ async function saturateDeleteParticipants(
   };
   for (let index = 0; index < DISK_CACHE_DELETE_PARTICIPANT_LIMIT; index++) {
     const participant = createCache(context, root, {
-      maxDiskBytes: 16,
+      maxDiskBytes,
       fileSystem: { rm: guardedRm },
     });
     await participant.whenReady();
   }
   assert.equal(deleteCalls, 0);
   return { owner, lease, dataPath, deleteCalls: () => deleteCalls };
+}
+
+async function saturateObservedDeleteParticipants(
+  context: TestContext,
+  root: string,
+  options: {
+    readonly name: string;
+    readonly dataPath: string;
+    readonly maxDiskBytes: number;
+  }
+): Promise<void> {
+  await rm(path.join(root, `${options.name}.index.json`), { force: true });
+  for (let index = 0; index < DISK_CACHE_DELETE_PARTICIPANT_LIMIT; index++) {
+    const participant = createCache(context, root, {
+      name: options.name,
+      maxDiskBytes: options.maxDiskBytes,
+    });
+    await participant.whenReady();
+  }
+  await access(options.dataPath);
+}
+
+async function indexedEntryCount(root: string, name = 'test-cache') {
+  const encoded = await readFile(path.join(root, `${name}.index.json`), 'utf8');
+  const parsed: unknown = JSON.parse(encoded);
+  assert(
+    parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+  );
+  return Object.keys(parsed).length;
+}
+
+async function persistentEntryCount(root: string, name = 'test-cache') {
+  const entries = await readdir(path.join(root, name));
+  return entries.filter((entry) => /^[a-f0-9]{40}$/.test(entry)).length;
 }
 
 interface LeasedSuccessorPath {
@@ -3541,4 +3577,376 @@ test('stale prepared destination cleanup remains retryable after clear', async (
   assert(lease);
   assert.equal((await readFile(lease.path)).toString(), 'fresh');
   await lease.release();
+});
+
+test('prepared writes stay within the hard LRU budget behind a saturated oldest entry', async (context) => {
+  const root = await mkdtemp(
+    path.join(tmpdir(), 'disk-cache-budget-prepared-')
+  );
+  const saturated = await saturateDeleteParticipants(
+    context,
+    root,
+    'blocked-old',
+    8
+  );
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  for (let index = 0; index < 20; index++) {
+    await saturated.owner.installPreparedFile(
+      `prepared-${index}`,
+      await prepared(saturated.owner, Buffer.from('data')),
+      4
+    );
+    await saturated.owner.flush();
+    const stats = saturated.owner.stats();
+    assert(stats.diskBytes <= 8);
+    assert(stats.diskCount <= 2);
+    assert.equal(await indexedEntryCount(root), stats.diskCount);
+    assert.equal(await persistentEntryCount(root), stats.diskCount);
+  }
+
+  await saturated.lease.release();
+  saturated.owner.resize(0, 0);
+  await saturated.owner.flush();
+});
+
+test('background writes stay within the hard LRU budget behind a saturated oldest entry', async (context) => {
+  const root = await mkdtemp(
+    path.join(tmpdir(), 'disk-cache-budget-background-')
+  );
+  const saturated = await saturateDeleteParticipants(
+    context,
+    root,
+    'blocked-old',
+    8
+  );
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  for (let index = 0; index < 20; index++) {
+    saturated.owner.set(`background-${index}`, Buffer.from('data'));
+    await saturated.owner.flush();
+    const stats = saturated.owner.stats();
+    assert(stats.diskBytes <= 8);
+    assert(stats.diskCount <= 2);
+    assert.equal(await indexedEntryCount(root), stats.diskCount);
+    assert.equal(await persistentEntryCount(root), stats.diskCount);
+  }
+
+  await saturated.lease.release();
+  saturated.owner.resize(0, 0);
+  await saturated.owner.flush();
+});
+
+test('bounded eviction skips a saturated oldest entry and evicts the next LRU candidate', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-budget-skip-'));
+  const saturated = await saturateDeleteParticipants(
+    context,
+    root,
+    'blocked-old',
+    8
+  );
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  assert.equal(
+    await saturated.owner.installPreparedFile(
+      'second-oldest',
+      await prepared(saturated.owner, Buffer.from('two!')),
+      4
+    ),
+    true
+  );
+  assert.equal(
+    await saturated.owner.installPreparedFile(
+      'newest',
+      await prepared(saturated.owner, Buffer.from('last')),
+      4
+    ),
+    true
+  );
+  await saturated.owner.flush();
+
+  assert.deepEqual(
+    {
+      diskBytes: saturated.owner.stats().diskBytes,
+      diskCount: saturated.owner.stats().diskCount,
+    },
+    { diskBytes: 8, diskCount: 2 }
+  );
+  assert.equal(
+    await saturated.owner.acquireDiskFile('second-oldest'),
+    undefined
+  );
+  const newest = await saturated.owner.acquireDiskFile('newest');
+  assert(newest);
+  await newest.release();
+
+  await saturated.lease.release();
+  saturated.owner.resize(0, 0);
+  await saturated.owner.flush();
+});
+
+test('new writes are discarded when every old over-budget entry is participant-blocked', async (context) => {
+  const root = await mkdtemp(
+    path.join(tmpdir(), 'disk-cache-budget-all-blocked-')
+  );
+  const saturated = await saturateDeleteParticipants(
+    context,
+    root,
+    'blocked-old',
+    4
+  );
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  assert.equal(
+    await saturated.owner.installPreparedFile(
+      'discarded-prepared',
+      await prepared(saturated.owner, Buffer.from('next')),
+      4
+    ),
+    false
+  );
+  saturated.owner.set('discarded-background', Buffer.from('more'));
+  await saturated.owner.flush();
+
+  assert.deepEqual(
+    {
+      diskBytes: saturated.owner.stats().diskBytes,
+      diskCount: saturated.owner.stats().diskCount,
+      indexEntries: await indexedEntryCount(root),
+      physicalEntries: await persistentEntryCount(root),
+    },
+    { diskBytes: 4, diskCount: 1, indexEntries: 1, physicalEntries: 1 }
+  );
+
+  await saturated.lease.release();
+  saturated.owner.resize(0, 0);
+  await saturated.owner.flush();
+});
+
+test('bounded flush and resize eviction progress after participant capacity is released', async (context) => {
+  const root = await mkdtemp(
+    path.join(tmpdir(), 'disk-cache-budget-progress-')
+  );
+  const saturated = await saturateDeleteParticipants(
+    context,
+    root,
+    'blocked-old',
+    4
+  );
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  assert.equal(
+    await saturated.owner.installPreparedFile(
+      'blocked-new',
+      await prepared(saturated.owner, Buffer.from('nope')),
+      4
+    ),
+    false
+  );
+  assert.equal(saturated.owner.stats().diskBytes, 4);
+
+  await saturated.lease.release();
+  saturated.owner.resize(0, 0);
+  await saturated.owner.flush();
+  assert.deepEqual(
+    {
+      diskBytes: saturated.owner.stats().diskBytes,
+      diskCount: saturated.owner.stats().diskCount,
+    },
+    { diskBytes: 0, diskCount: 0 }
+  );
+
+  saturated.owner.resize(0, 4);
+  assert.equal(
+    await saturated.owner.installPreparedFile(
+      'fresh',
+      await prepared(saturated.owner, Buffer.from('safe')),
+      4
+    ),
+    true
+  );
+  await saturated.owner.flush();
+  assert.equal((await saturated.owner.getAsync('fresh'))?.toString(), 'safe');
+});
+
+test('parallel prepared writes settle without over-budget or double accounting', async (context) => {
+  const root = await mkdtemp(
+    path.join(tmpdir(), 'disk-cache-budget-parallel-')
+  );
+  const saturated = await saturateDeleteParticipants(
+    context,
+    root,
+    'blocked-old',
+    8
+  );
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const staged = await Promise.all(
+    Array.from({ length: 8 }, (_, index) =>
+      prepared(saturated.owner, Buffer.from(`p${index}`))
+    )
+  );
+
+  await Promise.all(
+    staged.map((entry, index) =>
+      saturated.owner.installPreparedFile(`parallel-${index}`, entry, 2)
+    )
+  );
+  await saturated.owner.flush();
+  assert(saturated.owner.stats().diskBytes <= 8);
+  assert(saturated.owner.stats().diskCount <= 3);
+  assert.equal(
+    await indexedEntryCount(root),
+    saturated.owner.stats().diskCount
+  );
+  assert.equal(
+    await persistentEntryCount(root),
+    saturated.owner.stats().diskCount
+  );
+
+  await saturated.lease.release();
+  saturated.owner.resize(0, 0);
+  await saturated.owner.flush();
+});
+
+test('capacity-limited lease invalidation is explicit, idempotent, and retryable later', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-invalidate-cap-'));
+  const saturated = await saturateDeleteParticipants(
+    context,
+    root,
+    'corrupt',
+    16
+  );
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  assert.equal(saturated.lease.invalidateAsMiss(), false);
+  assert.equal(saturated.lease.invalidateAsMiss(), false);
+  saturated.lease.confirmHit();
+  assert.deepEqual(
+    {
+      hits: saturated.owner.stats().hits,
+      misses: saturated.owner.stats().misses,
+      diskHits: saturated.owner.stats().diskHits,
+      diskCount: saturated.owner.stats().diskCount,
+    },
+    { hits: 0, misses: 1, diskHits: 0, diskCount: 1 }
+  );
+
+  const release = saturated.lease.release();
+  assert.strictEqual(saturated.lease.release(), release);
+  await release;
+  assert.equal(await saturated.owner.acquireDiskFile('corrupt'), undefined);
+  assert.deepEqual(
+    {
+      misses: saturated.owner.stats().misses,
+      diskCount: saturated.owner.stats().diskCount,
+    },
+    { misses: 2, diskCount: 0 }
+  );
+});
+
+test('buffering deserialization corruption releases its lease under participant saturation', async (context) => {
+  const root = await mkdtemp(
+    path.join(tmpdir(), 'disk-cache-deserialize-cap-')
+  );
+  const readEntered = deferred();
+  const continueRead = deferred();
+  const key = 'deserialize-corrupt';
+  const dataPath = path.join(root, 'test-cache', fileKey(key));
+  let pauseRead = false;
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    deserialize: () => {
+      throw new Error('synthetic corrupt payload');
+    },
+    fileSystem: {
+      readFile: async (candidate, options) => {
+        const body = await readFile(candidate, options);
+        if (pauseRead && String(candidate) === dataPath) {
+          readEntered.resolve();
+          await continueRead.promise;
+        }
+        return body;
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await cache.whenReady();
+  assert.equal(
+    await cache.installPreparedFile(
+      key,
+      await prepared(cache, Buffer.from('bad!')),
+      4
+    ),
+    true
+  );
+  await cache.flush();
+
+  pauseRead = true;
+  const lookup = cache.getAsync(key);
+  await readEntered.promise;
+  await saturateObservedDeleteParticipants(context, root, {
+    name: 'test-cache',
+    dataPath,
+    maxDiskBytes: 16,
+  });
+  continueRead.resolve();
+
+  assert.equal(await lookup, undefined);
+  assert.deepEqual(
+    {
+      hits: cache.stats().hits,
+      misses: cache.stats().misses,
+      diskCount: cache.stats().diskCount,
+    },
+    { hits: 0, misses: 1, diskCount: 1 }
+  );
+  pauseRead = false;
+  assert.equal(await cache.getAsync(key), undefined);
+  assert.deepEqual(
+    { misses: cache.stats().misses, diskCount: cache.stats().diskCount },
+    { misses: 2, diskCount: 0 }
+  );
+});
+
+test('successful invalidation callbacks cannot affect a newer file incarnation', async (context) => {
+  const root = await mkdtemp(
+    path.join(tmpdir(), 'disk-cache-invalidate-once-')
+  );
+  const cache = createCache(context, root, { maxDiskBytes: 16 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await cache.whenReady();
+  assert.equal(
+    await cache.installPreparedFile(
+      'same-key',
+      await prepared(cache, Buffer.from('old!')),
+      4
+    ),
+    true
+  );
+  const lease = await cache.acquireDiskFile('same-key');
+  assert(lease);
+
+  assert.equal(lease.invalidateAsMiss(), true);
+  assert.equal(lease.invalidateAsMiss(), true);
+  lease.confirmHit();
+  const release = lease.release();
+  assert.strictEqual(lease.release(), release);
+  await release;
+  assert.deepEqual(
+    { hits: cache.stats().hits, misses: cache.stats().misses },
+    { hits: 0, misses: 1 }
+  );
+
+  assert.equal(
+    await cache.installPreparedFile(
+      'same-key',
+      await prepared(cache, Buffer.from('new!')),
+      4
+    ),
+    true
+  );
+  assert.equal(lease.invalidateAsMiss(), true);
+  lease.confirmHit();
+  await cache.flush();
+  assert.equal((await cache.getAsync('same-key'))?.toString(), 'new!');
 });
