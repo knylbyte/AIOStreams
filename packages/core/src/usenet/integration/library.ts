@@ -43,7 +43,11 @@ import {
   type UsenetLibrarySource,
 } from '../../db/index.js';
 import { usenetEngineRegistry, getUsenetEngineConfig } from './engine.js';
-import { attachProvisionalHoles, spawnCensusShadow } from './census-shadow.js';
+import {
+  attachProvisionalHoles,
+  invalidateCensusShadow,
+  spawnCensusShadow,
+} from './census-shadow.js';
 import {
   classifyNoStreamable,
   classifyAvailability,
@@ -419,6 +423,10 @@ async function importNzb(
     });
   };
   try {
+    // A previous same-hash shadow may already own an in-flight repository
+    // mutation. Retire that generation before this import publishes its row.
+    await invalidateCensusShadow(nzbHash);
+    jobSignal.throwIfAborted();
     const engine = await usenetEngineRegistry.get(spec.providers, spec.options);
     // Dispatch (not schedule) time, so `importMs` measures the inspect
     // itself, not time spent queued behind other imports.

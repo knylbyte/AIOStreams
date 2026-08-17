@@ -1,4 +1,5 @@
 export * from './damage-policy.js';
+export { shutdownCensusShadows } from './census-shadow.js';
 export * from './engine.js';
 export * from './inspect-scheduler.js';
 export * from './tokens.js';

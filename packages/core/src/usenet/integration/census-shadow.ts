@@ -2,8 +2,8 @@ import { createLogger } from '../../logging/logger.js';
 import { UsenetLibraryRepository } from '../../db/index.js';
 import type { UsenetLibraryFile } from '../../db/index.js';
 import {
-  markReleaseDead,
-  retractRelease,
+  markReleaseDeadOwned,
+  retractReleaseOwned,
 } from '../../release-blocklist/feedback.js';
 import { nzbContentKey } from '../../release-blocklist/keys.js';
 import {
@@ -15,6 +15,10 @@ import {
   type NzbContent,
 } from '../index.js';
 import type { CensusSnapshot } from '../pool/inspect/index.js';
+import {
+  CensusShadowOwner,
+  type CensusShadowPublication,
+} from './census-shadow-owner.js';
 
 const logger = createLogger('usenet/census-shadow');
 
@@ -99,8 +103,136 @@ export function attachProvisionalHoles(
   return attached;
 }
 
-/** Live shadows by nzb hash (singleflight; a re-import cancels the old run). */
-const liveShadows = new Map<string, { cancel(): void }>();
+const censusShadowOwner = new CensusShadowOwner<CensusSnapshot>();
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function applyCensusVerdict(
+  args: {
+    nzbHash: string;
+    name?: string;
+    nzb: Nzb;
+    content: NzbContent;
+    engine: UsenetEngine;
+    releaseKey?: string;
+  },
+  snap: CensusSnapshot,
+  publication: CensusShadowPublication
+): Promise<void> {
+  const { nzbHash, name, nzb, content, engine, releaseKey } = args;
+  if (!snap.complete || !publication.isCurrent()) {
+    if (!snap.complete) {
+      logger.debug(
+        { nzbHash, sampled: snap.sampled, total: snap.total },
+        'census shadow ended without completing; leaving entry status as-is'
+      );
+    }
+    return;
+  }
+  const targets = enumerateTargets(content);
+  if (targets.length === 0) return;
+
+  let anyHoles = false;
+  let allFailed = true;
+  const perTarget: Array<{
+    target: Target;
+    runs: HoleRun[];
+    failed: boolean;
+  }> = [];
+  for (const target of targets) {
+    const { runs, backingBytes, segBytes } = targetDamage(
+      engine,
+      nzb,
+      content,
+      target,
+      snap.holes
+    );
+    const failed = classifyHoles(runs, backingBytes, segBytes) === 'failed';
+    if (runs.length > 0) anyHoles = true;
+    if (!failed) allFailed = false;
+    perTarget.push({ target, runs, failed });
+  }
+
+  if (!publication.isCurrent()) return;
+  logger.debug(
+    {
+      nzbHash,
+      missing: snap.missing,
+      longestRun: snap.longestRun,
+      targets: targets.length,
+      damaged: perTarget.filter((t) => t.runs.length > 0).length,
+      failedTargets: perTarget.filter((t) => t.failed).length,
+    },
+    'census shadow verdict'
+  );
+
+  if (allFailed && anyHoles) {
+    const failed = await publication.step(() =>
+      UsenetLibraryRepository.markFailed(
+        nzbHash,
+        `Missing on providers: ${snap.missing}/${snap.sampled} audited segments unavailable on every provider`,
+        name,
+        'missing_on_providers'
+      )
+    );
+    if (!failed.current) return;
+    await publication.step(() =>
+      markReleaseDeadOwned(releaseKey, nzbContentKey(nzbHash))
+    );
+    return;
+  }
+
+  for (const { target, runs, failed } of perTarget) {
+    if (runs.length > 0) {
+      const holes = await publication.step(() =>
+        UsenetLibraryRepository.updateFileHoles(
+          nzbHash,
+          target.selector,
+          serializeHoles(runs)
+        )
+      );
+      if (!holes.current) return;
+    }
+    if (failed) {
+      const streamable = await publication.step(() =>
+        UsenetLibraryRepository.updateFileStreamable(
+          nzbHash,
+          target.selector,
+          false
+        )
+      );
+      if (!streamable.current) return;
+    }
+  }
+  if (anyHoles) {
+    await publication.step(() =>
+      UsenetLibraryRepository.setStatus(nzbHash, 'degraded', {
+        guard: { notIn: ['failed'] },
+      })
+    );
+    return;
+  }
+
+  const loaded = await publication.step(() =>
+    UsenetLibraryRepository.get(nzbHash)
+  );
+  if (!loaded.current || !loaded.value) return;
+  const entry = loaded.value;
+  const playbackHoles = entry.files.some((f) => (f.holes?.length ?? 0) > 0);
+  if (entry.status === 'degraded' && !playbackHoles) {
+    const promoted = await publication.step(() =>
+      UsenetLibraryRepository.setStatus(nzbHash, 'available', {
+        guard: { notIn: ['failed', 'queued', 'inspecting', 'streaming'] },
+      })
+    );
+    if (!promoted.current) return;
+    await publication.step(() =>
+      retractReleaseOwned(releaseKey, nzbContentKey(nzbHash))
+    );
+  }
+}
 
 /**
  * Adopt an import's still-running census and apply its final verdict to the
@@ -126,113 +258,44 @@ export function spawnCensusShadow(args: {
   content: NzbContent;
   engine: UsenetEngine;
   releaseKey?: string;
-}): void {
-  const { nzbHash, name, nzb, content, engine, releaseKey } = args;
+}): boolean {
+  const { nzbHash, content, engine } = args;
   const census = content.census;
-  if (!census) return;
+  if (!census) return false;
   content.census = undefined;
 
-  liveShadows.get(nzbHash)?.cancel();
-  liveShadows.set(nzbHash, census);
-
-  void (async () => {
-    const snap: CensusSnapshot = await census.done;
-    if (!snap.complete) {
-      logger.debug(
-        { nzbHash, sampled: snap.sampled, total: snap.total },
-        'census shadow ended without completing; leaving entry status as-is'
-      );
-      return;
-    }
-    const targets = enumerateTargets(content);
-    if (targets.length === 0) return;
-
-    let anyHoles = false;
-    let allFailed = true;
-    const perTarget: Array<{
-      target: Target;
-      runs: HoleRun[];
-      failed: boolean;
-    }> = [];
-    for (const target of targets) {
-      const { runs, backingBytes, segBytes } = targetDamage(
-        engine,
-        nzb,
-        content,
-        target,
-        snap.holes
-      );
-      const failed = classifyHoles(runs, backingBytes, segBytes) === 'failed';
-      if (runs.length > 0) anyHoles = true;
-      if (!failed) allFailed = false;
-      perTarget.push({ target, runs, failed });
-    }
-
-    logger.debug(
-      {
-        nzbHash,
-        missing: snap.missing,
-        longestRun: snap.longestRun,
-        targets: targets.length,
-        damaged: perTarget.filter((t) => t.runs.length > 0).length,
-        failedTargets: perTarget.filter((t) => t.failed).length,
-      },
-      'census shadow verdict'
-    );
-
-    if (allFailed && anyHoles) {
-      await UsenetLibraryRepository.markFailed(
-        nzbHash,
-        `Missing on providers: ${snap.missing}/${snap.sampled} audited segments unavailable on every provider`,
-        name,
-        'missing_on_providers'
-      );
-      markReleaseDead(releaseKey, nzbContentKey(nzbHash));
-      return;
-    }
-
-    for (const { target, runs, failed } of perTarget) {
-      if (runs.length > 0) {
-        await UsenetLibraryRepository.updateFileHoles(
-          nzbHash,
-          target.selector,
-          serializeHoles(runs)
-        );
-      }
-      if (failed) {
-        await UsenetLibraryRepository.updateFileStreamable(
-          nzbHash,
-          target.selector,
-          false
-        );
-      }
-    }
-    if (anyHoles) {
-      await UsenetLibraryRepository.setStatus(nzbHash, 'degraded', {
-        guard: { notIn: ['failed'] },
-      });
-      return;
-    }
-    // Fully clean census: promote a provisionally-degraded entry back to
-    // available, but never clear a degraded flag that playback padding put
-    // there (real holes on the wire beat STAT evidence).
-    const entry = await UsenetLibraryRepository.get(nzbHash);
-    if (!entry) return;
-    const playbackHoles = entry.files.some((f) => (f.holes?.length ?? 0) > 0);
-    if (entry.status === 'degraded' && !playbackHoles) {
-      await UsenetLibraryRepository.setStatus(nzbHash, 'available', {
-        guard: { notIn: ['failed', 'queued', 'inspecting', 'streaming'] },
-      });
-      retractRelease(releaseKey, nzbContentKey(nzbHash));
-    }
-  })()
-    .catch((err) => {
+  const handle = censusShadowOwner.spawn({
+    nzbHash,
+    census,
+    apply: (snapshot, publication) =>
+      applyCensusVerdict(args, snapshot, publication),
+    onError: (error) => {
       logger.warn(
-        { nzbHash, err: (err as Error)?.message },
+        { nzbHash, err: errorMessage(error) },
         'census shadow failed to apply its verdict'
       );
-    })
-    .finally(() => {
-      if (liveShadows.get(nzbHash) === census) liveShadows.delete(nzbHash);
-    });
+    },
+    onRejected: (error) => {
+      logger.debug(
+        { nzbHash, code: error.code },
+        'census shadow admission rejected'
+      );
+    },
+  });
+  if (!handle) return false;
+  if (!engine.trackCensusShadow(handle)) {
+    handle.cancel();
+    return false;
+  }
+  return true;
+}
+
+/** Invalidate and settle an old import generation before a same-hash reimport. */
+export function invalidateCensusShadow(nzbHash: string): Promise<void> {
+  return censusShadowOwner.invalidate(nzbHash);
+}
+
+/** Process-close fence for every census continuation and owned mutation. */
+export function shutdownCensusShadows(): Promise<void> {
+  return censusShadowOwner.close();
 }

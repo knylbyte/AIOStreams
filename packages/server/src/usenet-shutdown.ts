@@ -1,6 +1,7 @@
 export interface UsenetOwnerShutdown {
   readonly closeOpenings: () => Promise<unknown>;
   readonly closeGrabs: () => Promise<unknown>;
+  readonly closeCensusShadows: () => Promise<unknown>;
   readonly closeEngines: () => Promise<unknown>;
   readonly closePersistence: () => Promise<unknown>;
 }
@@ -23,10 +24,11 @@ async function collectFailures(
 }
 
 /**
- * Ordered usenet-owner shutdown. Opening and grab admission fences publish
- * synchronously before the first await. Engine retirement then stops every
- * already-admitted repository producer before persistence freezes its final
- * close snapshot. Every phase still runs when an earlier phase fails.
+ * Ordered usenet-owner shutdown. Opening, grab and census-shadow admission
+ * fences publish synchronously before the first await. Engine retirement then
+ * stops every already-admitted producer; census continuations settle before
+ * persistence freezes its final close snapshot. Every phase still runs when
+ * an earlier phase fails.
  */
 export async function closeUsenetOwners(
   owners: UsenetOwnerShutdown
@@ -34,9 +36,11 @@ export async function closeUsenetOwners(
   const failures: unknown[] = [];
   const openingClose = invokeCleanup(owners.closeOpenings);
   const grabClose = invokeCleanup(owners.closeGrabs);
+  const censusClose = invokeCleanup(owners.closeCensusShadows);
 
   await collectFailures([openingClose, grabClose], failures);
   await collectFailures([invokeCleanup(owners.closeEngines)], failures);
+  await collectFailures([censusClose], failures);
   await collectFailures([invokeCleanup(owners.closePersistence)], failures);
 
   if (failures.length > 0) {

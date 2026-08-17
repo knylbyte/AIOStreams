@@ -75,6 +75,14 @@ canonical concept itself is unchanged.
       makes `failed` terminal over concurrent `degraded` updates. Engine readers
       retire before repository persistence freezes its immutable close snapshot,
       so their final hooks remain part of the durability barrier.
+- [x] Census continuations use a process-wide owner capped at 64 active tasks
+      with one current monotonic generation per NZB hash. Reimports and engine
+      retirement invalidate stale generations; every hole, streamability,
+      status and release-feedback mutation rechecks publication ownership before
+      and after its awaited operation. Process shutdown synchronously fences new
+      shadows, cancels census workers, awaits crossing repository writes and
+      aggregates their bounded failures before stream-hook persistence and the
+      database close barrier.
 - [x] Startup orphan cleanup is heartbeat/fence protected and emits a structured
       completion record.
 - [x] Stable spool failures map to actionable user and HTTP/debrid errors.

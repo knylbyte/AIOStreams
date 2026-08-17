@@ -10,6 +10,7 @@ import { streamRegistry } from '../../stream-sessions/index.js';
 import { downloadManager } from '../../utils/download-manager.js';
 import {
   openNativeUsenetStream,
+  shutdownCensusShadows,
   shutdownNativeUsenetSessionOpens,
   shutdownNativeUsenetSessionPersistence,
   shutdownUsenetEngines,
@@ -104,9 +105,11 @@ test('native request stopped during session open creates no late reader or engin
     streamRegistry.sealAndCloseAll('shutdown');
     const openingShutdown = shutdownNativeUsenetSessionOpens();
     const grabShutdown = downloadManager.close();
+    const censusShutdown = shutdownCensusShadows();
     await upstreamClosed.promise;
     await Promise.all([openingShutdown, grabShutdown]);
     await shutdownUsenetEngines();
+    await censusShutdown;
     await shutdownNativeUsenetSessionPersistence();
 
     await rejected;

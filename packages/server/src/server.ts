@@ -42,6 +42,7 @@ import {
   pruneStreamSessions,
   recoverStreamSessions,
   streamRegistry,
+  shutdownCensusShadows,
   shutdownNativeUsenetSessionOpens,
   shutdownNativeUsenetSessionPersistence,
   downloadManager,
@@ -341,6 +342,7 @@ function beginUsenetShutdown(): Promise<void> {
     usenetShutdownPromise = closeUsenetOwners({
       closeOpenings: shutdownNativeUsenetSessionOpens,
       closeGrabs: () => downloadManager.close(),
+      closeCensusShadows: shutdownCensusShadows,
       closeEngines: shutdownUsenetEngines,
       closePersistence: shutdownNativeUsenetSessionPersistence,
     });

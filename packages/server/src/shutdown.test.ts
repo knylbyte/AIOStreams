@@ -297,6 +297,8 @@ describe('shutdown admission and ordering', () => {
   test('reader cleanup can persist before the repository and database fences', async () => {
     const engineEntered = Promise.withResolvers<void>();
     const engineGate = Promise.withResolvers<void>();
+    const censusGate = Promise.withResolvers<void>();
+    const readerWrite = Promise.withResolvers<void>();
     const events: string[] = [];
     let persistenceOpen = true;
     let databaseOpen = true;
@@ -318,6 +320,10 @@ describe('shutdown admission and ordering', () => {
               closeGrabs: async () => {
                 events.push('grabs');
               },
+              closeCensusShadows: async () => {
+                events.push('census-fence');
+                await censusGate.promise;
+              },
               closeEngines: async () => {
                 events.push('engine-start');
                 engineEntered.resolve();
@@ -326,6 +332,7 @@ describe('shutdown admission and ordering', () => {
                 expect(databaseOpen).toBe(true);
                 writes++;
                 events.push('reader-hook-write');
+                readerWrite.resolve();
               },
               closePersistence: async () => {
                 expect(writes).toBe(1);
@@ -348,13 +355,28 @@ describe('shutdown admission and ordering', () => {
     });
 
     const closing = coordinator.close();
-    expect(events).toEqual(['openings', 'grabs']);
+    expect(events).toEqual(['openings', 'grabs', 'census-fence']);
     await engineEntered.promise;
-    expect(events).toEqual(['openings', 'grabs', 'engine-start']);
+    expect(events).toEqual([
+      'openings',
+      'grabs',
+      'census-fence',
+      'engine-start',
+    ]);
     expect(persistenceOpen).toBe(true);
     engineGate.resolve();
+    await readerWrite.promise;
+    expect(events).toEqual([
+      'openings',
+      'grabs',
+      'census-fence',
+      'engine-start',
+      'reader-hook-write',
+    ]);
+    expect(persistenceOpen).toBe(true);
+    censusGate.resolve();
     await closing;
-    expect(events.slice(3)).toEqual([
+    expect(events.slice(4)).toEqual([
       'reader-hook-write',
       'persistence-close',
       'database-close',
@@ -363,8 +385,9 @@ describe('shutdown admission and ordering', () => {
     expect(databaseOpen).toBe(false);
   });
 
-  test('engine and repository close failures are both retained', async () => {
+  test('engine, shadow and repository close failures are retained', async () => {
     const engineFailure = new Error('engine cleanup failed');
+    const shadowFailure = new Error('shadow cleanup failed');
     const persistenceFailure = new Error('repository close failed');
     const events: string[] = [];
 
@@ -376,6 +399,10 @@ describe('shutdown admission and ordering', () => {
         closeGrabs: async () => {
           events.push('grabs');
         },
+        closeCensusShadows: async () => {
+          events.push('shadows');
+          throw shadowFailure;
+        },
         closeEngines: async () => {
           events.push('engines');
           throw engineFailure;
@@ -386,8 +413,14 @@ describe('shutdown admission and ordering', () => {
         },
       })
     ).rejects.toMatchObject({
-      errors: [engineFailure, persistenceFailure],
+      errors: [engineFailure, shadowFailure, persistenceFailure],
     });
-    expect(events).toEqual(['openings', 'grabs', 'engines', 'persistence']);
+    expect(events).toEqual([
+      'openings',
+      'grabs',
+      'shadows',
+      'engines',
+      'persistence',
+    ]);
   });
 });

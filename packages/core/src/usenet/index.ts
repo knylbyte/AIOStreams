@@ -190,6 +190,11 @@ export interface FileStreamHandle {
   file: NzbContentFile;
 }
 
+interface EngineCensusShadow {
+  readonly done: Promise<void>;
+  cancel(): void;
+}
+
 /**
  * Pure, HTTP-agnostic usenet engine: given provider configs + an NZB it
  * produces file lists, seekable streams, and stats. No UserData, no Express.
@@ -209,6 +214,8 @@ export class UsenetEngine {
   private statTrust = new StatTrustCache();
   /** Live census runs, so close() can cancel their workers promptly. */
   private liveCensus = new Set<CensusRun>();
+  /** Integration continuations owned until their final mutation settles. */
+  private liveCensusShadows = new Set<EngineCensusShadow>();
   /**
    * Every read stream opened through {@link track}, keyed by its stats stream
    * id, so close() can destroy in-flight readers and the idle reaper / the
@@ -503,6 +510,20 @@ export class UsenetEngine {
   private registerCensus(census: CensusRun): void {
     this.liveCensus.add(census);
     void census.done.finally(() => this.liveCensus.delete(census));
+  }
+
+  /** Bind an adopted census continuation to this engine's close barrier. */
+  trackCensusShadow(shadow: EngineCensusShadow): boolean {
+    if (this.closedError) {
+      shadow.cancel();
+      return false;
+    }
+    this.liveCensusShadows.add(shadow);
+    void shadow.done.then(
+      () => this.liveCensusShadows.delete(shadow),
+      () => this.liveCensusShadows.delete(shadow)
+    );
+    return true;
   }
 
   /**
@@ -1164,7 +1185,8 @@ export class UsenetEngine {
     return (
       this.stats.activeStreams > 0 ||
       this.pool.downloadsOnWire > 0 ||
-      this.liveCensus.size > 0
+      this.liveCensus.size > 0 ||
+      this.liveCensusShadows.size > 0
     );
   }
 
@@ -1285,6 +1307,8 @@ export class UsenetEngine {
     // pool being closed (they self-resolve with `complete: false`).
     for (const census of this.liveCensus) census.cancel();
     this.liveCensus.clear();
+    const censusShadows = [...this.liveCensusShadows];
+    for (const shadow of censusShadows) shadow.cancel();
     // Observe reader close before destroy, then close the pool concurrently:
     // readers may need pool/producer teardown to finish their async _destroy.
     const readers = this.liveReaders.size;
@@ -1293,10 +1317,18 @@ export class UsenetEngine {
     }
     const readerClose = destroyTrackedReaders(this.liveReaders, closeError);
     const poolClose = Promise.resolve().then(() => this.pool.close());
+    const shadowClose = Promise.allSettled(
+      censusShadows.map((shadow) => shadow.done)
+    ).then((results) =>
+      results.flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : []
+      )
+    );
     const errors: unknown[] = [];
-    const [readerResult, poolResult] = await Promise.allSettled([
+    const [readerResult, poolResult, shadowResult] = await Promise.allSettled([
       readerClose,
       poolClose,
+      shadowClose,
     ]);
     if (readerResult.status === 'fulfilled') {
       errors.push(...readerResult.value);
@@ -1310,12 +1342,20 @@ export class UsenetEngine {
         'usenet pool close failed'
       );
     }
+    if (shadowResult.status === 'fulfilled') {
+      errors.push(...shadowResult.value);
+    } else {
+      errors.push(shadowResult.reason);
+    }
     if (this.liveReaders.size !== 0 || this.stats.activeStreams !== 0) {
       errors.push(
         new Error(
           `Usenet reader cleanup incomplete (${this.liveReaders.size}/${this.stats.activeStreams})`
         )
       );
+    }
+    if (this.liveCensusShadows.size !== 0) {
+      errors.push(new Error('Usenet census shadow cleanup incomplete'));
     }
     try {
       const poolOwners = this.pool.poolInfo();

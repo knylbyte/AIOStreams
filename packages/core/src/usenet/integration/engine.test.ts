@@ -11,6 +11,7 @@ import { usenetSchema } from '../../config/schema/usenet.js';
 import type { SeekableStream } from '../pool/file-stream.js';
 import type { Nzb } from '../nzb/model.js';
 import type { SharedSegment } from '../pool/segment-arena.js';
+import { CensusShadowOwner } from './census-shadow-owner.js';
 
 const MEBIBYTE_BYTES = 1024 * 1024;
 
@@ -373,6 +374,72 @@ test('registry replacement waits for the previous engine reader close', async ()
   const second = await replacement;
   assert.equal(reader.closed, true);
   assert.notEqual(second, first);
+  await registry.closeAll();
+});
+
+test('registry replacement waits for and invalidates the old census shadow', async () => {
+  const { UsenetEngineRegistry } = await import('../index.js');
+  const registry = new UsenetEngineRegistry(60_000);
+  const firstProvider: ProviderConfig = {
+    id: 'shadow-first',
+    host: '127.0.0.1',
+    port: 119,
+    tls: false,
+    maxConnections: 1,
+    priority: 0,
+  };
+  const first = await registry.get([firstProvider], {
+    ...DEFAULT_ENGINE_OPTIONS,
+    segmentDiskCacheBytes: 0,
+  });
+  const owner = new CensusShadowOwner<{ readonly complete: boolean }>(1);
+  const beforePublish = Promise.withResolvers<void>();
+  const permitPublish = Promise.withResolvers<void>();
+  const censusCancelled = Promise.withResolvers<void>();
+  let writes = 0;
+  const shadow = owner.spawn({
+    nzbHash: 'provider-retirement',
+    census: {
+      done: Promise.resolve({ complete: true }),
+      cancel: () => censusCancelled.resolve(),
+    },
+    apply: async (_snapshot, publication) => {
+      beforePublish.resolve();
+      await permitPublish.promise;
+      await publication.step(async () => {
+        writes++;
+      });
+    },
+    onError: (error) => {
+      throw error;
+    },
+  });
+  assert(shadow);
+  assert.equal(first.trackCensusShadow(shadow), true);
+  await beforePublish.promise;
+
+  let replacementResolved = false;
+  const replacement = registry.get(
+    [{ ...firstProvider, id: 'shadow-second', port: 120 }],
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      segmentDiskCacheBytes: 0,
+    }
+  );
+  void replacement.then(() => {
+    replacementResolved = true;
+  });
+  await censusCancelled.promise;
+  await Promise.resolve();
+  assert.equal(replacementResolved, false);
+
+  permitPublish.resolve();
+  const second = await replacement;
+  assert.notEqual(second, first);
+  assert.equal(writes, 0);
+  assert.equal(owner.activeTasks, 0);
+  assert.equal(owner.currentGenerations, 0);
+  await owner.close();
   await registry.closeAll();
 });
 

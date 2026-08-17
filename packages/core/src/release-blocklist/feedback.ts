@@ -35,10 +35,10 @@ export function blocklistScopeForCode(
   }
 }
 
-function markDead(
+async function persistDead(
   scope: BlocklistScope,
   keys: Array<string | null | undefined>
-): void {
+): Promise<void> {
   const valid = keys.filter(
     (key): key is string => !!key && releaseKeyKind(key) === 'usenet'
   );
@@ -52,11 +52,26 @@ function markDead(
           ? `on ${backbones.join(', ')}`
           : '(unscoped)')
   );
+  const errors: unknown[] = [];
   for (const key of valid) {
-    void ReleaseBlocklistRepository.markVerdict(key, 'dead', backbones).catch(
-      (err) => logger.warn(`failed to mark ${key} dead: ${err}`)
-    );
+    try {
+      await ReleaseBlocklistRepository.markVerdict(key, 'dead', backbones);
+    } catch (error) {
+      errors.push(error);
+    }
   }
+  if (errors.length > 0) {
+    throw new AggregateError(errors, 'failed to persist dead release verdict');
+  }
+}
+
+function markDead(
+  scope: BlocklistScope,
+  keys: Array<string | null | undefined>
+): void {
+  void persistDead(scope, keys).catch((error) =>
+    logger.warn(`failed to mark release dead: ${error}`)
+  );
 }
 
 /**
@@ -68,6 +83,13 @@ export function markReleaseDead(
   ...keys: Array<string | null | undefined>
 ): void {
   markDead('backbones', keys);
+}
+
+/** Awaitable variant for lifecycle-owned persistence paths. */
+export function markReleaseDeadOwned(
+  ...keys: Array<string | null | undefined>
+): Promise<void> {
+  return persistDead('backbones', keys);
 }
 
 /**
@@ -92,10 +114,25 @@ export function markReleaseDeadForCode(
 export function retractRelease(
   ...keys: Array<string | null | undefined>
 ): void {
+  void retractReleaseOwned(...keys).catch((error) =>
+    logger.warn(`failed to retract release: ${error}`)
+  );
+}
+
+/** Awaitable variant for lifecycle-owned persistence paths. */
+export async function retractReleaseOwned(
+  ...keys: Array<string | null | undefined>
+): Promise<void> {
+  const errors: unknown[] = [];
   for (const key of keys) {
     if (!key || releaseKeyKind(key) === null) continue;
-    void ReleaseBlocklistRepository.retract(key, {
-      onlyIfBlocked: true,
-    }).catch((err) => logger.warn(`failed to retract ${key}: ${err}`));
+    try {
+      await ReleaseBlocklistRepository.retract(key, { onlyIfBlocked: true });
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length > 0) {
+    throw new AggregateError(errors, 'failed to persist release retraction');
   }
 }
