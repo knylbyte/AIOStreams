@@ -162,6 +162,26 @@ function waitForClose(stream: Readable): Promise<void> {
   return new Promise<void>((resolve) => stream.once('close', resolve));
 }
 
+test('a normal reader failure is not retained for later engine close', async () => {
+  const runtimeError = Object.assign(new Error('provider read failed'), {
+    code: 'EIO',
+  });
+  const reader = new SynchronousDestroyReadable();
+  const owner = new TrackedReaderOwner();
+  const observed: unknown[] = [];
+  owner.register(1, reader);
+  reader.once('error', (error) => observed.push(error));
+
+  const closed = waitForClose(reader);
+  reader.destroy(runtimeError);
+  await closed;
+
+  assert.deepEqual(observed, [runtimeError]);
+  assert.equal(owner.size, 0);
+  assert.deepEqual(await owner.close(new UsenetEngineClosedError()), []);
+  assert.equal(reader.listenerCount('error'), 0);
+});
+
 test('reader owner retains a synchronous cleanup replacement before engine close', async () => {
   const cleanupError = Object.assign(new Error('reader cleanup failed'), {
     code: 'EIO',
@@ -250,6 +270,35 @@ test('reader owner promptly removes an old normally closed reader', async () => 
   await closed;
 
   assert.equal(owner.size, 0);
+  assert.deepEqual(await owner.close(new UsenetEngineClosedError()), []);
+});
+
+test('reader cleanup error handoff remains bounded and removes every listener', async () => {
+  const owner = new TrackedReaderOwner();
+  const readers = Array.from({ length: 66 }, (_, index) => {
+    const cleanupError = Object.assign(
+      new Error(`reader cleanup failed ${index}`),
+      { code: 'EIO' }
+    );
+    const reader = new SynchronousDestroyReadable(cleanupError);
+    owner.register(index, reader);
+    return reader;
+  });
+
+  const closed = readers.map(waitForClose);
+  for (const reader of readers) {
+    reader.destroy(new StreamStoppedError('shutdown'));
+  }
+  await Promise.all(closed);
+
+  const errors = await owner.close(new UsenetEngineClosedError());
+  assert.equal(errors.length, 64);
+  assert.match(
+    String(errors.at(-1)),
+    /Additional usenet reader cleanup errors were suppressed/
+  );
+  assert.equal(owner.size, 0);
+  for (const reader of readers) assert.equal(reader.listenerCount('error'), 0);
   assert.deepEqual(await owner.close(new UsenetEngineClosedError()), []);
 });
 

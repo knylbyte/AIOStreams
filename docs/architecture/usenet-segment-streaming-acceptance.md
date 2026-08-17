@@ -48,9 +48,10 @@ canonical concept itself is unchanged.
       by that seal are awaited through their real `close` event without turning
       expected lifecycle errors into engine-cleanup failures. A bounded
       engine-owned terminal-error handoff is installed when each reader is
-      registered, so a synchronous `_destroy()` replacement such as `EIO`
-      remains part of the final aggregate even if `close` preceded engine
-      retirement.
+      registered. Only a reader destroy synchronously marked with an explicit
+      lifecycle cause can publish a later `_destroy()` replacement such as
+      `EIO` into that handoff; ordinary provider/playback errors disappear with
+      their closed reader and cannot poison a later engine retirement.
 - [x] The synchronous HTTP admission fence also publishes one stable process
       abort signal. Early cached-NZB GET/HEAD, stream HEAD, POST/PUT/PATCH and
       every Undici redirect hop observe it. Pre-header shutdown returns the
@@ -65,9 +66,11 @@ canonical concept itself is unchanged.
       publication before engines and the database retire.
 - [x] Final persistence is explicit: every registered disk cache is attempted
       and flush failures are aggregated. Layout/hole/status repository writes
-      use one bounded closeable owner; shutdown stops its eviction/debounce
-      timers, flushes the latest pending values, awaits crossing writes and
-      propagates failures before database close.
+      use one bounded, keyed-serial closeable owner. Each key has at most one
+      active write and one latest-wins successor, so layout invalidation follows
+      an active patch and hole generations cannot finish out of order. Shutdown
+      stops eviction/debounce timers, flushes the latest pending values, awaits
+      crossing writes and propagates failures before database close.
 - [x] Startup orphan cleanup is heartbeat/fence protected and emits a structured
       completion record.
 - [x] Stable spool failures map to actionable user and HTTP/debrid errors.

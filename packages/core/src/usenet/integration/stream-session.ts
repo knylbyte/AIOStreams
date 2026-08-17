@@ -294,6 +294,7 @@ function lazyHooksFor(
         'lazy layout invalidated; clearing persisted layout'
       );
       const accepted = sessionPersistence.run(
+        `layout:${key}`,
         async () => {
           await UsenetLibraryRepository.updateFileLayout(hash, innerPath, null);
         },
@@ -370,6 +371,7 @@ function holeHooksFor(
     if (degradedMarked) return;
     degradedMarked = true;
     const accepted = sessionPersistence.run(
+      `status:${hash}`,
       async () => {
         await UsenetLibraryRepository.setStatus(hash, 'degraded', {
           guard: { notIn: ['failed'] },
@@ -420,6 +422,7 @@ function holeHooksFor(
           'missing_on_providers',
         ];
     const accepted = sessionPersistence.run(
+      `status:${hash}`,
       async () => {
         await UsenetLibraryRepository.markFailed(
           hash,
@@ -653,6 +656,7 @@ async function openStreamSession(
     ) {
       const friendly = friendlyUsenetError(err);
       const accepted = sessionPersistence.run(
+        `status:${hash}`,
         async () => {
           await UsenetLibraryRepository.markFailed(
             hash,

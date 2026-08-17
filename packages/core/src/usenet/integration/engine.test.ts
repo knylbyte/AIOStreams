@@ -376,6 +376,50 @@ test('registry replacement waits for the previous engine reader close', async ()
   await registry.closeAll();
 });
 
+test('registry replacement ignores a completed normal reader failure', async () => {
+  const { UsenetEngineRegistry } = await import('../index.js');
+  const registry = new UsenetEngineRegistry(60_000);
+  const firstProvider: ProviderConfig = {
+    id: 'runtime-error-first',
+    host: '127.0.0.1',
+    port: 119,
+    tls: false,
+    maxConnections: 1,
+    priority: 0,
+  };
+  const first = await registry.get([firstProvider], {
+    ...DEFAULT_ENGINE_OPTIONS,
+    segmentDiskCacheBytes: 0,
+  });
+  const runtimeError = Object.assign(new Error('provider read failed'), {
+    code: 'EIO',
+  });
+  const reader = new BarrierReader(Promise.resolve());
+  const observed: unknown[] = [];
+  reader.once('error', (error) => observed.push(error));
+  const tracked = (first as unknown as EngineTestAccess).track(
+    barrierNzb,
+    seekableReturning(reader)
+  );
+  const publicReader = tracked.createReadStream();
+  const closed = new Promise<void>((resolve) =>
+    publicReader.once('close', resolve)
+  );
+  publicReader.destroy(runtimeError);
+  await closed;
+  assert.deepEqual(observed, [runtimeError]);
+
+  const second = await registry.get(
+    [{ ...firstProvider, id: 'runtime-error-second', port: 120 }],
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      segmentDiskCacheBytes: 0,
+    }
+  );
+  assert.notEqual(second, first);
+  await registry.closeAll();
+});
+
 test('engine close accepts a reader already stopped by the stream registry shutdown', async () => {
   const [{ UsenetEngine }, { StreamRegistry }] = await Promise.all([
     import('../index.js'),

@@ -52,16 +52,18 @@ const MAX_RETAINED_READER_ERRORS = 64;
 interface TrackedReaderState {
   readonly stream: Readable;
   readonly closed: Promise<void>;
+  lifecycleTermination?: Error;
 }
 
 /**
  * Engine-owned lifecycle registry for handed-out readers.
  *
  * Error observation starts synchronously at registration, before another
- * lifecycle owner can destroy the stream. Normal readers disappear on
- * `close`; unexpected terminal errors remain in a fixed-size handoff until
- * engine close consumes them. This preserves synchronous `_destroy()`
- * replacement failures without retaining an unbounded history of streams.
+ * lifecycle owner can destroy the stream. A destroy with one of the explicit
+ * lifecycle causes is marked before Node enters `_destroy()`. Only an
+ * unexpected replacement error emitted by that marked cleanup remains in the
+ * fixed-size engine-close handoff; ordinary playback/provider errors disappear
+ * with their reader on `close`.
  */
 export class TrackedReaderOwner {
   private readonly readers = new Map<number, TrackedReaderState>();
@@ -81,21 +83,41 @@ export class TrackedReaderOwner {
       throw new Error('Usenet reader id is already registered');
     }
     const closed = Promise.withResolvers<void>();
+    const state: TrackedReaderState = {
+      stream,
+      closed: closed.promise,
+    };
+    const originalDestroy = stream.destroy;
+    const trackedDestroy: typeof stream.destroy = function (
+      this: Readable,
+      error?: Error
+    ) {
+      if (isExpectedReaderTermination(error)) {
+        state.lifecycleTermination ??= error;
+      }
+      return originalDestroy.call(this, error);
+    };
     let terminalErrorRecorded = false;
     const onError = (error: unknown): void => {
-      if (!terminalErrorRecorded && !isExpectedReaderTermination(error)) {
+      if (
+        state.lifecycleTermination &&
+        !terminalErrorRecorded &&
+        !isExpectedReaderTermination(error)
+      ) {
         terminalErrorRecorded = true;
         this.recordError(error);
       }
     };
     const onClose = (): void => {
       stream.removeListener('error', onError);
+      if (stream.destroy === trackedDestroy) stream.destroy = originalDestroy;
       this.readers.delete(id);
       closed.resolve();
     };
+    stream.destroy = trackedDestroy;
     stream.on('error', onError);
     stream.once('close', onClose);
-    this.readers.set(id, { stream, closed: closed.promise });
+    this.readers.set(id, state);
   }
 
   /** Destroy the active snapshot, await real close, then consume saved errors. */
