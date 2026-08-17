@@ -23,6 +23,7 @@ import {
   DiskBackedCache,
   DiskBackedCacheError,
   type DiskBackedCacheFileSystem,
+  type DiskFileLease,
   type DiskPreparedFile,
 } from './disk-backed-cache.js';
 
@@ -102,6 +103,136 @@ async function writePersistentEntry(
     JSON.stringify({ [fileKey(key)]: { size: body.length } })
   );
   return { dataPath, indexPath };
+}
+
+function hasParticipantLimitError(error: unknown): boolean {
+  if (
+    error instanceof DiskBackedCacheError &&
+    error.code === 'DISK_CACHE_DELETE_PARTICIPANT_LIMIT'
+  ) {
+    return true;
+  }
+  return (
+    error instanceof AggregateError &&
+    error.errors.some((candidate: unknown) =>
+      hasParticipantLimitError(candidate)
+    )
+  );
+}
+
+interface SaturatedDeletePath {
+  readonly owner: DiskBackedCache<Buffer>;
+  readonly lease: DiskFileLease;
+  readonly dataPath: string;
+  readonly deleteCalls: () => number;
+}
+
+async function saturateDeleteParticipants(
+  context: TestContext,
+  root: string,
+  key: string
+): Promise<SaturatedDeletePath> {
+  const owner = createCache(context, root, { maxDiskBytes: 16 });
+  await owner.whenReady();
+  assert.equal(
+    await owner.installPreparedFile(
+      key,
+      await prepared(owner, Buffer.from('old!')),
+      4
+    ),
+    true
+  );
+  await owner.flush();
+  const lease = await owner.acquireDiskFile(key);
+  assert(lease);
+  const dataPath = lease.path;
+  await rm(path.join(root, 'test-cache.index.json'), { force: true });
+
+  let deleteCalls = 0;
+  const guardedRm: DiskBackedCacheFileSystem['rm'] = async (
+    candidate,
+    options
+  ) => {
+    if (String(candidate) === dataPath) deleteCalls++;
+    return rm(candidate, options);
+  };
+  for (let index = 0; index < DISK_CACHE_DELETE_PARTICIPANT_LIMIT; index++) {
+    const participant = createCache(context, root, {
+      maxDiskBytes: 16,
+      fileSystem: { rm: guardedRm },
+    });
+    await participant.whenReady();
+  }
+  assert.equal(deleteCalls, 0);
+  return { owner, lease, dataPath, deleteCalls: () => deleteCalls };
+}
+
+interface LeasedSuccessorPath {
+  readonly owner: DiskBackedCache<Buffer>;
+  readonly observer: DiskBackedCache<Buffer>;
+  readonly lease: DiskFileLease;
+  readonly dataPath: string;
+}
+
+async function createLeasedSuccessorPath(
+  context: TestContext,
+  root: string,
+  key: string,
+  currentDelete: DiskBackedCacheFileSystem['rm']
+): Promise<LeasedSuccessorPath> {
+  const directory = path.join(root, 'test-cache');
+  const dataPath = path.join(directory, fileKey(key));
+  await mkdir(directory, { recursive: true });
+  let deletePhase = false;
+  const owner = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath && deletePhase) {
+          return currentDelete(candidate, options);
+        }
+        return rm(candidate, options);
+      },
+    },
+  });
+  await owner.whenReady();
+  await writeFile(dataPath, 'old!', { mode: 0o600 });
+
+  const candidateObserved = deferred();
+  const continueObservation = deferred();
+  let targetLstatCalls = 0;
+  const scanner = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      lstat: async (candidate) => {
+        const stats = await lstat(candidate);
+        if (String(candidate) === dataPath && ++targetLstatCalls === 1) {
+          candidateObserved.resolve();
+          await continueObservation.promise;
+        }
+        return stats;
+      },
+    },
+  });
+  await candidateObserved.promise;
+  assert.equal(
+    await owner.installPreparedFile(
+      key,
+      await prepared(owner, Buffer.from('new!')),
+      4
+    ),
+    true
+  );
+  await owner.flush();
+  const observer = createCache(context, root, { maxDiskBytes: 16 });
+  await observer.whenReady();
+  const lease = await owner.acquireDiskFile(key);
+  assert(lease);
+  continueObservation.resolve();
+  await scanner.whenReady();
+  deletePhase = true;
+  assert.equal(await owner.delete(key), true);
+  return { owner, observer, lease, dataPath };
 }
 
 test('prepared installs are atomic, touch LRU, and account serialized bytes', async (context) => {
@@ -2885,7 +3016,6 @@ test('process path delete participants are hard-bounded with a typed error', asy
     fileSystem: { rm: guardedRm },
   });
   participants.push(first);
-  context.after(() => rm(root, { recursive: true, force: true }));
   await deleteEntered.promise;
   for (let index = 1; index < DISK_CACHE_DELETE_PARTICIPANT_LIMIT; index++) {
     const participant = createCache(context, root, {
@@ -2922,6 +3052,365 @@ test('process path delete participants are hard-bounded with a typed error', asy
   await Promise.all(participants.map((participant) => participant.flush()));
   assert.equal(deleteCalls, 1);
   await assert.rejects(access(dataPath), { code: 'ENOENT' });
+
+  const replacement = createCache(context, root, { maxDiskBytes: 16 });
+  await replacement.whenReady();
+  context.after(() => rm(root, { recursive: true, force: true }));
+  assert.equal(
+    await replacement.installPreparedFile(
+      'intent-limit',
+      await prepared(replacement, Buffer.from('new!')),
+      4
+    ),
+    true
+  );
+  await assert.rejects(overflow.close(), hasParticipantLimitError);
+  assert.equal((await readFile(dataPath)).toString(), 'new!');
+  assert.equal(deleteCalls, 1);
+});
+
+test('a 65th clear cannot publish a stale delete for a later incarnation', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-cap-clear-'));
+  const key = 'cap-clear';
+  const writer = createCache(context, root, { maxDiskBytes: 16 });
+  await writer.whenReady();
+  const saturated = await saturateDeleteParticipants(context, root, key);
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  await assert.rejects(saturated.owner.clear(), hasParticipantLimitError);
+  assert.deepEqual(
+    {
+      diskBytes: saturated.owner.stats().diskBytes,
+      diskCount: saturated.owner.stats().diskCount,
+    },
+    { diskBytes: 4, diskCount: 1 }
+  );
+
+  await saturated.lease.release();
+  assert.equal(saturated.deleteCalls(), 1);
+  await assert.rejects(access(saturated.dataPath), { code: 'ENOENT' });
+
+  assert.equal(
+    await writer.installPreparedFile(
+      key,
+      await prepared(writer, Buffer.from('new!')),
+      4
+    ),
+    true
+  );
+  await writer.flush();
+  await saturated.owner.flush();
+  await saturated.owner.close();
+  assert.equal((await readFile(saturated.dataPath)).toString(), 'new!');
+  assert.equal(saturated.deleteCalls(), 1);
+});
+
+test('a saturated explicit delete leaves no unbound retryable state', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-cap-delete-'));
+  const key = 'cap-delete';
+  const writer = createCache(context, root, { maxDiskBytes: 16 });
+  await writer.whenReady();
+  const saturated = await saturateDeleteParticipants(context, root, key);
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  await assert.rejects(saturated.owner.delete(key), hasParticipantLimitError);
+  assert.equal(saturated.owner.stats().diskCount, 1);
+  await saturated.lease.release();
+
+  assert.equal(
+    await writer.installPreparedFile(
+      key,
+      await prepared(writer, Buffer.from('next')),
+      4
+    ),
+    true
+  );
+  await saturated.owner.flush();
+  await saturated.owner.close();
+  assert.equal((await readFile(saturated.dataPath)).toString(), 'next');
+  assert.equal(saturated.deleteCalls(), 1);
+});
+
+test('LRU saturation retains the over-budget entry without a latent delete', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-cap-lru-'));
+  const key = 'cap-lru';
+  const writer = createCache(context, root, { maxDiskBytes: 16 });
+  await writer.whenReady();
+  const saturated = await saturateDeleteParticipants(context, root, key);
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  saturated.owner.resize(0, 0);
+  assert.deepEqual(
+    {
+      diskBytes: saturated.owner.stats().diskBytes,
+      diskCount: saturated.owner.stats().diskCount,
+    },
+    { diskBytes: 4, diskCount: 1 }
+  );
+  await saturated.lease.release();
+
+  assert.equal(
+    await writer.installPreparedFile(
+      key,
+      await prepared(writer, Buffer.from('safe')),
+      4
+    ),
+    true
+  );
+  await saturated.owner.flush();
+  await saturated.owner.close();
+  assert.equal((await readFile(saturated.dataPath)).toString(), 'safe');
+  assert.equal(saturated.deleteCalls(), 1);
+});
+
+test('participant capacity is reusable only by a newly initiated delete', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-cap-reuse-'));
+  const key = 'cap-reuse';
+  const writer = createCache(context, root, { maxDiskBytes: 16 });
+  await writer.whenReady();
+  const saturated = await saturateDeleteParticipants(context, root, key);
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  await assert.rejects(saturated.owner.delete(key), hasParticipantLimitError);
+  await saturated.lease.release();
+  assert.equal(
+    await writer.installPreparedFile(
+      key,
+      await prepared(writer, Buffer.from('next')),
+      4
+    ),
+    true
+  );
+
+  assert.equal(await saturated.owner.delete(key), true);
+  await saturated.owner.flush();
+  await assert.rejects(access(saturated.dataPath), { code: 'ENOENT' });
+  assert.equal(saturated.deleteCalls(), 1);
+});
+
+test('the final file lease waits through a predecessor to its paused successor delete', async (context) => {
+  const root = await mkdtemp(
+    path.join(tmpdir(), 'disk-cache-lease-successor-')
+  );
+  const deleteEntered = deferred();
+  const continueDelete = deferred();
+  const scenario = await createLeasedSuccessorPath(
+    context,
+    root,
+    'lease-successor',
+    async (candidate, options) => {
+      deleteEntered.resolve();
+      await continueDelete.promise;
+      return rm(candidate, options);
+    }
+  );
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  let releaseSettled = false;
+  const release = scenario.lease.release().then(() => {
+    releaseSettled = true;
+  });
+  await deleteEntered.promise;
+  await Promise.resolve();
+  assert.equal(releaseSettled, false);
+  assert.equal((await readFile(scenario.dataPath)).toString(), 'new!');
+
+  continueDelete.resolve();
+  await release;
+  assert.equal(releaseSettled, true);
+  await assert.rejects(access(scenario.dataPath), { code: 'ENOENT' });
+  await Promise.all([scenario.owner.flush(), scenario.observer.flush()]);
+});
+
+test('the final file lease idempotently propagates a successor error and leaves it retryable', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-lease-error-'));
+  let deleteCalls = 0;
+  const scenario = await createLeasedSuccessorPath(
+    context,
+    root,
+    'lease-error',
+    async (candidate, options) => {
+      deleteCalls++;
+      if (deleteCalls === 1) throw codedError('EBUSY');
+      return rm(candidate, options);
+    }
+  );
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  const release = scenario.lease.release();
+  assert.strictEqual(scenario.lease.release(), release);
+  await assert.rejects(
+    release,
+    (error: unknown) =>
+      error instanceof Error && 'code' in error && error.code === 'EBUSY'
+  );
+  assert.strictEqual(scenario.lease.release(), release);
+  assert.equal((await readFile(scenario.dataPath)).toString(), 'new!');
+  assert.equal(
+    await scenario.observer.acquireDiskFile('lease-error'),
+    undefined
+  );
+  assert.equal(
+    await scenario.owner.installPreparedFile(
+      'lease-error',
+      await prepared(scenario.owner, Buffer.from('nope')),
+      4
+    ),
+    false
+  );
+
+  await scenario.owner.flush();
+  assert.equal(deleteCalls, 2);
+  await assert.rejects(access(scenario.dataPath), { code: 'ENOENT' });
+});
+
+test('a non-final lease returns promptly while the final lease owns delete completion', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-lease-final-'));
+  const deleteEntered = deferred();
+  const continueDelete = deferred();
+  let deleteCalls = 0;
+  const dataPath = path.join(root, 'test-cache', fileKey('lease-final'));
+  const cache = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath) {
+          deleteCalls++;
+          deleteEntered.resolve();
+          await continueDelete.promise;
+        }
+        return rm(candidate, options);
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await cache.whenReady();
+  assert.equal(
+    await cache.installPreparedFile(
+      'lease-final',
+      await prepared(cache, Buffer.from('data')),
+      4
+    ),
+    true
+  );
+  const first = await cache.acquireDiskFile('lease-final');
+  const second = await cache.acquireDiskFile('lease-final');
+  assert(first);
+  assert(second);
+  assert.equal(await cache.delete('lease-final'), true);
+
+  const firstRelease = first.release();
+  assert.strictEqual(first.release(), firstRelease);
+  await firstRelease;
+  assert.equal(deleteCalls, 0);
+
+  let finalSettled = false;
+  const finalReleaseCompletion = second.release();
+  assert.strictEqual(second.release(), finalReleaseCompletion);
+  const finalRelease = finalReleaseCompletion.then(() => {
+    finalSettled = true;
+  });
+  await deleteEntered.promise;
+  await Promise.resolve();
+  assert.equal(finalSettled, false);
+  continueDelete.resolve();
+  await finalRelease;
+  assert.equal(finalSettled, true);
+  assert.strictEqual(second.release(), finalReleaseCompletion);
+  assert.equal(deleteCalls, 1);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+});
+
+test('the final lease follows two observed predecessors to its own delete intent', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-lease-chain-'));
+  const directory = path.join(root, 'test-cache');
+  const key = 'lease-chain';
+  const dataPath = path.join(directory, fileKey(key));
+  await mkdir(directory, { recursive: true });
+  let deletePhase = false;
+  let deleteCalls = 0;
+  const owner = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      rm: async (candidate, options) => {
+        if (deletePhase && String(candidate) === dataPath) deleteCalls++;
+        return rm(candidate, options);
+      },
+    },
+  });
+  await owner.whenReady();
+  await writeFile(dataPath, 'one!', { mode: 0o600 });
+
+  const firstObserved = deferred();
+  const continueFirst = deferred();
+  let firstLstatCalls = 0;
+  const first = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      lstat: async (candidate) => {
+        const stats = await lstat(candidate);
+        if (String(candidate) === dataPath) {
+          firstLstatCalls++;
+          if (firstLstatCalls === 1) {
+            firstObserved.resolve();
+            await continueFirst.promise;
+          }
+        }
+        return stats;
+      },
+    },
+  });
+  await firstObserved.promise;
+  await rm(dataPath, { force: true });
+  await writeFile(dataPath, 'two!', { mode: 0o600 });
+
+  const secondObserved = deferred();
+  const continueSecond = deferred();
+  let secondLstatCalls = 0;
+  const second = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: {
+      lstat: async (candidate) => {
+        const stats = await lstat(candidate);
+        if (String(candidate) === dataPath) {
+          secondLstatCalls++;
+          if (secondLstatCalls === 1) {
+            secondObserved.resolve();
+            await continueSecond.promise;
+          }
+        }
+        return stats;
+      },
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await secondObserved.promise;
+  assert.equal(
+    await owner.installPreparedFile(
+      key,
+      await prepared(owner, Buffer.from('last')),
+      4
+    ),
+    true
+  );
+  await owner.flush();
+  const lease = await owner.acquireDiskFile(key);
+  assert(lease);
+
+  continueFirst.resolve();
+  await first.whenReady();
+  continueSecond.resolve();
+  await second.whenReady();
+  deletePhase = true;
+  assert.equal(await owner.delete(key), true);
+  await lease.release();
+
+  assert.equal(firstLstatCalls, 2);
+  assert.equal(secondLstatCalls, 2);
+  assert.equal(deleteCalls, 1);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  await Promise.all([first.flush(), second.flush(), owner.flush()]);
+  assert.equal(deleteCalls, 1);
 });
 
 test('stale background destination cleanup remains retryable after clear', async (context) => {

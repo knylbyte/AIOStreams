@@ -143,6 +143,11 @@ export interface DiskFileLease {
   confirmHit(): void;
   /** Finalize it as one miss and invalidate the structurally corrupt entry. */
   invalidateAsMiss(): void;
+  /**
+   * Release exactly once. A non-final process lease resolves immediately; the
+   * final lease observes every bounded predecessor through the delete intent
+   * bound to this local entry and propagates that required attempt's failure.
+   */
   release(): Promise<void>;
 }
 
@@ -179,6 +184,8 @@ interface UnindexedDeleteState {
   readonly candidateFingerprint?: DiskPathFingerprint;
   operation?: Promise<void>;
   deleteIntent?: ProcessPathDeleteIntent;
+  /** Admission saturation is terminal for this unadmitted local cleanup target. */
+  admissionError?: DiskBackedCacheError;
   lastError?: unknown;
 }
 
@@ -341,6 +348,7 @@ interface ProcessPathDeleteIntent {
 interface ProcessPathOwnershipState {
   leases: number;
   mutationClaimed: boolean;
+  mutationRelease?: PromiseWithResolvers<void>;
   deleteIntent?: ProcessPathDeleteIntent;
   /** FIFO target successors; total participants are bounded per path. */
   readonly deleteSuccessors: ProcessPathDeleteIntent[];
@@ -352,6 +360,7 @@ interface ProcessPathMutationClaim {
 }
 
 interface ProcessPathLeaseRelease {
+  readonly wasFinalProcessLease: boolean;
   readonly completion: Promise<void>;
 }
 
@@ -414,6 +423,7 @@ function cleanupProcessPathState(
   if (
     state.leases === 0 &&
     !state.mutationClaimed &&
+    !state.mutationRelease &&
     !state.deleteIntent &&
     state.deleteSuccessors.length === 0 &&
     state.deleteParticipants === 0 &&
@@ -569,23 +579,75 @@ function tryAcquireProcessPathLease(filePath: string): boolean {
   return true;
 }
 
-function releaseProcessPathLease(filePath: string): ProcessPathLeaseRelease {
+async function waitForProcessPathDeleteIntent(
+  resolved: string,
+  state: ProcessPathOwnershipState,
+  participant: ProcessPathDeleteIntent
+): Promise<void> {
+  // A path can contain at most one intent per registered participant. Two
+  // observations per participant cover an active/predecessor handoff plus one
+  // bounded mutation-release transition. No polling or retry is involved.
+  const maxTurns = DISK_CACHE_DELETE_PARTICIPANT_LIMIT * 2 + 2;
+  for (let turn = 0; turn < maxTurns; turn++) {
+    if (participant.status === 'resolved') return;
+    if (!hasProcessPathDeleteIntent(state, participant)) {
+      throw new Error('Disk cache delete-intent invariant violated');
+    }
+    const current = state.deleteIntent;
+    if (!current) {
+      throw new Error('Disk cache delete-successor invariant violated');
+    }
+    if (current.attempt) {
+      await current.attempt;
+      continue;
+    }
+    if (state.leases > 0) {
+      throw new Error('Disk cache final-lease invariant violated');
+    }
+    if (state.mutationClaimed) {
+      const mutationRelease = state.mutationRelease;
+      if (!mutationRelease) {
+        throw new Error('Disk cache mutation-release invariant violated');
+      }
+      await mutationRelease.promise;
+      continue;
+    }
+    const attempt = startProcessPathDeleteAttempt(resolved, state, current);
+    if (!attempt.operation) {
+      throw new Error('Disk cache delete-attempt invariant violated');
+    }
+    await attempt.operation;
+  }
+  throw new Error('Disk cache delete completion progress limit exceeded');
+}
+
+function releaseProcessPathLease(
+  filePath: string,
+  participant?: ProcessPathDeleteIntent
+): ProcessPathLeaseRelease {
   const resolved = resolvedFilePath(filePath);
   const state = processPathOwnership.get(resolved);
   if (!state || state.leases <= 0) {
     throw new Error('Disk cache process lease accounting invariant violated');
   }
   state.leases--;
-  if (state.leases === 0 && state.deleteIntent && !state.mutationClaimed) {
-    const result = startProcessPathDeleteAttempt(
-      resolved,
-      state,
-      state.deleteIntent
-    );
-    return { completion: result.operation ?? Promise.resolve() };
+  const wasFinalProcessLease = state.leases === 0;
+  if (!wasFinalProcessLease) {
+    return { wasFinalProcessLease, completion: Promise.resolve() };
+  }
+  const awaitedIntent = participant ?? state.deleteIntent;
+  if (awaitedIntent) {
+    return {
+      wasFinalProcessLease,
+      completion: waitForProcessPathDeleteIntent(
+        resolved,
+        state,
+        awaitedIntent
+      ),
+    };
   }
   cleanupProcessPathState(resolved, state);
-  return { completion: Promise.resolve() };
+  return { wasFinalProcessLease, completion: Promise.resolve() };
 }
 
 function tryClaimProcessPathMutation(
@@ -598,15 +660,25 @@ function tryClaimProcessPathMutation(
     return undefined;
   }
   state.mutationClaimed = true;
+  const mutationRelease = Promise.withResolvers<void>();
+  state.mutationRelease = mutationRelease;
   let releasePromise: Promise<void> | undefined;
   return {
     release: () => {
       if (releasePromise) return releasePromise;
       state.mutationClaimed = false;
-      const attempt = state.deleteIntent
-        ? startProcessPathDeleteAttempt(resolved, state, state.deleteIntent)
-        : undefined;
-      releasePromise = attempt?.operation ?? Promise.resolve();
+      state.mutationRelease = undefined;
+      try {
+        const attempt = state.deleteIntent
+          ? startProcessPathDeleteAttempt(resolved, state, state.deleteIntent)
+          : undefined;
+        releasePromise = attempt?.operation ?? Promise.resolve();
+      } catch (error) {
+        releasePromise = Promise.reject(error);
+      }
+      // Publish progress after a queued delete has been started under the same
+      // synchronous fence. Final lease releasers can now observe that attempt.
+      mutationRelease.resolve();
       cleanupProcessPathState(resolved, state);
       return releasePromise;
     },
@@ -1055,7 +1127,12 @@ export class DiskBackedCache<V> {
         // There must be no await between the confirmed stale observation and
         // intent publication. Physical ENOENT confirmation remains tied to
         // this intent and may safely run after the lease is released.
-        this.dropDisk(fileKey);
+        try {
+          this.dropDisk(fileKey);
+        } catch (deleteError) {
+          await this.releaseFileLease(fileKey, state);
+          throw deleteError;
+        }
         await this.releaseInvalidatedFileLease(fileKey, state);
         if (signal?.aborted) throw signal.reason;
         this.misses++;
@@ -1498,6 +1575,7 @@ export class DiskBackedCache<V> {
     }
     const leaseState = this.fileLeases.get(fileKey);
     if (leaseState?.pendingDelete && leaseState.leases === 0) {
+      if (leaseState.deleteIntent?.lastError !== undefined) return false;
       try {
         await this.startPhysicalDelete(fileKey, leaseState);
       } catch (error) {
@@ -1712,30 +1790,43 @@ export class DiskBackedCache<V> {
         }
       }
       if (oldest === undefined) break;
-      this.dropDisk(oldest);
+      try {
+        this.dropDisk(oldest);
+      } catch (error) {
+        if (
+          error instanceof DiskBackedCacheError &&
+          error.code === 'DISK_CACHE_DELETE_PARTICIPANT_LIMIT'
+        ) {
+          // Admission saturation keeps the immutable LRU entry and accounting
+          // intact. A later explicit eviction may retry after the bounded
+          // process-wide participant chain has completed.
+          break;
+        }
+        throw error;
+      }
     }
   }
 
   private dropDisk(fileKey: string): void {
     const entry = this.disk.get(fileKey);
     if (!entry) return;
+    const state = this.fileLeases.get(fileKey) ?? {
+      leases: 0,
+      pendingDelete: false,
+    };
+    // Reserve and bind the bounded process-wide participant before publishing
+    // any local logical deletion. `requestProcessPathDelete()` is synchronous;
+    // filesystem I/O begins in its following microtask. Capacity rejection
+    // therefore leaves disk/index/accounting and local retry state untouched.
+    const deletion = this.startPhysicalDelete(fileKey, state);
+    state.pendingDelete = true;
+    this.fileLeases.set(fileKey, state);
     this.disk.delete(fileKey);
     this.diskBytes -= entry.size;
     this.assertDiskAccounting();
     this.indexDirty = true;
     this.scheduleIndexFlush();
-    const state = this.fileLeases.get(fileKey) ?? {
-      leases: 0,
-      pendingDelete: false,
-    };
-    state.pendingDelete = true;
-    this.fileLeases.set(fileKey, state);
-    // The process-wide delete intent is registered synchronously with logical
-    // eviction, even when this cache owns a lease. This is the linearization
-    // point that rejects every later process-local lease. Physical removal is
-    // still deferred by the shared ownership registry until its final old
-    // lease is released.
-    void this.startPhysicalDelete(fileKey, state).catch(() => undefined);
+    void deletion.catch(() => undefined);
   }
 
   private async releaseFileLease(
@@ -1749,7 +1840,10 @@ export class DiskBackedCache<V> {
     state.leases--;
     let processReleaseError: unknown;
     try {
-      const processRelease = releaseProcessPathLease(this.filePath(fileKey));
+      const processRelease = releaseProcessPathLease(
+        this.filePath(fileKey),
+        state.pendingDelete ? state.deleteIntent : undefined
+      );
       await processRelease.completion;
     } catch (error) {
       processReleaseError = error;
@@ -1896,7 +1990,7 @@ export class DiskBackedCache<V> {
     const currentIntent = state.deleteIntent;
     if (currentIntent?.status === 'resolved') {
       this.completeFileDeleteIntent(fileKey, state, currentIntent);
-      return currentIntent.completion.then(() => undefined);
+      return this.startPhysicalDelete(fileKey, state);
     }
     if (currentIntent) {
       return (
@@ -1904,12 +1998,7 @@ export class DiskBackedCache<V> {
         Promise.resolve()
       );
     }
-    let registration: ProcessPathDeleteRegistration;
-    try {
-      registration = requestProcessPathDelete(dataPath, request);
-    } catch (error) {
-      return Promise.reject(error);
-    }
+    const registration = requestProcessPathDelete(dataPath, request);
     this.bindFileDeleteIntent(fileKey, state, registration.intent);
     return registration.startedOperation ?? Promise.resolve();
   }
@@ -1939,6 +2028,12 @@ export class DiskBackedCache<V> {
   }
 
   private startUnindexedPathDelete(state: UnindexedDeleteState): Promise<void> {
+    if (state.admissionError) {
+      if (this.unindexedDeletes.get(state.path) === state) {
+        this.unindexedDeletes.delete(state.path);
+      }
+      return Promise.reject(state.admissionError);
+    }
     if (state.operation) return state.operation;
     let deletion: Promise<void> | undefined;
     const target: ProcessPathDeleteTarget = state.candidateFingerprint
@@ -1989,6 +2084,15 @@ export class DiskBackedCache<V> {
     try {
       registration = requestProcessPathDelete(state.path, request);
     } catch (error) {
+      if (
+        error instanceof DiskBackedCacheError &&
+        error.code === 'DISK_CACHE_DELETE_PARTICIPANT_LIMIT'
+      ) {
+        // This local cleanup target was never admitted and must never become a
+        // later current-incarnation retry. Startup reconciliation in a future
+        // cache generation may observe the path again under a fresh target.
+        state.admissionError = error;
+      }
       return Promise.reject(error);
     }
     this.bindUnindexedDeleteIntent(state, registration.intent);
@@ -2100,21 +2204,22 @@ export class DiskBackedCache<V> {
   }
 
   async delete(key: string): Promise<boolean> {
-    let removed = false;
     const memEntry = this.mem.get(key);
-    if (memEntry) {
-      this.mem.delete(key);
-      this.memBytes -= memEntry.size;
-      removed = true;
-    }
     const fileKey = this.fileKey(key);
     const pending = this.pendingWrites.get(fileKey);
     if (pending) await pending.catch(() => undefined);
-    if (this.disk.has(fileKey)) {
+    const diskEntry = this.disk.has(fileKey);
+    // Disk-delete admission precedes every logical tier mutation. If the
+    // bounded participant registry is saturated, the explicit delete rejects
+    // without leaving either tier partially removed or retryable by accident.
+    if (diskEntry) {
       this.dropDisk(fileKey);
-      removed = true;
     }
-    return removed;
+    if (memEntry && this.mem.get(key) === memEntry) {
+      this.mem.delete(key);
+      this.memBytes -= memEntry.size;
+    }
+    return memEntry !== undefined || diskEntry;
   }
 
   clear(): Promise<void> {
