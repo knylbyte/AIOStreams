@@ -172,14 +172,14 @@ async function awaitSessionOpenStep<T>(
 }
 
 /**
- * Fence and settle every native session-open owner before engines/DB close.
- * The fence is synchronous; the returned idempotent promise is the task-finally
- * barrier. Warm handles are dropped because their owning engines retire next.
+ * Fence and settle native session opening before engines retire. Repository
+ * persistence deliberately remains open until every admitted reader producer
+ * has stopped during engine close.
  */
-let sessionShutdownPromise: Promise<void> | undefined;
+let sessionOpeningShutdownPromise: Promise<void> | undefined;
 
 export function shutdownNativeUsenetSessionOpens(): Promise<void> {
-  if (sessionShutdownPromise) return sessionShutdownPromise;
+  if (sessionOpeningShutdownPromise) return sessionOpeningShutdownPromise;
   if (sessionEvictionTimer) clearInterval(sessionEvictionTimer);
   sessionEvictionTimer = undefined;
   streamSessions.clear();
@@ -187,19 +187,20 @@ export function shutdownNativeUsenetSessionOpens(): Promise<void> {
   const openingClose = openingSessions.close(
     new StreamStoppedError('shutdown')
   );
-  const persistenceClose = sessionPersistence.close();
-  sessionShutdownPromise = Promise.allSettled([
-    openingClose,
-    persistenceClose,
-  ]).then((results) => {
-    const errors = results.flatMap((result) =>
-      result.status === 'rejected' ? [result.reason] : []
-    );
-    if (errors.length > 0) {
-      throw new AggregateError(errors, 'Native usenet session shutdown failed');
+  sessionOpeningShutdownPromise = Promise.allSettled([openingClose]).then(
+    (results) => {
+      const errors = results.flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : []
+      );
+      if (errors.length > 0) {
+        throw new AggregateError(
+          errors,
+          'Native usenet session shutdown failed'
+        );
+      }
     }
-  });
-  return sessionShutdownPromise;
+  );
+  return sessionOpeningShutdownPromise;
 }
 
 let sessionEvictionTimer: NodeJS.Timeout | undefined = setInterval(() => {
@@ -236,6 +237,13 @@ async function loadArchiveLayout(
 
 const LAYOUT_PATCH_DEBOUNCE_MS = 2_000;
 const sessionPersistence = new RepositoryPersistenceOwner();
+let sessionPersistenceShutdownPromise: Promise<void> | undefined;
+
+/** Close repository persistence only after every engine reader has stopped. */
+export function shutdownNativeUsenetSessionPersistence(): Promise<void> {
+  sessionPersistenceShutdownPromise ??= sessionPersistence.close();
+  return sessionPersistenceShutdownPromise;
+}
 
 function persistenceRejected(kind: string, key: string): void {
   logger.debug(
@@ -287,7 +295,6 @@ function lazyHooksFor(
       if (!accepted) persistenceRejected('layout', key);
     },
     onInvalid: (err: Error) => {
-      sessionPersistence.cancel(`layout:${key}`);
       streamSessions.delete(sessionKey);
       logger.warn(
         { hash, innerPath, err: err.message },
@@ -371,7 +378,7 @@ function holeHooksFor(
     if (degradedMarked) return;
     degradedMarked = true;
     const accepted = sessionPersistence.run(
-      `status:${hash}`,
+      `status:degraded:${hash}`,
       async () => {
         await UsenetLibraryRepository.setStatus(hash, 'degraded', {
           guard: { notIn: ['failed'] },
@@ -422,7 +429,7 @@ function holeHooksFor(
           'missing_on_providers',
         ];
     const accepted = sessionPersistence.run(
-      `status:${hash}`,
+      `status:failed:${hash}`,
       async () => {
         await UsenetLibraryRepository.markFailed(
           hash,
@@ -656,7 +663,7 @@ async function openStreamSession(
     ) {
       const friendly = friendlyUsenetError(err);
       const accepted = sessionPersistence.run(
-        `status:${hash}`,
+        `status:failed:${hash}`,
         async () => {
           await UsenetLibraryRepository.markFailed(
             hash,

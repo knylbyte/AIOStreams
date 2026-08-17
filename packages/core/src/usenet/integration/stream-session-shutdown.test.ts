@@ -11,6 +11,7 @@ import { downloadManager } from '../../utils/download-manager.js';
 import {
   openNativeUsenetStream,
   shutdownNativeUsenetSessionOpens,
+  shutdownNativeUsenetSessionPersistence,
   shutdownUsenetEngines,
   usenetEngineRegistry,
 } from './index.js';
@@ -106,6 +107,7 @@ test('native request stopped during session open creates no late reader or engin
     await upstreamClosed.promise;
     await Promise.all([openingShutdown, grabShutdown]);
     await shutdownUsenetEngines();
+    await shutdownNativeUsenetSessionPersistence();
 
     await rejected;
     assert.deepEqual(streamRegistry.snapshot(), []);

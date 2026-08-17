@@ -101,11 +101,18 @@ export class RepositoryPersistenceOwner {
     return true;
   }
 
-  cancel(key: string): void {
+  /**
+   * Remove a pending successor before close begins. The close linearization
+   * point freezes its captured successor set, so later cancellation is a
+   * non-mutating rejection.
+   */
+  cancel(key: string): boolean {
+    if (this.closed) return false;
     const state = this.states.get(key);
-    if (!state?.successor) return;
+    if (!state?.successor) return false;
     this.dropSuccessor(state);
     if (!state.active) this.states.delete(key);
+    return true;
   }
 
   run(

@@ -9,6 +9,7 @@ import {
   ShutdownAdmissionGate,
   ShutdownCoordinator,
 } from './shutdown.js';
+import { closeUsenetOwners } from './usenet-shutdown.js';
 
 class CoordinatedReader extends Readable {
   readonly destroyEntered = Promise.withResolvers<void>();
@@ -291,5 +292,102 @@ describe('shutdown admission and ordering', () => {
     await closing;
     expect(reader.closed).toBe(true);
     expect(registry.snapshot()).toEqual([]);
+  });
+
+  test('reader cleanup can persist before the repository and database fences', async () => {
+    const engineEntered = Promise.withResolvers<void>();
+    const engineGate = Promise.withResolvers<void>();
+    const events: string[] = [];
+    let persistenceOpen = true;
+    let databaseOpen = true;
+    let writes = 0;
+
+    const coordinator = new ShutdownCoordinator({
+      admission: new ShutdownAdmissionGate(),
+      server: () => undefined,
+      stopTasks: () => undefined,
+      sealStreams: () => undefined,
+      beforeListenerClose: [
+        {
+          label: 'usenet owners',
+          run: () =>
+            closeUsenetOwners({
+              closeOpenings: async () => {
+                events.push('openings');
+              },
+              closeGrabs: async () => {
+                events.push('grabs');
+              },
+              closeEngines: async () => {
+                events.push('engine-start');
+                engineEntered.resolve();
+                await engineGate.promise;
+                expect(persistenceOpen).toBe(true);
+                expect(databaseOpen).toBe(true);
+                writes++;
+                events.push('reader-hook-write');
+              },
+              closePersistence: async () => {
+                expect(writes).toBe(1);
+                events.push('persistence-close');
+                persistenceOpen = false;
+              },
+            }),
+        },
+      ],
+      afterListenerClose: [
+        {
+          label: 'database',
+          run: async () => {
+            expect(persistenceOpen).toBe(false);
+            events.push('database-close');
+            databaseOpen = false;
+          },
+        },
+      ],
+    });
+
+    const closing = coordinator.close();
+    expect(events).toEqual(['openings', 'grabs']);
+    await engineEntered.promise;
+    expect(events).toEqual(['openings', 'grabs', 'engine-start']);
+    expect(persistenceOpen).toBe(true);
+    engineGate.resolve();
+    await closing;
+    expect(events.slice(3)).toEqual([
+      'reader-hook-write',
+      'persistence-close',
+      'database-close',
+    ]);
+    expect(writes).toBe(1);
+    expect(databaseOpen).toBe(false);
+  });
+
+  test('engine and repository close failures are both retained', async () => {
+    const engineFailure = new Error('engine cleanup failed');
+    const persistenceFailure = new Error('repository close failed');
+    const events: string[] = [];
+
+    await expect(
+      closeUsenetOwners({
+        closeOpenings: async () => {
+          events.push('openings');
+        },
+        closeGrabs: async () => {
+          events.push('grabs');
+        },
+        closeEngines: async () => {
+          events.push('engines');
+          throw engineFailure;
+        },
+        closePersistence: async () => {
+          events.push('persistence');
+          throw persistenceFailure;
+        },
+      })
+    ).rejects.toMatchObject({
+      errors: [engineFailure, persistenceFailure],
+    });
+    expect(events).toEqual(['openings', 'grabs', 'engines', 'persistence']);
   });
 });

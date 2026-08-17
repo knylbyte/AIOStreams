@@ -7,6 +7,20 @@ import {
 
 const ignoreError = (): void => undefined;
 
+interface StoredStatus {
+  value: 'available' | 'degraded' | 'failed';
+  reason?: string;
+}
+
+function persistDegraded(status: StoredStatus): void {
+  if (status.value !== 'failed') status.value = 'degraded';
+}
+
+function persistFailed(status: StoredStatus, reason: string): void {
+  status.value = 'failed';
+  status.reason = reason;
+}
+
 test('close flushes the latest pending layout and hole writes exactly once', async () => {
   const owner = new RepositoryPersistenceOwner(4, 4);
   const layoutGate = Promise.withResolvers<void>();
@@ -209,7 +223,7 @@ test('multiple writes behind one active key coalesce to the latest successor', a
   await owner.close();
 });
 
-test('different repository keys remain parallel within the active bound', async () => {
+test('status writes for different hashes remain parallel within the active bound', async () => {
   const owner = new RepositoryPersistenceOwner(2, 2);
   const firstEntered = Promise.withResolvers<void>();
   const secondEntered = Promise.withResolvers<void>();
@@ -217,7 +231,7 @@ test('different repository keys remain parallel within the active bound', async 
   const secondGate = Promise.withResolvers<void>();
 
   owner.run(
-    'layout:first',
+    'status:failed:first',
     async () => {
       firstEntered.resolve();
       await firstGate.promise;
@@ -225,7 +239,7 @@ test('different repository keys remain parallel within the active bound', async 
     ignoreError
   );
   owner.run(
-    'layout:second',
+    'status:failed:second',
     async () => {
       secondEntered.resolve();
       await secondGate.promise;
@@ -345,7 +359,7 @@ test('pending and active persistence structures are hard bounded', async () => {
     owner.schedule('two', 60_000, async () => undefined, ignoreError),
     false
   );
-  owner.cancel('one');
+  assert.equal(owner.cancel('one'), true);
   assert.equal(
     owner.run('active', async () => gate.promise, ignoreError),
     true
@@ -372,4 +386,228 @@ test('invalid persistence bounds fail with a stable typed error', () => {
       error instanceof RepositoryPersistenceError &&
       error.code === 'USENET_SESSION_PERSISTENCE_CAPACITY'
   );
+});
+
+test('a later degraded successor cannot displace a pending failed transition', async () => {
+  const owner = new RepositoryPersistenceOwner(4, 1);
+  const activeEntered = Promise.withResolvers<void>();
+  const activeGate = Promise.withResolvers<void>();
+  const status: StoredStatus = { value: 'available' };
+  const calls: string[] = [];
+
+  owner.run(
+    'status:degraded:release',
+    async () => {
+      activeEntered.resolve();
+      await activeGate.promise;
+      persistDegraded(status);
+      calls.push('active degraded');
+    },
+    ignoreError
+  );
+  await activeEntered.promise;
+  assert.equal(
+    owner.run(
+      'status:failed:release',
+      async () => {
+        persistFailed(status, 'terminal');
+        calls.push('failed');
+      },
+      ignoreError
+    ),
+    true
+  );
+  assert.equal(
+    owner.run(
+      'status:degraded:release',
+      async () => {
+        persistDegraded(status);
+        calls.push('later degraded');
+      },
+      ignoreError
+    ),
+    true
+  );
+
+  const closing = owner.close();
+  activeGate.resolve();
+  await closing;
+  assert.equal(status.value, 'failed');
+  assert.equal(status.reason, 'terminal');
+  assert.deepEqual(calls, ['active degraded', 'later degraded', 'failed']);
+});
+
+test('a degraded update cannot resurrect an actively persisted failed status', async () => {
+  const owner = new RepositoryPersistenceOwner(2, 1);
+  const failedEntered = Promise.withResolvers<void>();
+  const failedGate = Promise.withResolvers<void>();
+  const status: StoredStatus = { value: 'available' };
+
+  owner.run(
+    'status:failed:release',
+    async () => {
+      failedEntered.resolve();
+      await failedGate.promise;
+      persistFailed(status, 'terminal');
+    },
+    ignoreError
+  );
+  await failedEntered.promise;
+  owner.run(
+    'status:degraded:release',
+    async () => persistDegraded(status),
+    ignoreError
+  );
+
+  const closing = owner.close();
+  failedGate.resolve();
+  await closing;
+  assert.deepEqual(status, { value: 'failed', reason: 'terminal' });
+});
+
+test('terminal status successors stay bounded and retain the newest reason', async () => {
+  const owner = new RepositoryPersistenceOwner(2, 1);
+  const activeEntered = Promise.withResolvers<void>();
+  const activeGate = Promise.withResolvers<void>();
+  const status: StoredStatus = { value: 'available' };
+  const calls: string[] = [];
+
+  owner.run(
+    'status:failed:release',
+    async () => {
+      activeEntered.resolve();
+      await activeGate.promise;
+      persistFailed(status, 'first');
+      calls.push('first');
+    },
+    ignoreError
+  );
+  await activeEntered.promise;
+  for (const reason of ['second', 'latest']) {
+    assert.equal(
+      owner.run(
+        'status:failed:release',
+        async () => {
+          persistFailed(status, reason);
+          calls.push(reason);
+        },
+        ignoreError
+      ),
+      true
+    );
+  }
+  assert.equal(owner.pendingWrites, 1);
+  assert.equal(owner.trackedKeys, 1);
+
+  const closing = owner.close();
+  activeGate.resolve();
+  await closing;
+  assert.deepEqual(calls, ['first', 'latest']);
+  assert.deepEqual(status, { value: 'failed', reason: 'latest' });
+});
+
+test('parallel sessions preserve failed after a later degradation report', async () => {
+  const owner = new RepositoryPersistenceOwner(2, 2);
+  const failedEntered = Promise.withResolvers<void>();
+  const degradedEntered = Promise.withResolvers<void>();
+  const failedGate = Promise.withResolvers<void>();
+  const degradedGate = Promise.withResolvers<void>();
+  const failedDone = Promise.withResolvers<void>();
+  const status: StoredStatus = { value: 'available' };
+
+  owner.run(
+    'status:failed:shared-release',
+    async () => {
+      failedEntered.resolve();
+      await failedGate.promise;
+      persistFailed(status, 'session-a');
+      failedDone.resolve();
+    },
+    ignoreError
+  );
+  owner.run(
+    'status:degraded:shared-release',
+    async () => {
+      degradedEntered.resolve();
+      await degradedGate.promise;
+      persistDegraded(status);
+    },
+    ignoreError
+  );
+  await Promise.all([failedEntered.promise, degradedEntered.promise]);
+
+  failedGate.resolve();
+  await failedDone.promise;
+  degradedGate.resolve();
+  await owner.close();
+  assert.deepEqual(status, { value: 'failed', reason: 'session-a' });
+});
+
+test('close freezes pending writes against later cancellation and admission', async () => {
+  const owner = new RepositoryPersistenceOwner(2, 1);
+  const entered = Promise.withResolvers<void>();
+  const gate = Promise.withResolvers<void>();
+  let writes = 0;
+
+  owner.schedule(
+    'layout:file',
+    60_000,
+    async () => {
+      writes++;
+      entered.resolve();
+      await gate.promise;
+    },
+    ignoreError
+  );
+  const closing = owner.close();
+  assert.equal(owner.cancel('layout:file'), false);
+  assert.equal(
+    owner.run('layout:file', async () => undefined, ignoreError),
+    false
+  );
+  assert.equal(
+    owner.schedule('layout:file', 0, async () => undefined, ignoreError),
+    false
+  );
+
+  await entered.promise;
+  assert.equal(writes, 1);
+  gate.resolve();
+  await closing;
+  assert.equal(owner.pendingWrites, 0);
+  assert.equal(owner.activeWrites, 0);
+  assert.equal(owner.trackedKeys, 0);
+  assert.equal(owner.cancel('layout:file'), false);
+});
+
+test('pending layout invalidation atomically replaces its stale patch', async () => {
+  const owner = new RepositoryPersistenceOwner(1, 1);
+  const clearDone = Promise.withResolvers<void>();
+  const calls: string[] = [];
+
+  assert.equal(
+    owner.schedule(
+      'layout:file',
+      60_000,
+      async () => {
+        calls.push('stale layout');
+      },
+      ignoreError
+    ),
+    true
+  );
+  assert.equal(
+    owner.run(
+      'layout:file',
+      async () => {
+        calls.push('clear layout');
+        clearDone.resolve();
+      },
+      ignoreError
+    ),
+    true
+  );
+  await clearDone.promise;
+  await owner.close();
+  assert.deepEqual(calls, ['clear layout']);
 });

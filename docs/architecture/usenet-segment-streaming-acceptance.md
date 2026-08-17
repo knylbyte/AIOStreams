@@ -70,7 +70,11 @@ canonical concept itself is unchanged.
       active write and one latest-wins successor, so layout invalidation follows
       an active patch and hole generations cannot finish out of order. Shutdown
       stops eviction/debounce timers, flushes the latest pending values, awaits
-      crossing writes and propagates failures before database close.
+      crossing writes and propagates failures before database close. Status
+      latest-wins keys are separated by semantic class, and the database guard
+      makes `failed` terminal over concurrent `degraded` updates. Engine readers
+      retire before repository persistence freezes its immutable close snapshot,
+      so their final hooks remain part of the durability barrier.
 - [x] Startup orphan cleanup is heartbeat/fence protected and emits a structured
       completion record.
 - [x] Stable spool failures map to actionable user and HTTP/debrid errors.
