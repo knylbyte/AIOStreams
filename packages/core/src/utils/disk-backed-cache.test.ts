@@ -22,10 +22,65 @@ import {
   DISK_CACHE_DELETE_PARTICIPANT_LIMIT,
   DiskBackedCache,
   DiskBackedCacheError,
+  flushAllDiskCaches,
   type DiskBackedCacheFileSystem,
   type DiskFileLease,
   type DiskPreparedFile,
 } from './disk-backed-cache.js';
+
+test('global disk cache flush attempts every cache and aggregates failures', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-flush-all-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let armed = false;
+  let goodIndexWrites = 0;
+  let failedIndexWrites = 0;
+  const countedWriteFile =
+    (kind: 'good' | 'failed'): DiskBackedCacheFileSystem['writeFile'] =>
+    async (filePath, data, options) => {
+      if (armed && String(filePath).endsWith('.index.json')) {
+        if (kind === 'good') goodIndexWrites++;
+        else {
+          failedIndexWrites++;
+          throw Object.assign(new Error('synthetic index failure'), {
+            code: 'EIO',
+          });
+        }
+      }
+      return writeFile(filePath, data, options);
+    };
+  const good = createCache(t, root, {
+    name: 'flush-good',
+    maxDiskBytes: 64,
+    fileSystem: { writeFile: countedWriteFile('good') },
+  });
+  const failed = createCache(t, root, {
+    name: 'flush-failed',
+    maxDiskBytes: 64,
+    fileSystem: { writeFile: countedWriteFile('failed') },
+  });
+  await Promise.all([good.whenReady(), failed.whenReady()]);
+  good.set('good', Buffer.from('good'));
+  failed.set('failed', Buffer.from('failed'));
+  armed = true;
+
+  await assert.rejects(
+    flushAllDiskCaches(),
+    (error) =>
+      error instanceof AggregateError &&
+      error.errors.some(
+        (candidate: unknown) =>
+          candidate instanceof Error &&
+          candidate.message.includes('flush-failed') &&
+          candidate.cause instanceof DiskBackedCacheError &&
+          candidate.cause.code === 'DISK_CACHE_INDEX_IO'
+      )
+  );
+  assert.equal(goodIndexWrites, 1);
+  assert.equal(failedIndexWrites, 1);
+
+  armed = false;
+  await Promise.all([good.flush(), failed.flush()]);
+});
 
 function deferred<T = void>(): PromiseWithResolvers<T> {
   return Promise.withResolvers<T>();

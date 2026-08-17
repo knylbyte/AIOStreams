@@ -2,11 +2,15 @@ import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
 import test from 'node:test';
 import '../../config/index.js';
-import { StreamStoppedError } from '../../stream-sessions/registry.js';
+import {
+  StreamRegistry,
+  StreamStoppedError,
+} from '../../stream-sessions/registry.js';
 import { StatsAccumulator } from '../stats/accumulator.js';
 import type { SeekableStream } from './file-stream.js';
 import {
   destroyTrackedReaders,
+  TrackedReaderOwner,
   trackSeekableStream,
   UsenetEngineClosedError,
   UsenetStreamReapedError,
@@ -139,6 +143,115 @@ class DelayedDestroyReadable extends Readable {
     void this.destroyGate.then(() => callback(this.replacementError ?? error));
   }
 }
+
+class SynchronousDestroyReadable extends Readable {
+  constructor(private readonly replacementError?: Error) {
+    super({ read() {} });
+  }
+
+  override _destroy(
+    error: Error | null,
+    callback: (error?: Error | null) => void
+  ): void {
+    callback(this.replacementError ?? error);
+  }
+}
+
+function waitForClose(stream: Readable): Promise<void> {
+  if (stream.closed) return Promise.resolve();
+  return new Promise<void>((resolve) => stream.once('close', resolve));
+}
+
+test('reader owner retains a synchronous cleanup replacement before engine close', async () => {
+  const cleanupError = Object.assign(new Error('reader cleanup failed'), {
+    code: 'EIO',
+  });
+  const reader = new SynchronousDestroyReadable(cleanupError);
+  const owner = new TrackedReaderOwner();
+  owner.register(1, reader);
+
+  const closed = waitForClose(reader);
+  reader.destroy(new StreamStoppedError('shutdown'));
+  await closed;
+  assert.equal(owner.size, 0);
+
+  assert.deepEqual(
+    await destroyTrackedReaders(owner, new UsenetEngineClosedError()),
+    [cleanupError]
+  );
+  assert.deepEqual(
+    await destroyTrackedReaders(owner, new UsenetEngineClosedError()),
+    []
+  );
+});
+
+test('registry shutdown preserves a synchronous reader cleanup error for engine close', async () => {
+  const cleanupError = Object.assign(new Error('reader cleanup failed'), {
+    code: 'EIO',
+  });
+  const inner: SeekableStream = {
+    filename: 'registry.bin',
+    size: () => 1,
+    open: async () => undefined,
+    readAt: async () => Buffer.from('x'),
+    createReadStream: () => new SynchronousDestroyReadable(cleanupError),
+  };
+  const stats = new StatsAccumulator();
+  const owner = new TrackedReaderOwner();
+  const tracked = trackSeekableStream(
+    inner,
+    stats,
+    'registry-cleanup',
+    owner,
+    () => undefined
+  );
+  const registry = new StreamRegistry(() => ({ ok: true }));
+  const admitted = registry.open({
+    transport: 'usenet',
+    username: 'reader-owner-test',
+    targetKey: 'registry-cleanup',
+  });
+  assert.equal(admitted.ok, true);
+  if (!admitted.ok) return;
+  const reader = tracked.createReadStream();
+  const closed = waitForClose(reader);
+  admitted.handle.attach(reader);
+
+  registry.sealAndCloseAll('shutdown');
+  await closed;
+  assert.equal(owner.size, 0);
+  assert.equal(stats.activeStreams, 0);
+  assert.deepEqual(await owner.close(new UsenetEngineClosedError()), [
+    cleanupError,
+  ]);
+  assert.deepEqual(registry.snapshot(), []);
+});
+
+test('reader owner discards synchronous expected lifecycle termination', async () => {
+  const reader = new SynchronousDestroyReadable();
+  const owner = new TrackedReaderOwner();
+  owner.register(1, reader);
+
+  const closed = waitForClose(reader);
+  reader.destroy(new StreamStoppedError('shutdown'));
+  await closed;
+
+  assert.equal(owner.size, 0);
+  assert.deepEqual(await owner.close(new UsenetEngineClosedError()), []);
+});
+
+test('reader owner promptly removes an old normally closed reader', async () => {
+  const reader = new SynchronousDestroyReadable();
+  const owner = new TrackedReaderOwner();
+  owner.register(1, reader);
+
+  const closed = waitForClose(reader);
+  reader.destroy();
+  await closed;
+
+  assert.equal(owner.size, 0);
+  assert.deepEqual(await owner.close(new UsenetEngineClosedError()), []);
+});
 
 test('reader teardown waits for asynchronous close after destroy', async () => {
   const gate = Promise.withResolvers<void>();

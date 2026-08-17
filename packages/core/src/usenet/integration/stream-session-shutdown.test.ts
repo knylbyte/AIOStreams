@@ -7,6 +7,7 @@ import test from 'node:test';
 import { settingsStore } from '../../config/index.js';
 import { closeDb, initDb } from '../../db/index.js';
 import { streamRegistry } from '../../stream-sessions/index.js';
+import { downloadManager } from '../../utils/download-manager.js';
 import {
   openNativeUsenetStream,
   shutdownNativeUsenetSessionOpens,
@@ -101,8 +102,9 @@ test('native request stopped during session open creates no late reader or engin
     );
     streamRegistry.sealAndCloseAll('shutdown');
     const openingShutdown = shutdownNativeUsenetSessionOpens();
+    const grabShutdown = downloadManager.close();
     await upstreamClosed.promise;
-    await openingShutdown;
+    await Promise.all([openingShutdown, grabShutdown]);
     await shutdownUsenetEngines();
 
     await rejected;

@@ -35,9 +35,31 @@ import {
   isStreamShutdownError,
   sendStreamShutdownResponse,
 } from './stream-shutdown.js';
+import { shutdownAdmission } from '../../shutdown.js';
 
 const logger = createLogger('server');
 const router: Router = Router();
+
+interface ProxyLifecycleDependencies {
+  readonly processShutdownSignal: AbortSignal;
+  readonly nzbDownloads: Pick<typeof downloadManager, 'fetchNzb'>;
+}
+
+let proxyLifecycleDependencies: ProxyLifecycleDependencies = {
+  processShutdownSignal: shutdownAdmission.signal,
+  nzbDownloads: downloadManager,
+};
+
+/** @internal Scoped dependency override for deterministic route tests. */
+export function overrideProxyLifecycleForTest(
+  dependencies: ProxyLifecycleDependencies
+): () => void {
+  const previous = proxyLifecycleDependencies;
+  proxyLifecycleDependencies = dependencies;
+  return () => {
+    proxyLifecycleDependencies = previous;
+  };
+}
 
 function sanitiseHeaderValue(value: string): string {
   return value.replace(/[^\t\x20-\x7e]/g, '');
@@ -120,8 +142,6 @@ function copyHeaders(headers: Record<string, string | string[] | undefined>) {
     Object.entries(headers).filter(([key]) => !exclude.has(key))
   );
 }
-
-export default router;
 
 const ProxyAuthSchema = z.object({
   username: z.string(),
@@ -252,12 +272,16 @@ async function serveNzbFromGrabCache(
   res: Response,
   data: ProxyData,
   requestId: string,
-  username: string
+  username: string,
+  signal: AbortSignal,
+  nzbDownloads: Pick<typeof downloadManager, 'fetchNzb'>
 ): Promise<void> {
   let nzb: Buffer;
   try {
-    nzb = await downloadManager.fetchNzb(data.url);
+    nzb = await nzbDownloads.fetchNzb(data.url, { signal });
+    signal.throwIfAborted();
   } catch (error) {
+    signal.throwIfAborted();
     if (error instanceof NzbTooLargeError) {
       throw new APIError(constants.ErrorCode.BAD_REQUEST, 413, error.message);
     }
@@ -329,7 +353,7 @@ router.post(
         enabled: true,
         url: appConfig.bootstrap.baseUrl,
         credentials: `${username}:${password}`,
-      } as any);
+      });
       const urls = await proxy.generateUrls(
         [
           {
@@ -366,6 +390,7 @@ interface ProxyParams {
 router.all(
   '/:encryptedAuthAndData{/:filename}',
   async (req: Request<ProxyParams>, res: Response, next: NextFunction) => {
+    const { processShutdownSignal, nzbDownloads } = proxyLifecycleDependencies;
     const startTime = Date.now();
     const requestId = Math.random().toString(36).substring(7);
     let upstreamResponse: Dispatcher.ResponseData | undefined;
@@ -388,8 +413,16 @@ router.all(
         abortUpstream(new DOMException('Proxy client closed', 'AbortError'));
       }
     };
+    const onProcessShutdown = (): void => {
+      req.pause();
+      abortUpstream(processShutdownSignal.reason);
+    };
     req.once('aborted', onClientAborted);
     res.once('close', onResponseClose);
+    processShutdownSignal.addEventListener('abort', onProcessShutdown, {
+      once: true,
+    });
+    if (processShutdownSignal.aborted) onProcessShutdown();
 
     try {
       const { auth: decodedAuth, data: decodedData } =
@@ -407,7 +440,9 @@ router.all(
           res,
           data,
           requestId,
-          auth.username
+          auth.username,
+          upstreamController.signal,
+          nzbDownloads
         );
         return;
       }
@@ -671,6 +706,14 @@ router.all(
         sendStreamShutdownResponse(res);
         return;
       }
+      if (
+        isStreamShutdownError(terminalError) &&
+        res.headersSent &&
+        !res.destroyed
+      ) {
+        res.destroy(terminalError instanceof Error ? terminalError : undefined);
+        return;
+      }
 
       const errorCode = (terminalError as NodeJS.ErrnoException)?.code;
       const isClientDisconnect =
@@ -712,8 +755,11 @@ router.all(
       requestFinished = true;
       req.removeListener('aborted', onClientAborted);
       res.removeListener('close', onResponseClose);
+      processShutdownSignal.removeEventListener('abort', onProcessShutdown);
       // Ends this request only; the session idles out on its own.
       if (session?.ok) session.handle.close();
     }
   }
 );
+
+export default router;

@@ -5,6 +5,7 @@ export function isStreamShutdownError(error: unknown): boolean {
   if (typeof error !== 'object' || error === null || !('code' in error)) {
     return false;
   }
+  if (error.code === 'PROCESS_SHUTDOWN') return true;
   if (error.code === 'USENET_ENGINE_CLOSED') return true;
   return (
     error.code === 'STREAM_STOPPED' &&

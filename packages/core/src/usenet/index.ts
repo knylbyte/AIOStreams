@@ -1,6 +1,5 @@
 import { readdir, rm } from 'fs/promises';
 import { join } from 'path';
-import type { Readable } from 'node:stream';
 import { createLogger } from '../logging/logger.js';
 import { getCacheFolder } from '../utils/general.js';
 import { appConfig } from '../utils/index.js';
@@ -14,6 +13,7 @@ import {
   destroyTrackedReaders,
   trackSeekableStream,
   reapIdleStreams,
+  TrackedReaderOwner,
   UsenetEngineClosedError,
 } from './pool/tracked-stream.js';
 import {
@@ -214,7 +214,7 @@ export class UsenetEngine {
    * id, so close() can destroy in-flight readers and the idle reaper / the
    * dashboard stop action can destroy one by id.
    */
-  private liveReaders = new Map<number, Readable>();
+  private liveReaders = new TrackedReaderOwner();
   /**
    * Shared probe budget for ALL live censuses (blocking + shadows): N
    * concurrent censuses contend for these slots instead of multiplying

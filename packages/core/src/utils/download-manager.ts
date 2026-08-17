@@ -45,6 +45,16 @@ export class NzbTooLargeError extends Error {
   }
 }
 
+/** Stable terminal reason for the process-wide NZB grab owner. */
+export class NzbGrabClosedError extends Error {
+  readonly code = 'NZB_GRAB_CLOSED';
+
+  constructor() {
+    super('NZB grab owner is closed');
+    this.name = 'NzbGrabClosedError';
+  }
+}
+
 /**
  * Process-wide download manager for grabbed `.nzb` files: a disk-backed,
  * restart-surviving, single-flighted grab layer (so a player resuming a stream
@@ -57,11 +67,18 @@ export class NzbTooLargeError extends Error {
  * import graph. NZBs differ in that they are parsed later, by the usenet engine
  * — so this manager just grabs the raw bytes.
  */
-class DownloadManager {
+export class DownloadManager {
   private _nzb?: GrabCache<Buffer>;
+  private closedError: NzbGrabClosedError | undefined;
+  private closePromise: Promise<void> | undefined;
+
+  constructor(cache?: GrabCache<Buffer>) {
+    this._nzb = cache;
+  }
 
   /** Lazily build the NZB grab cache from live config. */
   private nzbCache(): GrabCache<Buffer> {
+    if (this.closedError) throw this.closedError;
     if (!this._nzb) {
       const g = appConfig.builtins.grab;
       this._nzb = new GrabCache<Buffer>({
@@ -75,16 +92,34 @@ class DownloadManager {
   }
 
   /** Grab a raw NZB by URL (disk-cached, single-flighted). */
-  fetchNzb(
+  async fetchNzb(
     url: string,
     opts: Omit<GrabOptions, 'userAgent'> = {}
   ): Promise<Buffer> {
     // Default user-agent; a `[nzb_grabs]` (or per-host) override in
     // REQUEST_HEADER_OVERRIDES takes priority inside makeRequest.
     const userAgent = appConfig.http.defaultUserAgent;
-    return this.nzbCache().fetch(url, () =>
-      this.download(url, { ...opts, userAgent })
+    const { signal: waiterSignal, ...downloadOptions } = opts;
+    return this.nzbCache().fetch(
+      url,
+      (ownerSignal) =>
+        this.download(url, {
+          ...downloadOptions,
+          signal: ownerSignal,
+          userAgent,
+        }),
+      { signal: waiterSignal }
     );
+  }
+
+  /** Fence new grabs and settle every shared producer/cache writer. */
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closedError = new NzbGrabClosedError();
+    this.closePromise = this._nzb
+      ? this._nzb.close(this.closedError)
+      : Promise.resolve();
+    return this.closePromise;
   }
 
   private async download(url: string, opts: GrabOptions): Promise<Buffer> {

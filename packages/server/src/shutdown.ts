@@ -16,6 +16,16 @@ export interface ShutdownCoordinatorOptions {
   readonly onCleanupError?: (label: string, error: unknown) => void;
 }
 
+/** Stable terminal reason shared by every request admitted before shutdown. */
+export class ProcessShutdownError extends Error {
+  readonly code = 'PROCESS_SHUTDOWN';
+
+  constructor() {
+    super('server is shutting down');
+    this.name = 'ProcessShutdownError';
+  }
+}
+
 /**
  * Synchronous process-shutdown admission fence. It is installed before route
  * middleware so every request arriving after the linearization point receives
@@ -23,6 +33,8 @@ export interface ShutdownCoordinatorOptions {
  */
 export class ShutdownAdmissionGate {
   private draining = false;
+  private readonly controller = new AbortController();
+  private readonly shutdownError = new ProcessShutdownError();
 
   readonly middleware = (
     _request: Request,
@@ -40,11 +52,18 @@ export class ShutdownAdmissionGate {
   };
 
   beginDraining(): void {
+    if (this.draining) return;
     this.draining = true;
+    this.controller.abort(this.shutdownError);
   }
 
   get isDraining(): boolean {
     return this.draining;
+  }
+
+  /** Process-lifetime signal for work admitted before the HTTP fence closed. */
+  get signal(): AbortSignal {
+    return this.controller.signal;
   }
 }
 

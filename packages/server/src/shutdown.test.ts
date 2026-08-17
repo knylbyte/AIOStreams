@@ -4,7 +4,11 @@ import { Readable } from 'node:stream';
 import express from 'express';
 import { describe, expect, test } from 'vitest';
 import { StreamRegistry } from '@aiostreams/core';
-import { ShutdownAdmissionGate, ShutdownCoordinator } from './shutdown.js';
+import {
+  ProcessShutdownError,
+  ShutdownAdmissionGate,
+  ShutdownCoordinator,
+} from './shutdown.js';
 
 class CoordinatedReader extends Readable {
   readonly destroyEntered = Promise.withResolvers<void>();
@@ -38,6 +42,7 @@ async function listen(app: express.Express): Promise<{
 describe('shutdown admission and ordering', () => {
   test('the HTTP gate returns a stable 503 while draining', async () => {
     const gate = new ShutdownAdmissionGate();
+    expect(gate.signal.aborted).toBe(false);
     const app = express();
     app.use(gate.middleware);
     app.get('/work', (_request, response) => response.json({ ok: true }));
@@ -45,6 +50,11 @@ describe('shutdown admission and ordering', () => {
     try {
       expect((await fetch(`${baseUrl}/work`)).status).toBe(200);
       gate.beginDraining();
+      expect(gate.signal.aborted).toBe(true);
+      expect(gate.signal.reason).toBeInstanceOf(ProcessShutdownError);
+      const reason = gate.signal.reason;
+      gate.beginDraining();
+      expect(gate.signal.reason).toBe(reason);
       const response = await fetch(`${baseUrl}/work`);
       expect(response.status).toBe(503);
       expect(response.headers.get('connection')).toBe('close');
@@ -130,6 +140,41 @@ describe('shutdown admission and ordering', () => {
     ]);
     await coordinator.close();
     expect(events.filter((event) => event === 'database')).toHaveLength(1);
+  });
+
+  test('persistent cleanup failures are aggregated after every cleanup is attempted', async () => {
+    const failure = new Error('disk cache index failed');
+    const events: string[] = [];
+    const reported: Array<{ label: string; error: unknown }> = [];
+    const coordinator = new ShutdownCoordinator({
+      admission: new ShutdownAdmissionGate(),
+      server: () => undefined,
+      stopTasks: () => undefined,
+      sealStreams: () => undefined,
+      beforeListenerClose: [],
+      afterListenerClose: [
+        {
+          label: 'disk caches',
+          run: async () => {
+            events.push('disk caches');
+            throw failure;
+          },
+        },
+        {
+          label: 'database',
+          run: async () => {
+            events.push('database');
+          },
+        },
+      ],
+      onCleanupError: (label, error) => reported.push({ label, error }),
+    });
+
+    await expect(coordinator.close()).rejects.toMatchObject({
+      errors: expect.arrayContaining([failure]),
+    });
+    expect(events).toEqual(['disk caches', 'database']);
+    expect(reported).toEqual([{ label: 'disk caches', error: failure }]);
   });
 
   test('real listener admission closes before engine and final-index barriers finish', async () => {

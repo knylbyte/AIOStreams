@@ -28,16 +28,16 @@ export class UsenetEngineClosedError extends Error {
  */
 export function isExpectedReaderTermination(
   error: unknown,
-  closeError: UsenetEngineClosedError
+  closeError?: UsenetEngineClosedError
 ): boolean {
-  if (error === closeError) return true;
+  if (closeError && error === closeError) return true;
   if (typeof error !== 'object' || error === null) return false;
 
   const code = 'code' in error ? error.code : undefined;
   const name = 'name' in error ? error.name : undefined;
   const message = 'message' in error ? error.message : undefined;
   return (
-    code === closeError.code ||
+    code === 'USENET_ENGINE_CLOSED' ||
     code === 'STREAM_STOPPED' ||
     code === 'USENET_STREAM_REAPED' ||
     code === 'ABORT_ERR' ||
@@ -47,15 +47,110 @@ export function isExpectedReaderTermination(
   );
 }
 
+const MAX_RETAINED_READER_ERRORS = 64;
+
+interface TrackedReaderState {
+  readonly stream: Readable;
+  readonly closed: Promise<void>;
+}
+
+/**
+ * Engine-owned lifecycle registry for handed-out readers.
+ *
+ * Error observation starts synchronously at registration, before another
+ * lifecycle owner can destroy the stream. Normal readers disappear on
+ * `close`; unexpected terminal errors remain in a fixed-size handoff until
+ * engine close consumes them. This preserves synchronous `_destroy()`
+ * replacement failures without retaining an unbounded history of streams.
+ */
+export class TrackedReaderOwner {
+  private readonly readers = new Map<number, TrackedReaderState>();
+  private readonly terminalErrors: unknown[] = [];
+  private overflowRecorded = false;
+
+  get size(): number {
+    return this.readers.size;
+  }
+
+  get(id: number): Readable | undefined {
+    return this.readers.get(id)?.stream;
+  }
+
+  register(id: number, stream: Readable): void {
+    if (this.readers.has(id)) {
+      throw new Error('Usenet reader id is already registered');
+    }
+    const closed = Promise.withResolvers<void>();
+    let terminalErrorRecorded = false;
+    const onError = (error: unknown): void => {
+      if (!terminalErrorRecorded && !isExpectedReaderTermination(error)) {
+        terminalErrorRecorded = true;
+        this.recordError(error);
+      }
+    };
+    const onClose = (): void => {
+      stream.removeListener('error', onError);
+      this.readers.delete(id);
+      closed.resolve();
+    };
+    stream.on('error', onError);
+    stream.once('close', onClose);
+    this.readers.set(id, { stream, closed: closed.promise });
+  }
+
+  /** Destroy the active snapshot, await real close, then consume saved errors. */
+  async close(closeError: UsenetEngineClosedError): Promise<unknown[]> {
+    const states = [...this.readers.values()];
+    await Promise.all(
+      states.map((state) => {
+        if (state.stream.closed) return Promise.resolve();
+        if (!state.stream.destroyed) {
+          try {
+            state.stream.destroy(closeError);
+          } catch (error) {
+            this.recordError(error);
+            // A synchronous throw means Node did not accept ownership of the
+            // destroy request, so there is no reliable close event to await.
+            return Promise.resolve();
+          }
+        }
+        return state.closed;
+      })
+    );
+    return this.takeErrors();
+  }
+
+  private recordError(error: unknown): void {
+    if (this.terminalErrors.length < MAX_RETAINED_READER_ERRORS) {
+      this.terminalErrors.push(error);
+      return;
+    }
+    if (this.overflowRecorded) return;
+    this.overflowRecorded = true;
+    this.terminalErrors[MAX_RETAINED_READER_ERRORS - 1] = new Error(
+      'Additional usenet reader cleanup errors were suppressed'
+    );
+  }
+
+  private takeErrors(): unknown[] {
+    const errors = this.terminalErrors.splice(0);
+    this.overflowRecorded = false;
+    return errors;
+  }
+}
+
 /**
  * Destroy the current reader snapshot and settle only after every reader has
  * emitted `close`. Observation is installed before `destroy()`, so synchronous
  * and asynchronous `_destroy()` implementations share the same barrier.
  */
 export async function destroyTrackedReaders(
-  liveReaders: ReadonlyMap<number, Readable>,
+  liveReaders: ReadonlyMap<number, Readable> | TrackedReaderOwner,
   closeError: UsenetEngineClosedError
 ): Promise<unknown[]> {
+  if (liveReaders instanceof TrackedReaderOwner) {
+    return liveReaders.close(closeError);
+  }
   const readers = [...liveReaders.values()];
   const outcomes = await Promise.all(
     readers.map(
@@ -101,7 +196,7 @@ export async function destroyTrackedReaders(
  */
 export function reapIdleStreams(
   stats: StatsAccumulator,
-  liveReaders: ReadonlyMap<number, Readable>,
+  liveReaders: Pick<ReadonlyMap<number, Readable>, 'get'>,
   thresholdMs: number,
   now = Date.now()
 ): number {
@@ -141,7 +236,7 @@ export function trackSeekableStream(
   stream: SeekableStream,
   stats: StatsAccumulator,
   nzbHash: string,
-  liveReaders: Map<number, Readable> | undefined,
+  liveReaders: Map<number, Readable> | TrackedReaderOwner | undefined,
   assertOpen: () => void
 ): SeekableStream {
   return new TrackedSeekableStream(
@@ -158,7 +253,10 @@ class TrackedSeekableStream implements SeekableStream {
     private readonly inner: SeekableStream,
     private readonly stats: StatsAccumulator,
     private readonly nzbHash: string,
-    private readonly liveReaders: Map<number, Readable> | undefined,
+    private readonly liveReaders:
+      | Map<number, Readable>
+      | TrackedReaderOwner
+      | undefined,
     private readonly assertOpen: () => void
   ) {}
 
@@ -236,13 +334,19 @@ class TrackedSeekableStream implements SeekableStream {
       }
       return push(chunk, encoding);
     };
-    this.liveReaders?.set(id, out);
+    if (this.liveReaders instanceof TrackedReaderOwner) {
+      this.liveReaders.register(id, out);
+    } else {
+      this.liveReaders?.set(id, out);
+    }
     // 'close' always follows end/destroy (autoDestroy default), so neither
     // the gauge nor the live-reader registry can leak an open entry as long
     // as the reader is eventually destroyed; the engine's idle reaper is the
     // backstop for readers whose response socket never closes.
     out.once('close', () => {
-      this.liveReaders?.delete(id);
+      if (!(this.liveReaders instanceof TrackedReaderOwner)) {
+        this.liveReaders?.delete(id);
+      }
       this.stats.streamClosed(id);
     });
     return out;

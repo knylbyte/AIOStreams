@@ -46,15 +46,28 @@ canonical concept itself is unchanged.
 - [x] Coordinated process shutdown seals `StreamRegistry` with the distinct
       `shutdown` reason before engine retirement. Readers already terminalised
       by that seal are awaited through their real `close` event without turning
-      expected lifecycle errors into engine-cleanup failures.
-- [x] A proxy request waiting for upstream headers receives the stable 503
-      shutdown response only for the explicit shutdown reason; its active
-      Undici request (including the current redirect hop) is actually aborted.
-      Limit, stale and administrative stops retain their disconnect semantics.
+      expected lifecycle errors into engine-cleanup failures. A bounded
+      engine-owned terminal-error handoff is installed when each reader is
+      registered, so a synchronous `_destroy()` replacement such as `EIO`
+      remains part of the final aggregate even if `close` preceded engine
+      retirement.
+- [x] The synchronous HTTP admission fence also publishes one stable process
+      abort signal. Early cached-NZB GET/HEAD, stream HEAD, POST/PUT/PATCH and
+      every Undici redirect hop observe it. Pre-header shutdown returns the
+      stable 503 contract; a post-header response is destroyed without a second
+      response attempt. Limit, stale, administrative stop and client abort
+      retain their distinct disconnect semantics.
 - [x] Native shared session opens use bounded per-key flights and bounded
-      request waiters. Process shutdown synchronously fences new opens, aborts
-      remote NZB work, awaits every flight finalizer, and prevents late warm
-      session publication before engines and the database retire.
+      request waiters. The process-wide NZB grab owner independently limits
+      itself to 256 producers and 64 waiters per URL; request abort removes only
+      that waiter, while process close fences hits, aborts each owner once,
+      awaits producer/cache finalizers and prevents late cache or warm-session
+      publication before engines and the database retire.
+- [x] Final persistence is explicit: every registered disk cache is attempted
+      and flush failures are aggregated. Layout/hole/status repository writes
+      use one bounded closeable owner; shutdown stops its eviction/debounce
+      timers, flushes the latest pending values, awaits crossing writes and
+      propagates failures before database close.
 - [x] Startup orphan cleanup is heartbeat/fence protected and emits a structured
       completion record.
 - [x] Stable spool failures map to actionable user and HTTP/debrid errors.

@@ -42,6 +42,7 @@ import {
   recoverStreamSessions,
   streamRegistry,
   shutdownNativeUsenetSessionOpens,
+  downloadManager,
 } from '@aiostreams/core';
 
 const logger = createLogger('server');
@@ -339,8 +340,25 @@ function beginUsenetShutdown(): Promise<void> {
     // grabs. Its task-finally barrier must settle before engines (and later the
     // DB) retire, so no crossing open can publish a warm session afterwards.
     usenetShutdownPromise = (async () => {
-      await shutdownNativeUsenetSessionOpens();
-      await shutdownUsenetEngines();
+      // Both fences publish before either barrier is awaited: a native open
+      // may be a waiter on a grab first started by a proxy request.
+      const openingClose = shutdownNativeUsenetSessionOpens();
+      const grabClose = downloadManager.close();
+      const errors: unknown[] = [];
+      for (const result of await Promise.allSettled([
+        openingClose,
+        grabClose,
+      ])) {
+        if (result.status === 'rejected') errors.push(result.reason);
+      }
+      try {
+        await shutdownUsenetEngines();
+      } catch (error) {
+        errors.push(error);
+      }
+      if (errors.length > 0) {
+        throw new AggregateError(errors, 'Usenet shutdown failed');
+      }
     })();
     void usenetShutdownPromise.catch(() => undefined);
   }

@@ -824,7 +824,32 @@ export async function clearDiskCacheByName(name: string): Promise<boolean> {
  * Drain in-flight writes and persist every registered disk cache's index.
  */
 export async function flushAllDiskCaches(): Promise<void> {
-  await Promise.allSettled([...diskCacheRegistry].map((c) => c.flush()));
+  const caches = [...diskCacheRegistry];
+  const results = await Promise.allSettled(
+    caches.map((cache) => cache.flush())
+  );
+  const maxReportedErrors = 64;
+  const errors: Error[] = [];
+  for (let index = 0; index < results.length; index++) {
+    const result = results[index];
+    if (result?.status !== 'rejected') continue;
+    if (errors.length >= maxReportedErrors) continue;
+    if (errors.length === maxReportedErrors - 1) {
+      errors.push(new Error('Additional disk cache flush failures suppressed'));
+      continue;
+    }
+    errors.push(
+      new Error(
+        `Disk cache "${caches[index]?.name ?? 'unknown'}" flush failed`,
+        {
+          cause: result.reason,
+        }
+      )
+    );
+  }
+  if (errors.length > 0) {
+    throw new AggregateError(errors, 'One or more disk caches failed to flush');
+  }
 }
 
 /**

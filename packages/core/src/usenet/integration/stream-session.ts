@@ -55,6 +55,7 @@ import {
   BoundedOpeningFlights,
   OpeningFlightError,
 } from './opening-flights.js';
+import { RepositoryPersistenceOwner } from './repository-persistence.js';
 
 const logger = createLogger('usenet/stream');
 
@@ -175,12 +176,33 @@ async function awaitSessionOpenStep<T>(
  * The fence is synchronous; the returned idempotent promise is the task-finally
  * barrier. Warm handles are dropped because their owning engines retire next.
  */
+let sessionShutdownPromise: Promise<void> | undefined;
+
 export function shutdownNativeUsenetSessionOpens(): Promise<void> {
+  if (sessionShutdownPromise) return sessionShutdownPromise;
+  if (sessionEvictionTimer) clearInterval(sessionEvictionTimer);
+  sessionEvictionTimer = undefined;
   streamSessions.clear();
-  return openingSessions.close(new StreamStoppedError('shutdown'));
+  failingStreams.clear();
+  const openingClose = openingSessions.close(
+    new StreamStoppedError('shutdown')
+  );
+  const persistenceClose = sessionPersistence.close();
+  sessionShutdownPromise = Promise.allSettled([
+    openingClose,
+    persistenceClose,
+  ]).then((results) => {
+    const errors = results.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : []
+    );
+    if (errors.length > 0) {
+      throw new AggregateError(errors, 'Native usenet session shutdown failed');
+    }
+  });
+  return sessionShutdownPromise;
 }
 
-const sessionEvictionTimer = setInterval(() => {
+let sessionEvictionTimer: NodeJS.Timeout | undefined = setInterval(() => {
   const now = Date.now();
   for (const [key, session] of streamSessions) {
     if (now - session.lastUsedAt > STREAM_SESSION_IDLE_MS) {
@@ -212,9 +234,19 @@ async function loadArchiveLayout(
   }
 }
 
-/** Debounce for persisting lazy-resolution progress, keyed `${hash}:${path}`. */
-const layoutPatchTimers = new Map<string, NodeJS.Timeout>();
 const LAYOUT_PATCH_DEBOUNCE_MS = 2_000;
+const sessionPersistence = new RepositoryPersistenceOwner();
+
+function persistenceRejected(kind: string, key: string): void {
+  logger.debug(
+    { kind, key },
+    'usenet session repository persistence admission rejected'
+  );
+}
+
+function persistenceErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 /**
  * Hooks wiring a lazy (pending-fragment) layout's runtime resolution back to
@@ -232,46 +264,50 @@ function lazyHooksFor(
   const key = `${hash}:${innerPath}`;
   return {
     onCommit: (fragments: DataFragment[]) => {
-      const t = layoutPatchTimers.get(key);
-      if (t) clearTimeout(t);
-      const timer = setTimeout(() => {
-        layoutPatchTimers.delete(key);
-        const patched: ArchiveStreamLayout = {
-          ...layout,
-          target: { ...layout.target, fragments },
-        };
-        UsenetLibraryRepository.updateFileLayout(
-          hash,
-          innerPath,
-          serializeArchiveLayout(patched)
-        ).catch((err) =>
+      const accepted = sessionPersistence.schedule(
+        `layout:${key}`,
+        LAYOUT_PATCH_DEBOUNCE_MS,
+        async () => {
+          const patched: ArchiveStreamLayout = {
+            ...layout,
+            target: { ...layout.target, fragments },
+          };
+          await UsenetLibraryRepository.updateFileLayout(
+            hash,
+            innerPath,
+            serializeArchiveLayout(patched)
+          );
+        },
+        (error) =>
           logger.debug(
-            { hash, innerPath, err: (err as Error)?.message },
+            { hash, innerPath, err: persistenceErrorMessage(error) },
             'lazy layout patch failed (re-resolves on next open)'
           )
-        );
-      }, LAYOUT_PATCH_DEBOUNCE_MS);
-      timer.unref?.();
-      layoutPatchTimers.set(key, timer);
+      );
+      if (!accepted) persistenceRejected('layout', key);
     },
     onInvalid: (err: Error) => {
-      const t = layoutPatchTimers.get(key);
-      if (t) clearTimeout(t);
-      layoutPatchTimers.delete(key);
+      sessionPersistence.cancel(`layout:${key}`);
       streamSessions.delete(sessionKey);
       logger.warn(
         { hash, innerPath, err: err.message },
         'lazy layout invalidated; clearing persisted layout'
       );
-      UsenetLibraryRepository.updateFileLayout(hash, innerPath, null).catch(
-        () => {}
+      const accepted = sessionPersistence.run(
+        async () => {
+          await UsenetLibraryRepository.updateFileLayout(hash, innerPath, null);
+        },
+        (error) =>
+          logger.debug(
+            { hash, innerPath, err: persistenceErrorMessage(error) },
+            'lazy layout invalidation persistence failed'
+          )
       );
+      if (!accepted) persistenceRejected('layout invalidation', key);
     },
   };
 }
 
-/** Debounce for persisting playback-discovered holes, keyed `${hash}:${sel}`. */
-const holePatchTimers = new Map<string, NodeJS.Timeout>();
 const HOLE_PATCH_DEBOUNCE_MS = 2_000;
 
 /**
@@ -333,30 +369,40 @@ function holeHooksFor(
   const markDegraded = (): void => {
     if (degradedMarked) return;
     degradedMarked = true;
-    UsenetLibraryRepository.setStatus(hash, 'degraded', {
-      guard: { notIn: ['failed'] },
-    }).catch(() => {});
+    const accepted = sessionPersistence.run(
+      async () => {
+        await UsenetLibraryRepository.setStatus(hash, 'degraded', {
+          guard: { notIn: ['failed'] },
+        });
+      },
+      (error) =>
+        logger.debug(
+          { hash, err: persistenceErrorMessage(error) },
+          'degraded status persistence failed'
+        )
+    );
+    if (!accepted) persistenceRejected('degraded status', hash);
   };
 
   const persistHoles = (nzbFileIndex: number): void => {
     const key = `${hash}:${selector.path ?? selector.index ?? ''}`;
-    const t = holePatchTimers.get(key);
-    if (t) clearTimeout(t);
-    const timer = setTimeout(() => {
-      holePatchTimers.delete(key);
-      UsenetLibraryRepository.updateFileHoles(
-        hash,
-        selector,
-        serializeHoles(persistable.runsForFiles(new Set([nzbFileIndex])))
-      ).catch((err) =>
+    const accepted = sessionPersistence.schedule(
+      `holes:${key}`,
+      HOLE_PATCH_DEBOUNCE_MS,
+      async () => {
+        await UsenetLibraryRepository.updateFileHoles(
+          hash,
+          selector,
+          serializeHoles(persistable.runsForFiles(new Set([nzbFileIndex])))
+        );
+      },
+      (error) =>
         logger.debug(
-          { hash, err: (err as Error)?.message },
+          { hash, err: persistenceErrorMessage(error) },
           'hole map patch failed (re-discovered on next play)'
         )
-      );
-    }, HOLE_PATCH_DEBOUNCE_MS);
-    timer.unref?.();
-    holePatchTimers.set(key, timer);
+    );
+    if (!accepted) persistenceRejected('hole map', key);
   };
 
   const fail = (info: HoleInfo, why: string): HoleDecision => {
@@ -373,12 +419,22 @@ function holeHooksFor(
           'Too many articles missing on every provider to play',
           'missing_on_providers',
         ];
-    UsenetLibraryRepository.markFailed(
-      hash,
-      reason,
-      decoded.filename,
-      code
-    ).catch(() => {});
+    const accepted = sessionPersistence.run(
+      async () => {
+        await UsenetLibraryRepository.markFailed(
+          hash,
+          reason,
+          decoded.filename,
+          code
+        );
+      },
+      (error) =>
+        logger.debug(
+          { hash, err: persistenceErrorMessage(error) },
+          'failed status persistence failed'
+        )
+    );
+    if (!accepted) persistenceRejected('failed status', hash);
     // Pad caps only trip on damage confirmed against every provider.
     markReleaseDead(decoded.releaseKey, nzbContentKey(hash));
     // Drop the warm session so a player retry re-opens fresh and sees the
@@ -596,12 +652,22 @@ async function openStreamSession(
       err instanceof NotStreamableError
     ) {
       const friendly = friendlyUsenetError(err);
-      UsenetLibraryRepository.markFailed(
-        hash,
-        friendly.reason,
-        decoded.filename,
-        friendly.code
-      ).catch(() => {});
+      const accepted = sessionPersistence.run(
+        async () => {
+          await UsenetLibraryRepository.markFailed(
+            hash,
+            friendly.reason,
+            decoded.filename,
+            friendly.code
+          );
+        },
+        (error) =>
+          logger.debug(
+            { hash, err: persistenceErrorMessage(error) },
+            'open failure status persistence failed'
+          )
+      );
+      if (!accepted) persistenceRejected('open failure status', hash);
       // The release exists on usenet, but a compressed/solid/unsupported
       // archive is un-streamable for everyone (global); an all-provider
       // article miss is backbone-scoped evidence.
