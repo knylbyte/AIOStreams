@@ -423,4 +423,144 @@ describe('shutdown admission and ordering', () => {
       'persistence',
     ]);
   });
+
+  test('an immediate shadow rejection is observed while opening close is blocked', async () => {
+    const openingGate = Promise.withResolvers<void>();
+    const shadowFailure = new Error('census failed immediately');
+    const events: string[] = [];
+    const unhandled: unknown[] = [];
+    const handledWarnings: Error[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    const onWarning = (warning: Error): void => {
+      if (warning.name === 'PromiseRejectionHandledWarning') {
+        handledWarnings.push(warning);
+      }
+    };
+    process.on('unhandledRejection', onUnhandled);
+    process.on('warning', onWarning);
+    try {
+      let settled = false;
+      const closing = closeUsenetOwners({
+        closeOpenings: async () => {
+          events.push('openings');
+          await openingGate.promise;
+        },
+        closeGrabs: async () => {
+          events.push('grabs');
+        },
+        closeCensusShadows: () => {
+          events.push('shadows');
+          return Promise.reject(shadowFailure);
+        },
+        closeEngines: async () => {
+          events.push('engines');
+        },
+        closePersistence: async () => {
+          events.push('persistence');
+        },
+      }).then(
+        () => {
+          settled = true;
+          return undefined;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        }
+      );
+
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+      expect(unhandled).toEqual([]);
+      expect(handledWarnings).toEqual([]);
+      expect(events).toEqual(['openings', 'grabs', 'shadows']);
+
+      openingGate.resolve();
+      const error = await closing;
+      expect(error).toBeInstanceOf(AggregateError);
+      if (!(error instanceof AggregateError)) return;
+      expect(
+        error.errors.filter((item) => item === shadowFailure)
+      ).toHaveLength(1);
+      expect(events).toEqual([
+        'openings',
+        'grabs',
+        'shadows',
+        'engines',
+        'persistence',
+      ]);
+      expect(unhandled).toEqual([]);
+      expect(handledWarnings).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      process.off('warning', onWarning);
+      openingGate.resolve();
+    }
+  });
+
+  test('a synchronous shadow close throw is observed from its first turn', async () => {
+    const openingGate = Promise.withResolvers<void>();
+    const shadowFailure = new Error('census close threw synchronously');
+    const events: string[] = [];
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      let settled = false;
+      const closing = closeUsenetOwners({
+        closeOpenings: async () => {
+          events.push('openings');
+          await openingGate.promise;
+        },
+        closeGrabs: async () => {
+          events.push('grabs');
+        },
+        closeCensusShadows: () => {
+          events.push('shadows');
+          throw shadowFailure;
+        },
+        closeEngines: async () => {
+          events.push('engines');
+        },
+        closePersistence: async () => {
+          events.push('persistence');
+        },
+      }).then(
+        () => {
+          settled = true;
+          return undefined;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        }
+      );
+
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+      expect(unhandled).toEqual([]);
+      expect(events).toEqual(['openings', 'grabs', 'shadows']);
+
+      openingGate.resolve();
+      const error = await closing;
+      expect(error).toBeInstanceOf(AggregateError);
+      if (!(error instanceof AggregateError)) return;
+      expect(error.errors).toEqual([shadowFailure]);
+      expect(events).toEqual([
+        'openings',
+        'grabs',
+        'shadows',
+        'engines',
+        'persistence',
+      ]);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      openingGate.resolve();
+    }
+  });
 });

@@ -17,6 +17,7 @@ import {
 import type { CensusSnapshot } from '../pool/inspect/index.js';
 import {
   CensusShadowOwner,
+  publishCensusShadowMutations,
   type CensusShadowPublication,
 } from './census-shadow-owner.js';
 
@@ -178,8 +179,12 @@ async function applyCensusVerdict(
       )
     );
     if (!failed.current) return;
-    await publication.step(() =>
-      markReleaseDeadOwned(releaseKey, nzbContentKey(nzbHash))
+    await publishCensusShadowMutations(
+      publication,
+      [releaseKey, nzbContentKey(nzbHash)].filter(
+        (key): key is string => !!key
+      ),
+      markReleaseDeadOwned
     );
     return;
   }
@@ -228,8 +233,12 @@ async function applyCensusVerdict(
       })
     );
     if (!promoted.current) return;
-    await publication.step(() =>
-      retractReleaseOwned(releaseKey, nzbContentKey(nzbHash))
+    await publishCensusShadowMutations(
+      publication,
+      [releaseKey, nzbContentKey(nzbHash)].filter(
+        (key): key is string => !!key
+      ),
+      retractReleaseOwned
     );
   }
 }

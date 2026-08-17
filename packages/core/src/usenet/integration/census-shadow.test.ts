@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   CensusShadowOwner,
   CensusShadowOwnerError,
+  publishCensusShadowMutations,
   type CensusShadowHandle,
 } from './census-shadow-owner.js';
 
@@ -81,6 +82,7 @@ test('close fences a completed census before its first repository step', async (
   assert.equal(writes, 0);
   assert.equal(owner.activeTasks, 0);
   assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 0);
 });
 
 test('close waits for a repository step that already owns its operation', async () => {
@@ -121,6 +123,7 @@ test('close waits for a repository step that already owns its operation', async 
   assert.equal(writes, 1);
   assert.equal(owner.activeTasks, 0);
   assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 0);
 });
 
 test('a same-hash generation waits for and supersedes its predecessor', async () => {
@@ -171,6 +174,7 @@ test('a same-hash generation waits for and supersedes its predecessor', async ()
   assert.deepEqual(writes, ['new']);
   assert.equal(owner.activeTasks, 0);
   assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 0);
   await owner.close();
 });
 
@@ -200,6 +204,7 @@ test('an incomplete census cancelled by close publishes nothing and is removed',
   assert.equal(writes, 0);
   assert.equal(owner.activeTasks, 0);
   assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 0);
 });
 
 test('close aggregates a crossing repository error after every shadow settles', async () => {
@@ -259,6 +264,7 @@ test('close aggregates a crossing repository error after every shadow settles', 
   assert.equal(successfulWrites, 1);
   assert.equal(owner.activeTasks, 0);
   assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 0);
 });
 
 test('capacity rejects without replacing the current generation or leaking state', async () => {
@@ -316,6 +322,7 @@ test('capacity rejects without replacing the current generation or leaking state
   await owner.close();
   assert.equal(owner.activeTasks, 0);
   assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 0);
 
   const afterClose = controlledCensus(
     Promise.resolve({ complete: true, generation: 'closed' })
@@ -337,4 +344,326 @@ test('capacity rejects without replacing the current generation or leaking state
   assert.equal(closedError.code, 'USENET_CENSUS_SHADOW_CLOSED');
   assert.equal(afterClose.cancelCalls(), 1);
   assert.equal(owner.activeTasks, 0);
+  assert.equal(owner.retirementTails, 0);
+});
+
+test('handle cancel retains a same-hash retirement tail until the old write settles', async () => {
+  const owner = new CensusShadowOwner<TestSnapshot>(2);
+  const oldWriteEntered = Promise.withResolvers<void>();
+  const permitOldWrite = Promise.withResolvers<void>();
+  const writes: string[] = [];
+  const oldSource = controlledCensus(
+    Promise.resolve({ complete: true, generation: 'old' })
+  );
+  const oldShadow = requiredHandle(
+    owner.spawn({
+      nzbHash: 'cancel-tail',
+      census: oldSource.census,
+      apply: async (snapshot, publication) => {
+        await publication.step(async () => {
+          oldWriteEntered.resolve();
+          await permitOldWrite.promise;
+          writes.push(snapshot.generation);
+        });
+      },
+      onError: noError,
+    })
+  );
+  await oldWriteEntered.promise;
+
+  oldShadow.cancel();
+  assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 1);
+  const newShadow = requiredHandle(
+    owner.spawn({
+      nzbHash: 'cancel-tail',
+      census: controlledCensus(
+        Promise.resolve({ complete: true, generation: 'new' })
+      ).census,
+      apply: async (snapshot, publication) => {
+        await publication.step(async () => {
+          writes.push(snapshot.generation);
+        });
+      },
+      onError: noError,
+    })
+  );
+  let newSettled = false;
+  void newShadow.done.then(() => {
+    newSettled = true;
+  });
+  await Promise.resolve();
+  assert.equal(newSettled, false);
+  assert.deepEqual(writes, []);
+
+  permitOldWrite.resolve();
+  await Promise.all([oldShadow.done, newShadow.done]);
+  assert.deepEqual(writes, ['old', 'new']);
+  assert.equal(oldSource.cancelCalls(), 1);
+  assert.equal(owner.activeTasks, 0);
+  assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 0);
+  await owner.close();
+});
+
+test('concurrent invalidations share the complete retirement tail', async () => {
+  const owner = new CensusShadowOwner<TestSnapshot>(1);
+  const writeEntered = Promise.withResolvers<void>();
+  const permitWrite = Promise.withResolvers<void>();
+  let writes = 0;
+  const shadow = requiredHandle(
+    owner.spawn({
+      nzbHash: 'double-invalidate',
+      census: controlledCensus(
+        Promise.resolve({ complete: true, generation: 'old' })
+      ).census,
+      apply: async (_snapshot, publication) => {
+        await publication.step(async () => {
+          writeEntered.resolve();
+          await permitWrite.promise;
+          writes++;
+        });
+      },
+      onError: noError,
+    })
+  );
+  await writeEntered.promise;
+
+  let firstSettled = false;
+  let secondSettled = false;
+  const first = owner.invalidate('double-invalidate').then(() => {
+    firstSettled = true;
+  });
+  const second = owner.invalidate('double-invalidate').then(() => {
+    secondSettled = true;
+  });
+  await Promise.resolve();
+  assert.equal(firstSettled, false);
+  assert.equal(secondSettled, false);
+  assert.equal(owner.retirementTails, 1);
+
+  permitWrite.resolve();
+  await Promise.all([first, second, shadow.done]);
+  assert.equal(writes, 1);
+  assert.equal(owner.activeTasks, 0);
+  assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 0);
+  await owner.close();
+});
+
+test('three same-hash replacements retain one bounded tail and only the newest publishes', async () => {
+  const owner = new CensusShadowOwner<TestSnapshot>(3);
+  const oldApplyEntered = Promise.withResolvers<void>();
+  const permitOldApply = Promise.withResolvers<void>();
+  const writes: string[] = [];
+  const spawn = (generation: string): CensusShadowHandle =>
+    requiredHandle(
+      owner.spawn({
+        nzbHash: 'triple-replacement',
+        census: controlledCensus(
+          Promise.resolve({ complete: true, generation })
+        ).census,
+        apply: async (snapshot, publication) => {
+          if (snapshot.generation === 'A') {
+            oldApplyEntered.resolve();
+            await permitOldApply.promise;
+          }
+          await publication.step(async () => {
+            writes.push(snapshot.generation);
+          });
+        },
+        onError: noError,
+      })
+    );
+
+  const first = spawn('A');
+  await oldApplyEntered.promise;
+  const second = spawn('B');
+  const third = spawn('C');
+  assert.equal(owner.activeTasks, 3);
+  assert.equal(owner.currentGenerations, 1);
+  assert.equal(owner.retirementTails, 1);
+
+  permitOldApply.resolve();
+  await Promise.all([first.done, second.done, third.done]);
+  assert.deepEqual(writes, ['C']);
+  assert.equal(owner.activeTasks, 0);
+  assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 0);
+  await owner.close();
+});
+
+test('close waits an externally cancelled retirement tail without deadlock', async () => {
+  const owner = new CensusShadowOwner<TestSnapshot>(1);
+  const writeEntered = Promise.withResolvers<void>();
+  const permitWrite = Promise.withResolvers<void>();
+  const shadow = requiredHandle(
+    owner.spawn({
+      nzbHash: 'cancelled-close-tail',
+      census: controlledCensus(
+        Promise.resolve({ complete: true, generation: 'old' })
+      ).census,
+      apply: async (_snapshot, publication) => {
+        await publication.step(async () => {
+          writeEntered.resolve();
+          await permitWrite.promise;
+        });
+      },
+      onError: noError,
+    })
+  );
+  await writeEntered.promise;
+  shadow.cancel();
+
+  let closeSettled = false;
+  const closing = owner.close().then(() => {
+    closeSettled = true;
+  });
+  await Promise.resolve();
+  assert.equal(closeSettled, false);
+  assert.equal(owner.retirementTails, 1);
+
+  permitWrite.resolve();
+  await Promise.all([shadow.done, closing]);
+  assert.equal(owner.activeTasks, 0);
+  assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 0);
+});
+
+test('close during the first feedback key prevents the second key from starting', async () => {
+  const owner = new CensusShadowOwner<TestSnapshot>(1);
+  const firstEntered = Promise.withResolvers<void>();
+  const permitFirst = Promise.withResolvers<void>();
+  const feedback: string[] = [];
+  const shadow = requiredHandle(
+    owner.spawn({
+      nzbHash: 'dead-feedback-close',
+      census: controlledCensus(
+        Promise.resolve({ complete: true, generation: 'old' })
+      ).census,
+      apply: async (_snapshot, publication) => {
+        await publishCensusShadowMutations(
+          publication,
+          ['dead-key-1', 'dead-key-2'],
+          async (key) => {
+            if (key === 'dead-key-1') {
+              firstEntered.resolve();
+              await permitFirst.promise;
+            }
+            feedback.push(key);
+          }
+        );
+      },
+      onError: noError,
+    })
+  );
+  await firstEntered.promise;
+
+  let closeSettled = false;
+  const closing = owner.close().then(() => {
+    closeSettled = true;
+  });
+  await Promise.resolve();
+  assert.equal(closeSettled, false);
+  assert.deepEqual(feedback, []);
+
+  permitFirst.resolve();
+  await Promise.all([shadow.done, closing]);
+  assert.deepEqual(feedback, ['dead-key-1']);
+  assert.equal(owner.activeTasks, 0);
+  assert.equal(owner.retirementTails, 0);
+});
+
+test('same-hash invalidation stops old retract keys and gates the new generation', async () => {
+  const owner = new CensusShadowOwner<TestSnapshot>(2);
+  const firstEntered = Promise.withResolvers<void>();
+  const permitFirst = Promise.withResolvers<void>();
+  const feedback: string[] = [];
+  const oldShadow = requiredHandle(
+    owner.spawn({
+      nzbHash: 'retract-feedback-reimport',
+      census: controlledCensus(
+        Promise.resolve({ complete: true, generation: 'old' })
+      ).census,
+      apply: async (_snapshot, publication) => {
+        await publishCensusShadowMutations(
+          publication,
+          ['old-retract-1', 'old-retract-2'],
+          async (key) => {
+            if (key === 'old-retract-1') {
+              firstEntered.resolve();
+              await permitFirst.promise;
+            }
+            feedback.push(key);
+          }
+        );
+      },
+      onError: noError,
+    })
+  );
+  await firstEntered.promise;
+
+  const invalidating = owner.invalidate('retract-feedback-reimport');
+  const newShadow = requiredHandle(
+    owner.spawn({
+      nzbHash: 'retract-feedback-reimport',
+      census: controlledCensus(
+        Promise.resolve({ complete: true, generation: 'new' })
+      ).census,
+      apply: async (_snapshot, publication) => {
+        await publishCensusShadowMutations(
+          publication,
+          ['new-retract-1', 'new-retract-2'],
+          async (key) => {
+            feedback.push(key);
+          }
+        );
+      },
+      onError: noError,
+    })
+  );
+  await Promise.resolve();
+  assert.deepEqual(feedback, []);
+
+  permitFirst.resolve();
+  await Promise.all([invalidating, oldShadow.done, newShadow.done]);
+  assert.deepEqual(feedback, [
+    'old-retract-1',
+    'new-retract-1',
+    'new-retract-2',
+  ]);
+  assert.equal(owner.activeTasks, 0);
+  assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 0);
+  await owner.close();
+});
+
+test('an uninterrupted generation persists both feedback keys exactly once', async () => {
+  const owner = new CensusShadowOwner<TestSnapshot>(1);
+  const feedback: string[] = [];
+  const shadow = requiredHandle(
+    owner.spawn({
+      nzbHash: 'feedback-success',
+      census: controlledCensus(
+        Promise.resolve({ complete: true, generation: 'current' })
+      ).census,
+      apply: async (_snapshot, publication) => {
+        await publishCensusShadowMutations(
+          publication,
+          ['feedback-key-1', 'feedback-key-2'],
+          async (key) => {
+            feedback.push(key);
+          }
+        );
+      },
+      onError: noError,
+    })
+  );
+
+  await shadow.done;
+  assert.deepEqual(feedback, ['feedback-key-1', 'feedback-key-2']);
+  assert.equal(owner.activeTasks, 0);
+  assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 0);
+  await owner.close();
 });

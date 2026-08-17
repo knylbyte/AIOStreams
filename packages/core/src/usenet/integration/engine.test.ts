@@ -377,7 +377,7 @@ test('registry replacement waits for the previous engine reader close', async ()
   await registry.closeAll();
 });
 
-test('registry replacement waits for and invalidates the old census shadow', async () => {
+test('registry replacement retires the old census before a same-hash reimport publishes', async () => {
   const { UsenetEngineRegistry } = await import('../index.js');
   const registry = new UsenetEngineRegistry(60_000);
   const firstProvider: ProviderConfig = {
@@ -392,22 +392,25 @@ test('registry replacement waits for and invalidates the old census shadow', asy
     ...DEFAULT_ENGINE_OPTIONS,
     segmentDiskCacheBytes: 0,
   });
-  const owner = new CensusShadowOwner<{ readonly complete: boolean }>(1);
+  const owner = new CensusShadowOwner<{
+    readonly complete: boolean;
+    readonly generation: string;
+  }>(2);
   const beforePublish = Promise.withResolvers<void>();
   const permitPublish = Promise.withResolvers<void>();
   const censusCancelled = Promise.withResolvers<void>();
-  let writes = 0;
+  const writes: string[] = [];
   const shadow = owner.spawn({
     nzbHash: 'provider-retirement',
     census: {
-      done: Promise.resolve({ complete: true }),
+      done: Promise.resolve({ complete: true, generation: 'old' }),
       cancel: () => censusCancelled.resolve(),
     },
-    apply: async (_snapshot, publication) => {
+    apply: async (snapshot, publication) => {
       beforePublish.resolve();
       await permitPublish.promise;
       await publication.step(async () => {
-        writes++;
+        writes.push(snapshot.generation);
       });
     },
     onError: (error) => {
@@ -430,15 +433,33 @@ test('registry replacement waits for and invalidates the old census shadow', asy
     replacementResolved = true;
   });
   await censusCancelled.promise;
+  const reimport = owner.spawn({
+    nzbHash: 'provider-retirement',
+    census: {
+      done: Promise.resolve({ complete: true, generation: 'new' }),
+      cancel: () => undefined,
+    },
+    apply: async (snapshot, publication) => {
+      await publication.step(async () => {
+        writes.push(snapshot.generation);
+      });
+    },
+    onError: (error) => {
+      throw error;
+    },
+  });
+  assert(reimport);
   await Promise.resolve();
   assert.equal(replacementResolved, false);
+  assert.deepEqual(writes, []);
 
   permitPublish.resolve();
-  const second = await replacement;
+  const [second] = await Promise.all([replacement, reimport.done]);
   assert.notEqual(second, first);
-  assert.equal(writes, 0);
+  assert.deepEqual(writes, ['new']);
   assert.equal(owner.activeTasks, 0);
   assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 0);
   await owner.close();
   await registry.closeAll();
 });

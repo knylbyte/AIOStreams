@@ -6,19 +6,34 @@ export interface UsenetOwnerShutdown {
   readonly closePersistence: () => Promise<unknown>;
 }
 
-function invokeCleanup(cleanup: () => Promise<unknown>): Promise<unknown> {
+type CleanupSettlement =
+  | { readonly status: 'fulfilled' }
+  | { readonly status: 'rejected'; readonly reason: unknown };
+
+function fulfilledCleanup(): CleanupSettlement {
+  return { status: 'fulfilled' };
+}
+
+function rejectedCleanup(reason: unknown): CleanupSettlement {
+  return { status: 'rejected', reason };
+}
+
+/** Attach both Promise observers in the same synchronous cleanup turn. */
+function settleCleanup(
+  cleanup: () => Promise<unknown>
+): Promise<CleanupSettlement> {
   try {
-    return Promise.resolve(cleanup());
+    return Promise.resolve(cleanup()).then(fulfilledCleanup, rejectedCleanup);
   } catch (error) {
-    return Promise.reject(error);
+    return Promise.resolve(rejectedCleanup(error));
   }
 }
 
 async function collectFailures(
-  operations: readonly Promise<unknown>[],
+  operations: readonly Promise<CleanupSettlement>[],
   failures: unknown[]
 ): Promise<void> {
-  for (const result of await Promise.allSettled(operations)) {
+  for (const result of await Promise.all(operations)) {
     if (result.status === 'rejected') failures.push(result.reason);
   }
 }
@@ -34,14 +49,14 @@ export async function closeUsenetOwners(
   owners: UsenetOwnerShutdown
 ): Promise<void> {
   const failures: unknown[] = [];
-  const openingClose = invokeCleanup(owners.closeOpenings);
-  const grabClose = invokeCleanup(owners.closeGrabs);
-  const censusClose = invokeCleanup(owners.closeCensusShadows);
+  const openingClose = settleCleanup(owners.closeOpenings);
+  const grabClose = settleCleanup(owners.closeGrabs);
+  const censusClose = settleCleanup(owners.closeCensusShadows);
 
   await collectFailures([openingClose, grabClose], failures);
-  await collectFailures([invokeCleanup(owners.closeEngines)], failures);
+  await collectFailures([settleCleanup(owners.closeEngines)], failures);
   await collectFailures([censusClose], failures);
-  await collectFailures([invokeCleanup(owners.closePersistence)], failures);
+  await collectFailures([settleCleanup(owners.closePersistence)], failures);
 
   if (failures.length > 0) {
     throw new AggregateError(failures, 'Usenet shutdown failed');

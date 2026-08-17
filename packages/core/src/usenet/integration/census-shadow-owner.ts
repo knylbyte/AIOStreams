@@ -27,6 +27,19 @@ export interface CensusShadowPublication {
   step<T>(operation: () => Promise<T>): Promise<CensusShadowStep<T>>;
 }
 
+/** Run individually fenced mutations until this generation loses ownership. */
+export async function publishCensusShadowMutations<T>(
+  publication: CensusShadowPublication,
+  values: readonly T[],
+  mutate: (value: T) => Promise<void>
+): Promise<boolean> {
+  for (const value of values) {
+    const result = await publication.step(() => mutate(value));
+    if (!result.current) return false;
+  }
+  return true;
+}
+
 export interface CensusShadowHandle {
   readonly generation: number;
   readonly done: Promise<void>;
@@ -63,6 +76,8 @@ const MAX_CENSUS_SHADOW_CLOSE_FAILURES = 64;
  */
 export class CensusShadowOwner<TSnapshot> {
   private readonly current = new Map<string, CensusShadowState<TSnapshot>>();
+  /** Latest unsettled task per hash, including an externally cancelled state. */
+  private readonly tails = new Map<string, CensusShadowState<TSnapshot>>();
   private readonly active = new Set<CensusShadowState<TSnapshot>>();
   private readonly closeFailures: unknown[] = [];
   private droppedCloseFailures = 0;
@@ -82,6 +97,10 @@ export class CensusShadowOwner<TSnapshot> {
 
   get currentGenerations(): number {
     return this.current.size;
+  }
+
+  get retirementTails(): number {
+    return this.tails.size;
   }
 
   spawn(args: CensusShadowSpawn<TSnapshot>): CensusShadowHandle | undefined {
@@ -113,8 +132,9 @@ export class CensusShadowOwner<TSnapshot> {
       return undefined;
     }
 
-    const predecessor = this.current.get(args.nzbHash);
-    if (predecessor) this.cancelState(predecessor);
+    const predecessor = this.tails.get(args.nzbHash);
+    const publishing = this.current.get(args.nzbHash);
+    if (publishing) this.cancelState(publishing);
     const generation = ++this.generation;
     const completion = Promise.withResolvers<void>();
     const state: CensusShadowState<TSnapshot> = {
@@ -126,15 +146,16 @@ export class CensusShadowOwner<TSnapshot> {
     };
     this.active.add(state);
     this.current.set(args.nzbHash, state);
+    this.tails.set(args.nzbHash, state);
     // runState catches operation failures and always settles. Keep a rejection
     // observer here as a final ownership guard against a future implementation
     // error creating an unhandled continuation.
     void this.runState(state, predecessor, args).then(
-      completion.resolve,
+      () => this.settleState(state, completion.resolve),
       (error) => {
         if (this.closed) this.recordCloseFailure(error);
         this.reportError(args, error);
-        completion.resolve();
+        this.settleState(state, completion.resolve);
       }
     );
 
@@ -146,7 +167,7 @@ export class CensusShadowOwner<TSnapshot> {
   }
 
   async invalidate(nzbHash: string): Promise<void> {
-    const state = this.current.get(nzbHash);
+    const state = this.current.get(nzbHash) ?? this.tails.get(nzbHash);
     if (!state) return;
     this.cancelState(state);
     await state.task;
@@ -176,11 +197,6 @@ export class CensusShadowOwner<TSnapshot> {
     } catch (error) {
       if (this.closed) this.recordCloseFailure(error);
       this.reportError(args, error);
-    } finally {
-      if (this.current.get(state.nzbHash) === state) {
-        this.current.delete(state.nzbHash);
-      }
-      this.active.delete(state);
     }
   }
 
@@ -199,7 +215,11 @@ export class CensusShadowOwner<TSnapshot> {
   }
 
   private isCurrent(state: CensusShadowState<TSnapshot>): boolean {
-    return !this.closed && this.current.get(state.nzbHash) === state;
+    return (
+      !this.closed &&
+      !state.cancelled &&
+      this.current.get(state.nzbHash) === state
+    );
   }
 
   private cancelState(state: CensusShadowState<TSnapshot>): void {
@@ -209,6 +229,22 @@ export class CensusShadowOwner<TSnapshot> {
     if (state.cancelled) return;
     state.cancelled = true;
     state.census.cancel();
+  }
+
+  private settleState(
+    state: CensusShadowState<TSnapshot>,
+    resolve: () => void
+  ): void {
+    if (this.current.get(state.nzbHash) === state) {
+      this.current.delete(state.nzbHash);
+    }
+    if (this.tails.get(state.nzbHash) === state) {
+      this.tails.delete(state.nzbHash);
+    }
+    this.active.delete(state);
+    // Promise resolution is synchronous with respect to state transition;
+    // awaiters resume only after every identity-safe cleanup above completed.
+    resolve();
   }
 
   private rejectSpawn(
@@ -246,6 +282,7 @@ export class CensusShadowOwner<TSnapshot> {
   ): Promise<void> {
     await Promise.all(states.map((state) => state.task));
     this.current.clear();
+    this.tails.clear();
     const errors = this.closeFailures.splice(0);
     if (this.droppedCloseFailures > 0) {
       errors.push(

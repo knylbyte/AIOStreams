@@ -85,11 +85,11 @@ export function markReleaseDead(
   markDead('backbones', keys);
 }
 
-/** Awaitable variant for lifecycle-owned persistence paths. */
+/** Awaitable single-key variant for lifecycle-owned persistence paths. */
 export function markReleaseDeadOwned(
-  ...keys: Array<string | null | undefined>
+  key: string | null | undefined
 ): Promise<void> {
-  return persistDead('backbones', keys);
+  return persistDead('backbones', [key]);
 }
 
 /**
@@ -114,14 +114,13 @@ export function markReleaseDeadForCode(
 export function retractRelease(
   ...keys: Array<string | null | undefined>
 ): void {
-  void retractReleaseOwned(...keys).catch((error) =>
+  void persistRetractions(keys).catch((error) =>
     logger.warn(`failed to retract release: ${error}`)
   );
 }
 
-/** Awaitable variant for lifecycle-owned persistence paths. */
-export async function retractReleaseOwned(
-  ...keys: Array<string | null | undefined>
+async function persistRetractions(
+  keys: Array<string | null | undefined>
 ): Promise<void> {
   const errors: unknown[] = [];
   for (const key of keys) {
@@ -135,4 +134,11 @@ export async function retractReleaseOwned(
   if (errors.length > 0) {
     throw new AggregateError(errors, 'failed to persist release retraction');
   }
+}
+
+/** Awaitable single-key variant for lifecycle-owned persistence paths. */
+export function retractReleaseOwned(
+  key: string | null | undefined
+): Promise<void> {
+  return persistRetractions([key]);
 }
