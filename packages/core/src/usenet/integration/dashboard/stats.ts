@@ -11,7 +11,10 @@ import {
   LiveTiles,
   LiveStreamInfo,
   CacheStats,
+  DEFAULT_ENGINE_OPTIONS,
   EngineOptions,
+  ResourceStats,
+  resolveEngineResourcePlan,
 } from '../../index.js';
 import { usenetEngineRegistry, getUsenetEngineConfig } from '../engine.js';
 
@@ -103,6 +106,7 @@ export interface UsenetStatsOverview {
   live: LiveTiles;
   pool: PoolInfo;
   cache: CacheStats;
+  resources: ResourceStats;
   totals: {
     articles: number;
     bytes: number;
@@ -157,7 +161,7 @@ function emptyLive(): LiveTiles {
   };
 }
 
-function emptyCache(): CacheStats {
+function emptyCache(arenaBudgetBytes = 0): CacheStats {
   return {
     hits: 0,
     misses: 0,
@@ -165,6 +169,44 @@ function emptyCache(): CacheStats {
     diskBytes: 0,
     diskCount: 0,
     diskHits: 0,
+    arenaBytes: 0,
+    arenaEntries: 0,
+    arenaPinned: 0,
+    arenaEvictions: 0,
+    arenaBudgetBytes,
+    arenaExhaustions: 0,
+  };
+}
+
+function emptyResources(options: Partial<EngineOptions>): ResourceStats {
+  const plan = resolveEngineResourcePlan({
+    ...DEFAULT_ENGINE_OPTIONS,
+    ...options,
+  });
+  return {
+    streamingMode: plan.mode,
+    memory: {
+      usedBytes: 0,
+      maxBytes: plan.segmentSpooling?.memoryBudgetBytes ?? 0,
+      peakBytes: 0,
+      waiting: 0,
+    },
+    spool: {
+      reservedBytes: 0,
+      actualBytes: 0,
+      maxBytes: plan.segmentSpooling?.spoolBytes ?? 0,
+      peakReservedBytes: 0,
+      peakActualBytes: 0,
+      sessions: 0,
+      files: 0,
+      openFiles: 0,
+      waiting: 0,
+    },
+    arena: {
+      usedBytes: 0,
+      budgetBytes: plan.arenaBytes,
+      exhaustions: 0,
+    },
   };
 }
 
@@ -257,16 +299,19 @@ export function getUsenetLiveStats(): {
   live: LiveTiles;
   pool: PoolInfo;
   cache: CacheStats;
+  resources: ResourceStats;
   streams: LiveStreamInfo[];
 } {
   const { providers, options } = getUsenetEngineConfig();
   const engine =
     providers.length > 0 ? usenetEngineRegistry.peek(providers) : undefined;
   if (!engine) {
+    const resources = emptyResources(options);
     return {
       live: emptyLive(),
       pool: idlePool(providers, options),
-      cache: emptyCache(),
+      cache: emptyCache(resources.arena.budgetBytes),
+      resources,
       streams: [],
     };
   }
@@ -275,6 +320,7 @@ export function getUsenetLiveStats(): {
     live: snapshot.tiles,
     pool: snapshot.pool,
     cache: snapshot.cache,
+    resources: snapshot.resources,
     streams: snapshot.streams,
   };
 }
@@ -287,7 +333,7 @@ export async function getUsenetStatsOverview(
   const configProviders = (settingsStore.current.usenet?.providers ??
     []) as ProviderConfig[];
 
-  const { live, pool, cache } = getUsenetLiveStats();
+  const { live, pool, cache, resources } = getUsenetLiveStats();
   const poolById = new Map(pool.providers.map((p) => [p.id, p]));
 
   const [summary, series, firstSeenAt, indexerSummary, indexerErrors] =
@@ -424,6 +470,7 @@ export async function getUsenetStatsOverview(
     live,
     pool,
     cache,
+    resources,
     totals,
     providers,
     indexers,

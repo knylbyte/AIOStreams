@@ -59,6 +59,10 @@ export interface CacheStats {
   /** Arena entries currently pinned by in-flight reads (hovers near 0). */
   arenaPinned?: number;
   arenaEvictions?: number;
+  /** Hard configured arena ceiling. */
+  arenaBudgetBytes?: number;
+  /** Number of arena checkouts that degraded to an owned allocation. */
+  arenaExhaustions?: number;
 }
 
 export interface SegmentCacheOptions {
@@ -613,6 +617,8 @@ export class SegmentCache implements SegmentArtifactCacheLookup {
       arenaEntries: a.entries,
       arenaPinned: a.pinned,
       arenaEvictions: a.evictions,
+      arenaBudgetBytes: a.budgetBytes,
+      arenaExhaustions: a.exhaustions,
     };
   }
 
@@ -631,9 +637,9 @@ export class SegmentCache implements SegmentArtifactCacheLookup {
 }
 
 /**
- * Consume the asynchronous cache shutdown from the engine's synchronous close
- * boundary. Durability failures remain observable without becoming unhandled
- * promise rejections while the broader engine lifecycle is still synchronous.
+ * Compatibility helper for callers that still have a synchronous owner.
+ * The Usenet engine itself now awaits `SegmentCache.close()` through its
+ * serialized lifecycle barrier.
  */
 export function closeSegmentCacheInBackground(
   cache: Pick<SegmentCache, 'close'>,

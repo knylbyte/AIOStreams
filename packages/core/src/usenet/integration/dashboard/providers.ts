@@ -85,7 +85,7 @@ export async function saveUsenetProviders(
 
   await settingsStore.set('usenet.providers', merged, username);
   // Drop warm engines so the next request rebuilds with the saved providers.
-  usenetEngineRegistry.invalidate();
+  await usenetEngineRegistry.invalidate();
 }
 
 /** Test a single provider connection (dial + auth + DATE health probe).
@@ -490,6 +490,6 @@ async function runProviderSpeedTestInner(
     logger.debug({ host, code, error }, 'provider speed test failed');
     return { ok: false, error, code, ...config };
   } finally {
-    engine.close();
+    await engine.close();
   }
 }

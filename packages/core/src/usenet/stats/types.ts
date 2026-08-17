@@ -1,3 +1,5 @@
+import type { UsenetStreamingMode } from '../types.js';
+
 /** Aggregated, derived stats for a single provider. */
 export interface ProviderStatsSnapshot {
   providerId: string;
@@ -65,6 +67,37 @@ export interface LiveStreamInfo {
   bytesPerSec: number;
   /** Epoch ms when the range stream opened. */
   openedAt: number;
+}
+
+/** Engine-owned resource accounting exposed as one dashboard snapshot. */
+export interface ResourceStats {
+  /** Effective engine mode; the buffering path remains the default. */
+  streamingMode: UsenetStreamingMode;
+  /** Global transient segment-spooling RAM budget. Zero outside spooling. */
+  memory: {
+    usedBytes: number;
+    maxBytes: number;
+    peakBytes: number;
+    waiting: number;
+  };
+  /** Transient spool disk/file ownership. Zero outside spooling. */
+  spool: {
+    reservedBytes: number;
+    actualBytes: number;
+    maxBytes: number;
+    peakReservedBytes: number;
+    peakActualBytes: number;
+    sessions: number;
+    files: number;
+    openFiles: number;
+    waiting: number;
+  };
+  /** Pinned in-memory arena used by the compatible buffering/readAt paths. */
+  arena: {
+    usedBytes: number;
+    budgetBytes: number;
+    exhaustions: number;
+  };
 }
 
 /**

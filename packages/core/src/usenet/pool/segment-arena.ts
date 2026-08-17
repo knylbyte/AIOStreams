@@ -28,6 +28,8 @@ export interface SharedSegment {
 }
 
 export interface ArenaStats {
+  /** Hard configured byte ceiling. */
+  budgetBytes: number;
   /** Allocated slot bytes (free + leased + resident + dropped-pinned). */
   bytes: number;
   /** Free-list slot count. */
@@ -214,6 +216,7 @@ export class SegmentArena {
       }
     }
     return {
+      budgetBytes: this.budgetBytes,
       bytes: this.allocatedBytes,
       freeSlots: this.freeSlots.length,
       entries: this.entries.size,

@@ -4,7 +4,8 @@ import { CommandPriority } from '../types.js';
 import type { SegmentSpoolingPlan } from '../resource-plan.js';
 import { SpoolManager } from '../spool/manager.js';
 import { UsenetSpoolError } from '../spool/errors.js';
-import type { ByteLease } from './byte-budget.js';
+import type { ByteBudgetStats, ByteLease } from './byte-budget.js';
+import type { SpoolManagerStats } from '../spool/types.js';
 import type { SegmentArtifactCacheLookup } from './segment-artifact.js';
 import { resolveSegmentStreamMemoryBytes } from '../stream-queue-budget.js';
 
@@ -15,6 +16,12 @@ export interface SegmentSpoolingRuntimeOptions {
   readonly artifactCache?: SegmentArtifactCacheLookup;
   readonly memoryBudget?: ByteBudget;
   readonly spoolManager?: SpoolManager;
+}
+
+/** Resource-owner snapshot used by the engine dashboard contract. */
+export interface SegmentSpoolingRuntimeStats {
+  readonly memory: ByteBudgetStats;
+  readonly spool: SpoolManagerStats;
 }
 
 type MemoryRequestKind = 'download' | 'stream';
@@ -201,6 +208,20 @@ export class SegmentSpoolingRuntime {
         // promotion therefore owns the matching lost-wakeup bridge as well.
         this.drainMemoryWaiters();
       },
+    };
+  }
+
+  /** Point-in-time accounting from the actual global resource owners. */
+  stats(): SegmentSpoolingRuntimeStats {
+    const memory = this.memoryBudget.stats();
+    return {
+      memory: {
+        ...memory,
+        // Runtime queues intentionally sit outside ByteBudget so admission and
+        // cross-kind fairness are atomic; expose their true combined depth.
+        waiting: memory.waiting + this.memoryWaitingCount,
+      },
+      spool: this.spoolManager.stats(),
     };
   }
 

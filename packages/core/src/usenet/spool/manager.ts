@@ -41,6 +41,19 @@ const LIVENESS_LOCK_SUFFIX = '.lock';
 const HASHED_NAMESPACE = /^[a-f0-9]{64}$/;
 const HASHED_ARTIFACT = /^[a-f0-9]{64}\.(?:partial|ready)$/;
 
+/** Avoid pulling the application config graph into the standalone spool API. */
+function logSpool(
+  level: 'debug' | 'info',
+  fields: Record<string, unknown>,
+  message: string
+): void {
+  void import('../../logging/logger.js')
+    .then(({ createLogger }) => {
+      createLogger('usenet/spool-manager')[level](fields, message);
+    })
+    .catch(() => undefined);
+}
+
 export interface SpoolManagerOptions {
   readonly plan: SegmentSpoolingPlan;
   readonly engineId: string;
@@ -240,6 +253,9 @@ export class SpoolManager {
     GrowingSpoolArtifact,
     SpoolBudgetLease
   >();
+  /** Bounded by maxArtifacts: one entry per tracked artifact/session hash. */
+  private readonly artifactSessions = new Map<GrowingSpoolArtifact, string>();
+  private readonly sessionReferences = new Map<string, number>();
   private readonly pendingArtifactCleanups = new Set<PendingArtifactCleanup>();
   private readonly closeController = new AbortController();
   private globalInitialization: Promise<void> | undefined;
@@ -382,6 +398,7 @@ export class SpoolManager {
             if (artifact) {
               this.artifacts.delete(artifact);
               this.artifactReservations.delete(artifact);
+              this.releaseArtifactSession(artifact);
             }
           },
         };
@@ -400,6 +417,7 @@ export class SpoolManager {
         }
         this.artifacts.add(artifact);
         this.artifactReservations.set(artifact, reservation);
+        this.retainArtifactSession(artifact, options.sessionId);
         return artifact;
       } catch (error) {
         if (partialPath && readyPath) {
@@ -431,6 +449,7 @@ export class SpoolManager {
       budget: this.budget.stats(),
       files: this.filePool.stats(),
       artifacts: this.artifacts.size + this.pendingArtifactCleanups.size,
+      sessions: this.sessionReferences.size,
     };
   }
 
@@ -467,7 +486,12 @@ export class SpoolManager {
       });
       await this.assertSafeDirectory(this.spoolRoot);
       await this.ensureLivenessLockRoot();
-      await this.cleanupOrphans();
+      const removedNamespaces = await this.cleanupOrphans();
+      logSpool(
+        'info',
+        { removedNamespaces },
+        'transient spool startup orphan cleanup completed'
+      );
     } catch (error) {
       throw classifySpoolFileError(error, 'initializing spool storage');
     }
@@ -518,14 +542,15 @@ export class SpoolManager {
     }
   }
 
-  private async cleanupOrphans(): Promise<void> {
+  private async cleanupOrphans(): Promise<number> {
     let entries: readonly string[];
     try {
       entries = await this.fileSystem.readdir(this.spoolRoot);
     } catch (error) {
-      if (isMissingSpoolError(error)) return;
+      if (isMissingSpoolError(error)) return 0;
       throw error;
     }
+    let removed = 0;
     const ownName = path.basename(this.processRoot);
     const now = this.clock();
     if (!Number.isFinite(now)) {
@@ -552,10 +577,38 @@ export class SpoolManager {
           continue;
         }
         await this.fileSystem.rm(candidate, { recursive: true, force: true });
+        removed++;
       } finally {
         await control.release();
       }
     }
+    return removed;
+  }
+
+  private retainArtifactSession(
+    artifact: GrowingSpoolArtifact,
+    rawSessionId: string
+  ): void {
+    const sessionId = hashId('session', rawSessionId);
+    this.artifactSessions.set(artifact, sessionId);
+    const references = this.sessionReferences.get(sessionId) ?? 0;
+    this.sessionReferences.set(sessionId, references + 1);
+    if (references === 0) {
+      logSpool('debug', { sessionId }, 'transient spool session opened');
+    }
+  }
+
+  private releaseArtifactSession(artifact: GrowingSpoolArtifact): void {
+    const sessionId = this.artifactSessions.get(artifact);
+    if (!sessionId) return;
+    this.artifactSessions.delete(artifact);
+    const references = this.sessionReferences.get(sessionId);
+    if (references === undefined || references <= 1) {
+      this.sessionReferences.delete(sessionId);
+      logSpool('debug', { sessionId }, 'transient spool session closed');
+      return;
+    }
+    this.sessionReferences.set(sessionId, references - 1);
   }
 
   /**

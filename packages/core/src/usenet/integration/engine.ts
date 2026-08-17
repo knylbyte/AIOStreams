@@ -18,6 +18,11 @@ import {
  */
 export const usenetEngineRegistry = new UsenetEngineRegistry();
 
+/** Await every engine-owned stream, spool, budget and cache writer on shutdown. */
+export function shutdownUsenetEngines(): Promise<void> {
+  return usenetEngineRegistry.closeAll();
+}
+
 /** Human-facing summary of the per-stream knobs a (speed) test exercises. */
 export interface UsenetStreamConfigSummary {
   /** In-flight BODY commands per connection (NNTP pipelining). */

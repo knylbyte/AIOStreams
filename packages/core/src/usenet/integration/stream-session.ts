@@ -415,7 +415,7 @@ async function getStreamSession(
     // Resolves the current engine (creating it after a provider edit) and
     // refreshes its idle clock so it isn't evicted out from under a session
     // that's serving range requests without re-entering the registry.
-    const engine = usenetEngineRegistry.get(providers, options);
+    const engine = await usenetEngineRegistry.get(providers, options);
     if (existing.engine === engine) {
       existing.lastUsedAt = Date.now();
       logger.debug(
@@ -455,7 +455,7 @@ async function getStreamSession(
     const hash = await canonicaliseNzbHash(decoded.hash, nzb, decoded.nzb);
     // Legacy tokens carry a pre-rekey hash; stickiness is keyed canonically.
     noteStreamActivity(hash);
-    const engine = usenetEngineRegistry.get(providers, options);
+    const engine = await usenetEngineRegistry.get(providers, options);
     // Fetched up-front: seeds the hole hooks (persisted hole map → replay
     // pre-pad) and provides addedAt for Last-Modified below.
     const entry = await UsenetLibraryRepository.get(hash).catch(

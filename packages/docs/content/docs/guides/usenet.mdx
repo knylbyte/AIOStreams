@@ -130,6 +130,84 @@ Streams are served directly from your instance under your `BASE_URL` — there i
   client.
 </Callout>
 
+#### Segment Buffering and Segment Spooling
+
+The built-in engine has two independent segment transport modes. Select one in
+**Usenet → Settings → Streaming mode**:
+
+- **Segment Buffering** is the compatible default. It keeps decoded read-ahead
+  segments in the bounded in-memory arena and preserves the established
+  playback path.
+- **Segment Spooling** decodes NNTP articles incrementally into a transient,
+  bounded disk spool. The player can tail the first segment while it is still
+  being written; later completed segments wait on disk rather than as complete
+  in-memory segment buffers.
+
+Changing the mode or any structural spooling budget requires an AIOStreams
+restart before the new engine layout is active. The dashboard marks settings
+provided by an environment variable as locked and read-only.
+
+<Callout type="info">
+  **Performance profiles remain separate.** `Low`, `Balanced`, `High` and
+  `Custom` still bundle only download concurrency, read-ahead and the
+  persistent segment disk cache. They never switch the streaming mode. Start
+  with **Balanced** in either mode; use **Low** for constrained providers or
+  disks, and **High** only when provider, disk and network headroom have been
+  measured.
+</Callout>
+
+The segment storage settings have deliberately different jobs:
+
+| Setting                            | Purpose                                                                                            |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `segmentMemoryCacheBytes`          | Pinned in-memory segment arena used in both modes; `0` selects the mode-specific automatic budget. |
+| `segmentDiskCacheBytes`            | Persistent LRU cache. Entries survive playback and restart; `0` disables promotion.                |
+| `segmentSpoolingMemoryBudgetBytes` | Hard global RAM budget for transient spooling queues and leases.                                   |
+| `segmentSpoolingStreamBufferBytes` | Maximum admitted queue reservation per active HTTP stream.                                         |
+| `segmentSpoolingSpoolBytes`        | Hard global size of the transient spool, deleted after its readers/promotions release it.          |
+| `segmentSpoolingMinFreeDiskBytes`  | Free-space reserve checked on the spool filesystem before relevant reservations.                   |
+
+The matching variables are
+`USENET_STREAMING_MODE`, `USENET_SEGMENT_MEMORY_CACHE_BYTES`,
+`USENET_SEGMENT_SPOOLING_MEMORY_BUDGET_BYTES`,
+`USENET_SEGMENT_SPOOLING_STREAM_BUFFER_BYTES`,
+`USENET_SEGMENT_SPOOLING_SPOOL_BYTES` and
+`USENET_SEGMENT_SPOOLING_MIN_FREE_DISK_BYTES`. Their generated defaults and
+validation notes are the source of truth in the [environment variable
+reference](/configuration/environment-variables#usenet).
+
+<Callout type="warn">
+  **Put the spool on real local storage, not tmpfs or `/dev/shm`.** Spooling is
+  intended to move read-ahead ownership out of RAM. The filesystem must have
+  room for the configured spool budget plus the minimum-free reserve and must
+  permit secure temporary files, rename and deletion. Disk-full or permission
+  failures stop the spooling request with a clear error; the engine does not
+  silently fall back to Segment Buffering.
+</Callout>
+
+The **Stats** page shows the active mode and compact live accounting for the
+memory budget, spool reserved/actual bytes, sessions, files, open files and the
+arena. These internal counters are the capacity contract; process RSS is only a
+diagnostic because it also includes Node.js, TLS, caches and allocator reuse.
+
+<Callout type="info">
+  **Current MVP boundary:** direct `FileStream` playback and HTTP ranges use
+  Segment Spooling. Small `readAt()` operations and archive-window streams
+  intentionally retain the established Segment Buffering/Arena path, bounded
+  by `segmentMemoryCacheBytes`. Segment Spooling therefore does not mean that
+  every archive-inspection operation is completely buffer-free.
+</Callout>
+
+**Migration and rollback:** switch one instance to `segment_spooling`, keep the
+default budgets initially, restart it, and watch the resource card during a
+representative stream. Verify writable local disk capacity before increasing
+the `High` profile or spool window. To roll back, set
+`USENET_STREAMING_MODE=segment_buffering` (or select Segment Buffering in the
+dashboard), restart, and leave the dormant spooling values in place. The
+persistent segment-cache format remains compatible; transient spool files have
+no migration value and startup orphan cleanup removes expired process
+namespaces safely.
+
 ### Stremio NNTP
 
 The one NNTP option that needs no server at all: here, the tool that converts Usenet articles into video **is the Stremio client itself**. AIOStreams sends your provider details and the NZB location with the stream, and Stremio connects to your provider and streams natively.

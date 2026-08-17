@@ -419,7 +419,7 @@ async function importNzb(
     });
   };
   try {
-    const engine = usenetEngineRegistry.get(spec.providers, spec.options);
+    const engine = await usenetEngineRegistry.get(spec.providers, spec.options);
     // Dispatch (not schedule) time, so `importMs` measures the inspect
     // itself, not time spent queued behind other imports.
     const inspectStart = Date.now();

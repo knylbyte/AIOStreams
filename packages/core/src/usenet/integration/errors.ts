@@ -1,10 +1,16 @@
 import { DebridError } from '../../debrid/base.js';
 import {
   ArticleNotFoundError,
+  NntpError,
   NotStreamableError,
   type ArchiveErrorCode,
   type NzbContent,
 } from '../index.js';
+import {
+  UsenetSpoolError,
+  type UsenetSpoolErrorCode,
+} from '../spool/errors.js';
+import { YencDecodeError, YencMetadataError } from '../pool/yenc.js';
 
 const ARCHIVE_REASONS: Record<ArchiveErrorCode, string> = {
   archive_compressed: 'Archive is compressed: not streamable',
@@ -16,6 +22,29 @@ const ARCHIVE_REASONS: Record<ArchiveErrorCode, string> = {
   archive_no_video: 'No streamable video found in archive',
   archive_disabled: 'Archived results are disabled',
   archive_incomplete: 'Archive volumes missing or unreadable: not streamable',
+};
+
+const SPOOL_REASONS: Record<UsenetSpoolErrorCode, string> = {
+  USENET_SPOOL_UNAVAILABLE:
+    'The transient Usenet spool is unavailable. Check its disk path and permissions.',
+  USENET_SPOOL_CAPACITY:
+    'The transient Usenet spool is at capacity. Reduce concurrent streams or increase its budget.',
+  USENET_SPOOL_DISK_FULL:
+    'The transient Usenet spool disk has insufficient free space.',
+  USENET_SPOOL_IO: 'The transient Usenet spool encountered a disk I/O error.',
+  USENET_SPOOL_NOT_FOUND:
+    'Transient Usenet spool data disappeared before playback completed.',
+  USENET_SPOOL_OPEN_FILE_LIMIT:
+    'The transient Usenet spool reached its open-file limit.',
+  USENET_SPOOL_CLOSED:
+    'The Usenet streaming engine closed while the request was active.',
+  USENET_SPOOL_ABORTED: 'The Usenet streaming request was cancelled.',
+  USENET_SPOOL_INVALID_ARGUMENT:
+    'The Usenet streaming resource configuration is invalid.',
+  USENET_SPOOL_METADATA_MISMATCH:
+    'The Usenet segment metadata does not match the requested file range.',
+  USENET_MEMORY_BUDGET:
+    'The transient Usenet memory budget cannot admit this stream.',
 };
 
 /**
@@ -136,6 +165,32 @@ export function friendlyUsenetError(err: unknown): {
       code: 'article_not_found',
     };
   }
+  if (err instanceof UsenetSpoolError) {
+    return { reason: SPOOL_REASONS[err.code], code: err.code };
+  }
+  if (err instanceof YencDecodeError) {
+    return {
+      reason: 'The Usenet article is malformed or not valid yEnc data.',
+      code: 'USENET_STREAMING_DECODE',
+    };
+  }
+  if (err instanceof YencMetadataError) {
+    return {
+      reason: 'The Usenet article does not contain trustworthy seek metadata.',
+      code: 'USENET_STREAMING_METADATA',
+    };
+  }
+  if (
+    err instanceof NntpError &&
+    err.kind === 'timeout' &&
+    err.timeoutSource === 'local_backpressure'
+  ) {
+    return {
+      reason:
+        'The Usenet segment exceeded its total time limit while local disk or player backpressure was active.',
+      code: 'USENET_STREAMING_BACKPRESSURE_TIMEOUT',
+    };
+  }
   return {
     reason: err instanceof Error ? err.message : 'Inspection failed',
     code: 'inspect_failed',
@@ -152,6 +207,50 @@ export function toDebridError(err: unknown): DebridError {
       code: 'DOWNLOAD_FAILED',
       headers: {},
       body: null,
+      type: 'upstream_error',
+      cause: err,
+    });
+  }
+  if (err instanceof UsenetSpoolError) {
+    const diskFull = err.code === 'USENET_SPOOL_DISK_FULL';
+    const resourceUnavailable =
+      err.code === 'USENET_SPOOL_UNAVAILABLE' ||
+      err.code === 'USENET_SPOOL_CAPACITY' ||
+      err.code === 'USENET_SPOOL_OPEN_FILE_LIMIT' ||
+      err.code === 'USENET_MEMORY_BUDGET' ||
+      err.code === 'USENET_SPOOL_CLOSED';
+    return new DebridError(SPOOL_REASONS[err.code], {
+      statusCode: diskFull ? 507 : resourceUnavailable ? 503 : 502,
+      statusText: diskFull
+        ? 'Insufficient Storage'
+        : resourceUnavailable
+          ? 'Service Unavailable'
+          : 'Bad Gateway',
+      code: diskFull
+        ? 'STORE_LIMIT_EXCEEDED'
+        : resourceUnavailable
+          ? 'SERVICE_UNAVAILABLE'
+          : 'DOWNLOAD_FAILED',
+      headers: {},
+      body: { usenetCode: err.code },
+      type: 'upstream_error',
+      cause: err,
+    });
+  }
+  if (
+    err instanceof YencDecodeError ||
+    err instanceof YencMetadataError ||
+    (err instanceof NntpError &&
+      err.kind === 'timeout' &&
+      err.timeoutSource === 'local_backpressure')
+  ) {
+    const friendly = friendlyUsenetError(err);
+    return new DebridError(friendly.reason, {
+      statusCode: 502,
+      statusText: 'Bad Gateway',
+      code: 'DOWNLOAD_FAILED',
+      headers: {},
+      body: { usenetCode: friendly.code },
       type: 'upstream_error',
       cause: err,
     });

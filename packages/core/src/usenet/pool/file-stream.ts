@@ -514,7 +514,15 @@ export class FileStream implements SeekableStream {
           callback(error);
           return;
         }
-        current.once('close', () => callback(error));
+        // Relay teardown already owns the outward error. Keep one bounded
+        // listener while destroying the detached inner stream so its abort
+        // error cannot become an uncaught EventEmitter error.
+        const onInnerDestroyError = (): void => undefined;
+        current.once('error', onInnerDestroyError);
+        current.once('close', () => {
+          current.removeListener('error', onInnerDestroyError);
+          callback(error);
+        });
         if (!current.destroyed) current.destroy(error ?? undefined);
       },
     });

@@ -31,6 +31,7 @@ import {
   pruneUsenetMetrics,
   requeueInterruptedInspects,
   flushAllDiskCaches,
+  shutdownUsenetEngines,
   ReleaseBlocklistRemoteService,
   ReleaseBlocklistPublishService,
   flushStreamSessions,
@@ -322,17 +323,42 @@ async function start() {
   }
 }
 
-async function shutdown() {
+let shutdownPromise: Promise<void> | undefined;
+
+function shutdown(): Promise<void> {
+  shutdownPromise ??= shutdownOnce();
+  return shutdownPromise;
+}
+
+async function shutdownOnce() {
+  const errors: unknown[] = [];
+  const runCleanup = async (
+    label: string,
+    operation: () => Promise<unknown>
+  ): Promise<void> => {
+    try {
+      await operation();
+    } catch (error) {
+      errors.push(error);
+      logger.error({ err: error, cleanup: label }, 'shutdown cleanup failed');
+    }
+  };
   TaskManager.stopAll();
   // Write live sessions out so the next boot doesn't reclaim them as stale.
   streamRegistry.closeAll('stale');
-  await flushStreamSessions().catch(() => undefined);
-  await stopAnalytics().catch(() => undefined);
-  await flushAllDiskCaches().catch(() => undefined);
-  await Cache.close();
+  await runCleanup('stream sessions', flushStreamSessions);
+  await runCleanup('analytics', stopAnalytics);
+  // This is the exclusive stable segment-cache writer handoff: all NNTP,
+  // readers, spool files, leases and the final index snapshot finish here.
+  await runCleanup('usenet engines', shutdownUsenetEngines);
+  await runCleanup('disk caches', flushAllDiskCaches);
+  await runCleanup('cache service', () => Cache.close());
   RegexAccess.cleanup();
   SelAccess.cleanup();
-  await closeDb();
+  await runCleanup('database', closeDb);
+  if (errors.length > 0) {
+    throw new AggregateError(errors, 'One or more shutdown cleanups failed');
+  }
 }
 
 process.on('unhandledRejection', (reason) => {
@@ -344,14 +370,24 @@ process.on('uncaughtException', (err) => {
 
 process.on('SIGTERM', async () => {
   logger.info('SIGTERM received. Shutting down gracefully...');
-  await shutdown();
-  process.exit(0);
+  try {
+    await shutdown();
+    process.exit(0);
+  } catch (error) {
+    logger.fatal({ err: error }, 'shutdown completed with cleanup errors');
+    process.exit(1);
+  }
 });
 
 process.on('SIGINT', async () => {
   logger.info('SIGINT received. Shutting down gracefully...');
-  await shutdown();
-  process.exit(0);
+  try {
+    await shutdown();
+    process.exit(0);
+  } catch (error) {
+    logger.fatal({ err: error }, 'shutdown completed with cleanup errors');
+    process.exit(1);
+  }
 });
 
 start().catch((error) => {

@@ -7,11 +7,7 @@ import { appConfig } from '../utils/index.js';
 import { MultiProviderPool } from './pool/multi-provider-pool.js';
 import { SegmentSpoolingRuntime } from './pool/segment-spooling-runtime.js';
 import { PrioritySemaphore } from './pool/priority-semaphore.js';
-import {
-  closeSegmentCacheInBackground,
-  SegmentCache,
-  CacheStats,
-} from './pool/segment-cache.js';
+import { SegmentCache, type CacheStats } from './pool/segment-cache.js';
 import { StatsAccumulator } from './stats/accumulator.js';
 import { FileStream, SeekableStream, SegmentMemo } from './pool/file-stream.js';
 import { trackSeekableStream, reapIdleStreams } from './pool/tracked-stream.js';
@@ -74,6 +70,7 @@ import {
   LiveTiles,
   ProviderMetricDelta,
   ProviderStatsSnapshot,
+  type ResourceStats,
 } from './stats/types.js';
 import {
   resolveEngineResourcePlan,
@@ -169,6 +166,7 @@ export interface EngineLiveStats {
   tiles: LiveTiles;
   pool: PoolInfo;
   cache: CacheStats;
+  resources: ResourceStats;
   /** In-flight read streams (live "Streams" view). */
   streams: LiveStreamInfo[];
 }
@@ -197,6 +195,7 @@ export class UsenetEngine {
   /** Immutable engine-wide limits derived from {@link options}. */
   readonly resourcePlan: EngineResourcePlan;
   private purgeTimer?: NodeJS.Timeout;
+  private closePromise: Promise<void> | undefined;
   /** Engine-lifetime per-provider STAT trust (census calibration results). */
   private statTrust = new StatTrustCache();
   /** Live census runs, so close() can cancel their workers promptly. */
@@ -276,6 +275,11 @@ export class UsenetEngine {
       {
         fingerprint: this.fingerprint,
         providers: providers.filter((p) => p.enabled !== false).length,
+        streamingMode: this.resourcePlan.mode,
+        arenaBudgetBytes: this.resourcePlan.arenaBytes,
+        spoolingMemoryBudgetBytes:
+          this.resourcePlan.segmentSpooling?.memoryBudgetBytes ?? 0,
+        spoolBudgetBytes: this.resourcePlan.segmentSpooling?.spoolBytes ?? 0,
         maxConcurrentDownloads: this.options.maxConcurrentDownloads,
       },
       'usenet engine created'
@@ -1157,12 +1161,45 @@ export class UsenetEngine {
    * Unified live snapshot (tiles + pool + cache + streams).
    */
   liveStats(): EngineLiveStats {
+    const cache = this.cache.stats();
     return {
       fingerprint: this.fingerprint,
       tiles: this.stats.live(),
       pool: this.pool.poolInfo(),
-      cache: this.cache.stats(),
+      cache,
+      resources: this.resourceStats(cache),
       streams: this.stats.liveStreams(),
+    };
+  }
+
+  private resourceStats(cache: CacheStats): ResourceStats {
+    const runtime = this.pool.spoolingStats();
+    const memory = runtime?.memory;
+    const spool = runtime?.spool;
+    return {
+      streamingMode: this.resourcePlan.mode,
+      memory: {
+        usedBytes: memory?.usedBytes ?? 0,
+        maxBytes: memory?.maxBytes ?? 0,
+        peakBytes: memory?.peakBytes ?? 0,
+        waiting: memory?.waiting ?? 0,
+      },
+      spool: {
+        reservedBytes: spool?.budget.reservedBytes ?? 0,
+        actualBytes: spool?.budget.actualBytes ?? 0,
+        maxBytes: spool?.budget.maxBytes ?? 0,
+        peakReservedBytes: spool?.budget.peakReservedBytes ?? 0,
+        peakActualBytes: spool?.budget.peakActualBytes ?? 0,
+        sessions: spool?.sessions ?? 0,
+        files: spool?.artifacts ?? 0,
+        openFiles: spool?.files.openFiles ?? 0,
+        waiting: (spool?.budget.waiting ?? 0) + (spool?.files.waiting ?? 0),
+      },
+      arena: {
+        usedBytes: cache.arenaBytes ?? 0,
+        budgetBytes: cache.arenaBudgetBytes ?? this.resourcePlan.arenaBytes,
+        exhaustions: cache.arenaExhaustions ?? 0,
+      },
     };
   }
 
@@ -1182,8 +1219,15 @@ export class UsenetEngine {
     this.lastUsedAt = Date.now();
   }
 
-  close(): void {
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closePromise = this.closeOnce();
+    return this.closePromise;
+  }
+
+  private async closeOnce(): Promise<void> {
     if (this.purgeTimer) clearInterval(this.purgeTimer);
+    this.purgeTimer = undefined;
     // Cancel any shadow census first so its workers stop submitting to the
     // pool being closed (they self-resolve with `complete: false`).
     for (const census of this.liveCensus) census.cancel();
@@ -1197,16 +1241,35 @@ export class UsenetEngine {
         reader.destroy(new Error('usenet engine closed'));
       }
     }
-    this.pool.close();
-    // Persist the disk index + drain pending writes; keep on-disk files so the
-    // cache survives the eviction/restart (do NOT clear()).
-    closeSegmentCacheInBackground(this.cache, (error: unknown) => {
+    const errors: unknown[] = [];
+    try {
+      await this.pool.close();
+    } catch (error) {
+      errors.push(error);
+      logger.error(
+        { fingerprint: this.fingerprint, err: error },
+        'usenet pool close failed'
+      );
+    }
+    // The pool/runtime owns producers and spool promotion sources. Close it
+    // before persisting the segment-cache index so no late writer can overlap
+    // the next engine using the stable namespace.
+    try {
+      await this.cache.close();
+    } catch (error) {
+      errors.push(error);
       logger.error(
         { fingerprint: this.fingerprint, err: error },
         'usenet segment cache close failed'
       );
-    });
-    logger.debug({ fingerprint: this.fingerprint }, 'usenet engine closed');
+    }
+    logger.info(
+      { fingerprint: this.fingerprint, cleanupErrors: errors.length },
+      'usenet engine closed'
+    );
+    if (errors.length > 0) {
+      throw new AggregateError(errors, 'Usenet engine cleanup failed');
+    }
   }
 }
 
@@ -1250,6 +1313,9 @@ async function pruneLegacySegmentCaches(): Promise<void> {
 export class UsenetEngineRegistry {
   private engines = new Map<string, UsenetEngine>();
   private evictionTimer?: NodeJS.Timeout;
+  /** Fail-closed writer handoff for the stable segment-cache namespace. */
+  private retirement: Promise<void> = Promise.resolve();
+  private closed = false;
 
   constructor(private idleEvictMs = 5 * 60_000) {
     this.evictionTimer = setInterval(() => this.evictIdle(), 60_000);
@@ -1258,35 +1324,46 @@ export class UsenetEngineRegistry {
   }
 
   /** Get-or-create an engine for the given providers + options. */
-  get(
+  async get(
     providers: ProviderConfig[],
     options?: Partial<EngineOptions>
-  ): UsenetEngine {
+  ): Promise<UsenetEngine> {
     const key = providerSetFingerprint(
       providers,
       appConfig.bootstrap.secretKey
     );
-    let engine = this.engines.get(key);
-    if (!engine) {
+    for (;;) {
+      if (this.closed) throw new Error('Usenet engine registry is closed');
+      const barrier = this.retirement;
+      await barrier;
+      // A concurrent invalidation may have published a new barrier while this
+      // caller awaited the previous one. Observe the newest handoff first.
+      if (barrier !== this.retirement) continue;
+      let engine = this.engines.get(key);
+      if (engine) {
+        engine.lastUsedAt = Date.now();
+        return engine;
+      }
       // NNTP providers are a single global admin config, so any engine under a
       // different fingerprint is stale (e.g. providers were just edited). Close
       // it now instead of waiting for idle eviction, so the shared, stable
       // segment-cache directory only ever has one live writer.
+      const stale: UsenetEngine[] = [];
       for (const [k, e] of this.engines) {
         if (k !== key) {
-          logger.debug(
-            { fingerprint: k },
-            'closing stale usenet engine after provider change'
-          );
-          e.close();
           this.engines.delete(k);
+          stale.push(e);
         }
+      }
+      if (stale.length > 0) {
+        this.beginRetirement(stale, 'provider-change');
+        continue;
       }
       engine = new UsenetEngine(providers, options);
       this.engines.set(key, engine);
+      engine.lastUsedAt = Date.now();
+      return engine;
     }
-    engine.lastUsedAt = Date.now();
-    return engine;
   }
 
   /**
@@ -1320,8 +1397,10 @@ export class UsenetEngineRegistry {
           { fingerprint: key, idleMs: now - engine.lastUsedAt },
           'evicting idle usenet engine'
         );
-        engine.close();
         this.engines.delete(key);
+        void this.beginRetirement([engine], 'idle-eviction').catch((error) => {
+          logger.error({ err: error }, 'idle usenet engine close failed');
+        });
       }
     }
   }
@@ -1330,14 +1409,48 @@ export class UsenetEngineRegistry {
    * Close and drop every warm engine WITHOUT stopping the eviction timer (unlike
    * {@link closeAll}, which is for shutdown).
    */
-  invalidate(): void {
-    for (const engine of this.engines.values()) engine.close();
+  invalidate(): Promise<void> {
+    const engines = [...this.engines.values()];
     this.engines.clear();
+    return this.beginRetirement(engines, 'invalidation');
   }
 
-  closeAll(): void {
+  async closeAll(): Promise<void> {
+    if (this.closed) return this.retirement;
+    this.closed = true;
     if (this.evictionTimer) clearInterval(this.evictionTimer);
-    for (const engine of this.engines.values()) engine.close();
+    this.evictionTimer = undefined;
+    const engines = [...this.engines.values()];
     this.engines.clear();
+    await this.beginRetirement(engines, 'process-shutdown');
+  }
+
+  private beginRetirement(
+    engines: readonly UsenetEngine[],
+    reason: string
+  ): Promise<void> {
+    if (engines.length === 0) return this.retirement;
+    const previous = this.retirement;
+    const next = previous.then(async () => {
+      logger.info(
+        { reason, engines: engines.length },
+        'waiting for exclusive usenet engine cleanup'
+      );
+      const results = await Promise.allSettled(
+        engines.map((engine) => engine.close())
+      );
+      const errors = results.flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : []
+      );
+      if (errors.length > 0) {
+        throw new AggregateError(errors, 'Usenet engine retirement failed');
+      }
+      logger.info(
+        { reason, engines: engines.length },
+        'exclusive usenet engine cleanup completed'
+      );
+    });
+    this.retirement = next;
+    return next;
   }
 }

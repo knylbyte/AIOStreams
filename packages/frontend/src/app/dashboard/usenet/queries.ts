@@ -69,6 +69,38 @@ export interface CacheStats {
   diskBytes: number;
   diskCount: number;
   diskHits: number;
+  arenaBytes?: number;
+  arenaEntries?: number;
+  arenaPinned?: number;
+  arenaEvictions?: number;
+  arenaBudgetBytes?: number;
+  arenaExhaustions?: number;
+}
+
+export interface ResourceStats {
+  streamingMode: 'segment_buffering' | 'segment_spooling';
+  memory: {
+    usedBytes: number;
+    maxBytes: number;
+    peakBytes: number;
+    waiting: number;
+  };
+  spool: {
+    reservedBytes: number;
+    actualBytes: number;
+    maxBytes: number;
+    peakReservedBytes: number;
+    peakActualBytes: number;
+    sessions: number;
+    files: number;
+    openFiles: number;
+    waiting: number;
+  };
+  arena: {
+    usedBytes: number;
+    budgetBytes: number;
+    exhaustions: number;
+  };
 }
 
 export interface ProviderLiveInfo {
@@ -136,6 +168,7 @@ export interface UsenetStatsOverview {
   live: LiveTiles;
   pool: PoolInfo;
   cache: CacheStats;
+  resources: ResourceStats;
   totals: {
     articles: number;
     bytes: number;
@@ -167,6 +200,7 @@ export interface LiveStats {
   live: LiveTiles;
   pool: PoolInfo;
   cache: CacheStats;
+  resources: ResourceStats;
   streams: LiveStreamInfo[];
   /**
    * The server's sampling interval, present only on streamed frames.

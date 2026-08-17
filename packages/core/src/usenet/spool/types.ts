@@ -109,6 +109,8 @@ export interface SpoolManagerStats {
   readonly budget: SpoolBudgetStats;
   readonly files: OpenFileStats;
   readonly artifacts: number;
+  /** Distinct hashed stream/session owners with live transient artifacts. */
+  readonly sessions: number;
 }
 
 /** Byte range for a reader; `endExclusive` follows standard slice semantics. */

@@ -19,7 +19,9 @@ import {
   type UsenetProviderStatRow,
   type UsenetIndexerStatRow,
   type UsenetStatsOverview,
+  type ResourceStats,
 } from './queries';
+import { resourceSummaryItems, streamingModeLabel } from './resource-stats';
 import {
   formatBytes,
   formatSpeed,
@@ -327,6 +329,8 @@ function LivePanel() {
         />
       </div>
 
+      {d?.resources && <ResourcePanel resources={d.resources} />}
+
       <Card className="p-4">
         <div className="flex items-baseline justify-between mb-3">
           <h3 className="text-sm font-semibold">Live connections</h3>
@@ -428,6 +432,50 @@ function LivePanel() {
         )}
       </Card>
     </div>
+  );
+}
+
+function ResourcePanel({ resources }: { resources: ResourceStats }) {
+  const items = resourceSummaryItems(resources);
+  return (
+    <Card className="p-4">
+      <div className="flex flex-wrap items-baseline justify-between gap-2 mb-3">
+        <h3 className="text-sm font-semibold">Streaming resources</h3>
+        <span className="text-xs font-medium text-brand">
+          {streamingModeLabel(resources.streamingMode)}
+        </span>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+        {items.map((item) => (
+          <div key={item.id} className="min-w-0">
+            <p className="text-xs text-[--muted]">{item.label}</p>
+            {item.kind === 'bytes' ? (
+              <>
+                <p className="text-sm font-semibold tabular-nums">
+                  {formatBytes(item.value)} / {formatBytes(item.max)}
+                </p>
+                <p className="text-xs text-[--muted]">
+                  {item.id === 'arena'
+                    ? `${resources.arena.exhaustions} exhaustions`
+                    : item.id === 'spool'
+                      ? `${formatBytes(item.reserved ?? 0)} reserved · peak ${formatBytes(item.peak ?? 0)}`
+                      : `peak ${formatBytes(item.peak ?? 0)} · ${item.waiting ?? 0} waiting`}
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="text-sm font-semibold tabular-nums">
+                  {item.files} files · {item.sessions} sessions
+                </p>
+                <p className="text-xs text-[--muted]">
+                  {item.openFiles} open · {item.waiting} waiting
+                </p>
+              </>
+            )}
+          </div>
+        ))}
+      </div>
+    </Card>
   );
 }
 
@@ -559,9 +607,11 @@ function indexerFailBreakdown(i: UsenetIndexerStatRow): string {
 }
 
 /** Popover shape mirroring {@link ProviderHealthPopover} for grab errors. */
-function indexerErrorInfo(
-  e: NonNullable<UsenetIndexerStatRow['lastError']>
-): { tone: 'bad' | 'warn'; label: string; hint: string } {
+function indexerErrorInfo(e: NonNullable<UsenetIndexerStatRow['lastError']>): {
+  tone: 'bad' | 'warn';
+  label: string;
+  hint: string;
+} {
   if (e.status === 401 || e.status === 403) {
     return {
       tone: 'bad',

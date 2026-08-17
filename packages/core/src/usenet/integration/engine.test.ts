@@ -5,7 +5,7 @@ import {
   type UsenetEngineRuntimeSettings,
 } from './engine.js';
 import { UsenetResourcePlanConfigError } from '../resource-plan.js';
-import type { ProviderConfig } from '../types.js';
+import { DEFAULT_ENGINE_OPTIONS, type ProviderConfig } from '../types.js';
 import { usenetSchema } from '../../config/schema/usenet.js';
 
 const MEBIBYTE_BYTES = 1024 * 1024;
@@ -168,4 +168,108 @@ test('buildUsenetEngineOptions validates spooling combinations centrally', () =>
       () => '/test/cache'
     )
   );
+});
+
+test('engine live stats expose the effective buffering resource plan', async () => {
+  const { UsenetEngine } = await import('../index.js');
+  const engine = new UsenetEngine([], {
+    ...DEFAULT_ENGINE_OPTIONS,
+    streamingMode: 'segment_buffering',
+    segmentDiskCacheBytes: 0,
+  });
+  const snapshot = engine.liveStats();
+  assert.equal(snapshot.resources.streamingMode, 'segment_buffering');
+  assert.deepEqual(snapshot.resources.memory, {
+    usedBytes: 0,
+    maxBytes: 0,
+    peakBytes: 0,
+    waiting: 0,
+  });
+  assert.equal(
+    snapshot.resources.arena.budgetBytes,
+    engine.resourcePlan.arenaBytes
+  );
+  assert.equal(snapshot.resources.arena.usedBytes, 0);
+  assert.equal(snapshot.resources.arena.exhaustions, 0);
+  await engine.close();
+});
+
+test('engine live stats are sourced from spooling memory, disk and file owners', async () => {
+  const { UsenetEngine } = await import('../index.js');
+  const engine = new UsenetEngine([], {
+    ...DEFAULT_ENGINE_OPTIONS,
+    streamingMode: 'segment_spooling',
+    segmentDiskCacheBytes: 0,
+  });
+  const plan = engine.resourcePlan.segmentSpooling;
+  assert(plan);
+  const resources = engine.liveStats().resources;
+  assert.equal(resources.streamingMode, 'segment_spooling');
+  assert.equal(resources.memory.maxBytes, plan.memoryBudgetBytes);
+  assert.equal(resources.spool.maxBytes, plan.spoolBytes);
+  assert.deepEqual(
+    {
+      memoryUsed: resources.memory.usedBytes,
+      reserved: resources.spool.reservedBytes,
+      actual: resources.spool.actualBytes,
+      sessions: resources.spool.sessions,
+      files: resources.spool.files,
+      openFiles: resources.spool.openFiles,
+    },
+    {
+      memoryUsed: 0,
+      reserved: 0,
+      actual: 0,
+      sessions: 0,
+      files: 0,
+      openFiles: 0,
+    }
+  );
+  await engine.close();
+});
+
+test('registry waits for the previous stable cache writer before replacement', async () => {
+  const { UsenetEngineRegistry } = await import('../index.js');
+  const registry = new UsenetEngineRegistry(60_000);
+  const firstProvider: ProviderConfig = {
+    id: 'first',
+    host: '127.0.0.1',
+    port: 119,
+    tls: false,
+    maxConnections: 1,
+    priority: 0,
+  };
+  const first = await registry.get([firstProvider], {
+    ...DEFAULT_ENGINE_OPTIONS,
+    segmentDiskCacheBytes: 0,
+  });
+  const closeStarted = Promise.withResolvers<void>();
+  const permitClose = Promise.withResolvers<void>();
+  const originalClose = first.close.bind(first);
+  first.close = async () => {
+    closeStarted.resolve();
+    await permitClose.promise;
+    await originalClose();
+  };
+
+  let replacementResolved = false;
+  const replacement = registry.get(
+    [{ ...firstProvider, id: 'second', port: 120 }],
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      segmentDiskCacheBytes: 0,
+    }
+  );
+  void replacement.then(() => {
+    replacementResolved = true;
+  });
+  await closeStarted.promise;
+  await Promise.resolve();
+  assert.equal(replacementResolved, false);
+
+  permitClose.resolve();
+  const second = await replacement;
+  assert.notEqual(second, first);
+  assert.equal(replacementResolved, true);
+  await registry.closeAll();
 });

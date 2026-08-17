@@ -40,6 +40,7 @@ import {
   type SegmentArtifact,
 } from './segment-artifact.js';
 import { SegmentSpoolingRuntime } from './segment-spooling-runtime.js';
+import type { SegmentSpoolingRuntimeStats } from './segment-spooling-runtime.js';
 import { SpoolingSegmentSink } from './spooling-segment-sink.js';
 import type {
   DecodedSegmentHeaderMetadata,
@@ -318,6 +319,7 @@ export class MultiProviderPool {
   private fetcher: SegmentFetcher;
   private globalDownloads: PrioritySemaphore;
   private readonly spooling: SegmentSpoolingRuntime | undefined;
+  private closePromise: Promise<void> | undefined;
   /** Single-flight coordinator for shared (arena-backed) segment fetches. */
   private sharedInflight = new Map<string, SharedFlight>();
   /** Single-flight coordinator for file-backed segment artifacts. */
@@ -1444,11 +1446,22 @@ export class MultiProviderPool {
     };
   }
 
+  /** Actual segment-spooling owners, absent in the compatible buffering mode. */
+  spoolingStats(): SegmentSpoolingRuntimeStats | undefined {
+    return this.spooling?.stats();
+  }
+
   purgeStaleIdles(): void {
     this.fetcher.purgeStaleIdles();
   }
 
-  close(): void {
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closePromise = this.closeOnce();
+    return this.closePromise;
+  }
+
+  private async closeOnce(): Promise<void> {
     const error = new UsenetSpoolError(
       'USENET_SPOOL_CLOSED',
       'Segment artifact pool is closed'
@@ -1462,12 +1475,7 @@ export class MultiProviderPool {
     this.artifactInflight.clear();
     this.fetcher.close();
     if (this.spooling) {
-      void this.spooling.close().catch((closeError: unknown) => {
-        logger.warn(
-          { err: closeError },
-          'failed to close segment-spooling resources'
-        );
-      });
+      await this.spooling.close();
     }
   }
 }

@@ -1042,6 +1042,14 @@ export class NntpConnection {
       this.localPauseStartedAt = now;
       this.socket.pause();
       this.socketLocallyPaused = true;
+      logger.trace(
+        {
+          provider: this.label,
+          connId: this.id,
+          inFlight: this.queue.length,
+        },
+        'nntp socket paused for local consumer backpressure'
+      );
     }
     this.armStallTimer();
   }
@@ -1128,9 +1136,23 @@ export class NntpConnection {
     }
     this.deferredRead = undefined;
     if (!this.destroyed && !this.pausedHead && this.socketLocallyPaused) {
+      const resumedAt = this.now();
+      const localBackpressureMs = Math.max(
+        0,
+        resumedAt - (this.localPauseStartedAt ?? resumedAt)
+      );
       this.socketLocallyPaused = false;
       this.localPauseStartedAt = undefined;
       this.socket.resume();
+      logger.trace(
+        {
+          provider: this.label,
+          connId: this.id,
+          inFlight: this.queue.length,
+          localBackpressureMs,
+        },
+        'nntp socket resumed after local consumer backpressure'
+      );
       this.armStallTimer();
     }
   }

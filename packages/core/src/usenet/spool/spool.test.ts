@@ -767,6 +767,7 @@ test('uses only hashed secure paths and leaves no process files after cleanup', 
   await artifact.complete();
   const promotion = artifact.acquirePromotion();
 
+  assert.equal(manager.stats().sessions, 1);
   assert.equal(promotion.path.startsWith(manager.engineRoot), true);
   assert.equal(promotion.path.includes(rawId), false);
   assert.match(path.basename(promotion.path), /^[a-f0-9]{64}\.ready$/);
@@ -782,6 +783,7 @@ test('uses only hashed secure paths and leaves no process files after cleanup', 
   }
   promotion.release();
   await artifact.dispose();
+  assert.equal(manager.stats().sessions, 0);
   await manager.close();
   await manager.close();
   assert.deepEqual(await filesBelow(cacheRoot), []);
