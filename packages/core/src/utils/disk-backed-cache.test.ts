@@ -19,6 +19,7 @@ import test, { type TestContext } from 'node:test';
 // Initialise the repository config/logger cycle in production order.
 import '../config/index.js';
 import {
+  DISK_CACHE_DELETE_PARTICIPANT_LIMIT,
   DiskBackedCache,
   DiskBackedCacheError,
   type DiskBackedCacheFileSystem,
@@ -663,14 +664,73 @@ test('a delete claim prevents a cross-instance lease without lookup stats', asyn
     },
     { hits: 0, misses: 0, diskHits: 0 }
   );
-  // A second logical delete coalesces with the already active process claim.
-  await readingCache.clear();
+  // A second logical delete joins the already active process claim. Its
+  // explicit cleanup barrier must observe that foreign attempt rather than
+  // reporting success while the physical removal is still unresolved.
+  let joinedClearSettled = false;
+  const joinedClear = readingCache.clear().then(() => {
+    joinedClearSettled = true;
+  });
+  await Promise.resolve();
+  assert.equal(joinedClearSettled, false);
   assert.equal(deleteCalls, 1);
 
   continueDelete.resolve();
-  await clearing;
+  await Promise.all([clearing, joinedClear]);
   await assert.rejects(access(dataPath), { code: 'ENOENT' });
   assert.equal(deleteCalls, 1);
+});
+
+test('a joined cleanup waits a failing shared attempt and one controlled retry', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-shared-retry-'));
+  const { dataPath } = await writePersistentEntry(
+    root,
+    'shared-retry',
+    Buffer.from('data')
+  );
+  const deleteEntered = deferred();
+  const continueDelete = deferred();
+  let deleteCalls = 0;
+  const guardedRm: DiskBackedCacheFileSystem['rm'] = async (
+    candidate,
+    options
+  ) => {
+    if (String(candidate) !== dataPath) return rm(candidate, options);
+    deleteCalls++;
+    if (deleteCalls === 1) {
+      deleteEntered.resolve();
+      await continueDelete.promise;
+      throw codedError('EBUSY');
+    }
+    return rm(candidate, options);
+  };
+  const first = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: { rm: guardedRm },
+  });
+  const second = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: { rm: guardedRm },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await Promise.all([first.whenReady(), second.whenReady()]);
+
+  const firstClear = first.clear();
+  await deleteEntered.promise;
+  let secondSettled = false;
+  const secondClear = second.clear().then(() => {
+    secondSettled = true;
+  });
+  await Promise.resolve();
+  assert.equal(secondSettled, false);
+  assert.equal(deleteCalls, 1);
+
+  continueDelete.resolve();
+  await Promise.all([firstClear, secondClear]);
+  assert.equal(deleteCalls, 2);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  await Promise.all([first.flush(), second.flush()]);
+  assert.equal(deleteCalls, 2);
 });
 
 test('a foreign lease rejects prepared replacement before Windows fallback', async (context) => {
@@ -1882,6 +1942,213 @@ test('startup orphan fingerprint supersedes a candidate replaced before intent p
   await writer.close();
 });
 
+test('a superseded startup candidate cannot satisfy a later owner clear', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-target-clear-'));
+  const directory = path.join(root, 'test-cache');
+  const key = 'target-clear';
+  const dataPath = path.join(directory, fileKey(key));
+  await mkdir(directory, { recursive: true });
+  const owner = createCache(context, root, { maxDiskBytes: 32 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await owner.whenReady();
+  await writeFile(dataPath, 'OLD', { mode: 0o600 });
+
+  const candidateObserved = deferred();
+  const continueObservation = deferred();
+  const revalidationEntered = deferred();
+  const continueRevalidation = deferred();
+  let targetLstatCalls = 0;
+  const scanner = createCache(context, root, {
+    maxDiskBytes: 32,
+    fileSystem: {
+      lstat: async (candidate) => {
+        const stats = await lstat(candidate);
+        if (String(candidate) !== dataPath) return stats;
+        targetLstatCalls++;
+        if (targetLstatCalls === 1) {
+          candidateObserved.resolve();
+          await continueObservation.promise;
+        } else if (targetLstatCalls === 2) {
+          revalidationEntered.resolve();
+          await continueRevalidation.promise;
+        }
+        return stats;
+      },
+    },
+  });
+
+  await candidateObserved.promise;
+  assert.equal(
+    await owner.installPreparedFile(
+      key,
+      await prepared(owner, Buffer.from('NEW!')),
+      4
+    ),
+    true
+  );
+  continueObservation.resolve();
+  await revalidationEntered.promise;
+
+  let clearSettled = false;
+  const clearing = owner.clear().then(() => {
+    clearSettled = true;
+  });
+  // clearOnce crosses only already-resolved lifecycle promises before dropping
+  // the indexed entry and registering its current-incarnation successor.
+  for (let turn = 0; turn < 8; turn++) await Promise.resolve();
+  assert.equal(owner.stats().diskCount, 0);
+  assert.equal(clearSettled, false);
+  assert.equal((await readFile(dataPath)).toString(), 'NEW!');
+
+  continueRevalidation.resolve();
+  await Promise.all([scanner.whenReady(), clearing]);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  assert.equal(owner.stats().diskCount, 0);
+  await Promise.all([owner.flush(), scanner.flush()]);
+});
+
+test('a superseded startup candidate cannot satisfy a later explicit delete', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-target-delete-'));
+  const directory = path.join(root, 'test-cache');
+  const key = 'target-delete';
+  const dataPath = path.join(directory, fileKey(key));
+  await mkdir(directory, { recursive: true });
+  const owner = createCache(context, root, { maxDiskBytes: 32 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await owner.whenReady();
+  await writeFile(dataPath, 'OLD', { mode: 0o600 });
+
+  const candidateObserved = deferred();
+  const continueObservation = deferred();
+  const revalidationEntered = deferred();
+  const continueRevalidation = deferred();
+  let targetLstatCalls = 0;
+  const scanner = createCache(context, root, {
+    maxDiskBytes: 32,
+    fileSystem: {
+      lstat: async (candidate) => {
+        const stats = await lstat(candidate);
+        if (String(candidate) !== dataPath) return stats;
+        targetLstatCalls++;
+        if (targetLstatCalls === 1) {
+          candidateObserved.resolve();
+          await continueObservation.promise;
+        } else if (targetLstatCalls === 2) {
+          revalidationEntered.resolve();
+          await continueRevalidation.promise;
+        }
+        return stats;
+      },
+    },
+  });
+
+  await candidateObserved.promise;
+  assert.equal(
+    await owner.installPreparedFile(
+      key,
+      await prepared(owner, Buffer.from('NEW!')),
+      4
+    ),
+    true
+  );
+  continueObservation.resolve();
+  await revalidationEntered.promise;
+
+  assert.equal(await owner.delete(key), true);
+  assert.equal(owner.stats().diskCount, 0);
+  assert.equal((await readFile(dataPath)).toString(), 'NEW!');
+  continueRevalidation.resolve();
+  await scanner.whenReady();
+  await owner.flush();
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  await Promise.all([owner.flush(), scanner.flush()]);
+});
+
+test('different startup fingerprints use a fenced successor without a mutation gap', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-target-pair-'));
+  const directory = path.join(root, 'test-cache');
+  const key = 'target-pair';
+  const dataPath = path.join(directory, fileKey(key));
+  await mkdir(directory, { recursive: true });
+  const writer = createCache(context, root, { maxDiskBytes: 32 });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await writer.whenReady();
+  await writeFile(dataPath, 'OLD', { mode: 0o600 });
+
+  const firstObserved = deferred();
+  const continueFirstObservation = deferred();
+  const firstRevalidation = deferred();
+  const continueFirstRevalidation = deferred();
+  let firstLstatCalls = 0;
+  const first = createCache(context, root, {
+    maxDiskBytes: 32,
+    fileSystem: {
+      lstat: async (candidate) => {
+        const stats = await lstat(candidate);
+        if (String(candidate) !== dataPath) return stats;
+        firstLstatCalls++;
+        if (firstLstatCalls === 1) {
+          firstObserved.resolve();
+          await continueFirstObservation.promise;
+        } else if (firstLstatCalls === 2) {
+          firstRevalidation.resolve();
+          await continueFirstRevalidation.promise;
+        }
+        return stats;
+      },
+    },
+  });
+
+  await firstObserved.promise;
+  await rm(dataPath, { force: true });
+  await writeFile(dataPath, 'NEWER', { mode: 0o600 });
+  continueFirstObservation.resolve();
+  await firstRevalidation.promise;
+
+  const secondRevalidation = deferred();
+  const continueSecondRevalidation = deferred();
+  let secondLstatCalls = 0;
+  let deleteCalls = 0;
+  const second = createCache(context, root, {
+    maxDiskBytes: 32,
+    fileSystem: {
+      lstat: async (candidate) => {
+        const stats = await lstat(candidate);
+        if (String(candidate) === dataPath && ++secondLstatCalls === 2) {
+          secondRevalidation.resolve();
+          await continueSecondRevalidation.promise;
+        }
+        return stats;
+      },
+      rm: async (candidate, options) => {
+        if (String(candidate) === dataPath) deleteCalls++;
+        return rm(candidate, options);
+      },
+    },
+  });
+  await second.whenReady();
+
+  continueFirstRevalidation.resolve();
+  await secondRevalidation.promise;
+  assert.equal(
+    await writer.installPreparedFile(
+      key,
+      await prepared(writer, Buffer.from('BLOCKED')),
+      7
+    ),
+    false
+  );
+  assert.equal((await readFile(dataPath)).toString(), 'NEWER');
+  continueSecondRevalidation.resolve();
+
+  await first.whenReady();
+  await second.flush();
+  assert.equal(deleteCalls, 1);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  await Promise.all([first.flush(), second.flush(), writer.flush()]);
+  assert.equal(deleteCalls, 1);
+});
+
 test('unchanged startup orphan is removed exactly once after fingerprint revalidation', async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-orphan-stable-'));
   const directory = path.join(root, 'test-cache');
@@ -2539,6 +2806,122 @@ test('two startup scans coalesce orphan removal without concurrent rm', async (c
     { diskBytes: 4, diskCount: 1 }
   );
   await second.close();
+});
+
+test('a joined close waits for a shared orphan attempt and retries its failure', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-orphan-join-'));
+  const directory = path.join(root, 'test-cache');
+  const dataPath = path.join(directory, fileKey('orphan-join'));
+  await mkdir(directory, { recursive: true });
+  await writeFile(dataPath, 'orphan', { mode: 0o600 });
+  const deleteEntered = deferred();
+  const continueDelete = deferred();
+  let deleteCalls = 0;
+  const guardedRm: DiskBackedCacheFileSystem['rm'] = async (
+    candidate,
+    options
+  ) => {
+    if (String(candidate) !== dataPath) return rm(candidate, options);
+    deleteCalls++;
+    if (deleteCalls === 1) {
+      deleteEntered.resolve();
+      await continueDelete.promise;
+      throw codedError('EBUSY');
+    }
+    return rm(candidate, options);
+  };
+  const first = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: { rm: guardedRm },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await deleteEntered.promise;
+  const second = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: { rm: guardedRm },
+  });
+  await second.whenReady();
+
+  let closeSettled = false;
+  const closing = second.close().then(() => {
+    closeSettled = true;
+  });
+  await Promise.resolve();
+  assert.equal(closeSettled, false);
+  assert.equal(deleteCalls, 1);
+
+  continueDelete.resolve();
+  await Promise.all([first.whenReady(), closing]);
+  assert.equal(deleteCalls, 2);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
+  await second.close();
+  assert.equal(deleteCalls, 2);
+});
+
+test('process path delete participants are hard-bounded with a typed error', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-intent-limit-'));
+  const directory = path.join(root, 'test-cache');
+  const dataPath = path.join(directory, fileKey('intent-limit'));
+  await mkdir(directory, { recursive: true });
+  await writeFile(dataPath, 'orphan', { mode: 0o600 });
+  const deleteEntered = deferred();
+  const continueDelete = deferred();
+  let deleteCalls = 0;
+  const guardedRm: DiskBackedCacheFileSystem['rm'] = async (
+    candidate,
+    options
+  ) => {
+    if (String(candidate) !== dataPath) return rm(candidate, options);
+    deleteCalls++;
+    if (deleteCalls === 1) {
+      deleteEntered.resolve();
+      await continueDelete.promise;
+    }
+    return rm(candidate, options);
+  };
+  const participants: DiskBackedCache<Buffer>[] = [];
+  const first = createCache(context, root, {
+    maxDiskBytes: 16,
+    fileSystem: { rm: guardedRm },
+  });
+  participants.push(first);
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await deleteEntered.promise;
+  for (let index = 1; index < DISK_CACHE_DELETE_PARTICIPANT_LIMIT; index++) {
+    const participant = createCache(context, root, {
+      maxDiskBytes: 16,
+      fileSystem: { rm: guardedRm },
+    });
+    participants.push(participant);
+    await participant.whenReady();
+  }
+
+  const overflow = new DiskBackedCache<Buffer>({
+    name: 'test-cache',
+    dir: root,
+    maxMemBytes: 0,
+    maxDiskBytes: 16,
+    serialize: (value) => Buffer.from(value),
+    deserialize: (value) => Buffer.from(value),
+    sizeOf: (value) => value.length,
+    fileSystem: { rm: guardedRm },
+  });
+  await overflow.whenReady();
+  await assert.rejects(overflow.close(), (error: unknown) => {
+    assert(error instanceof AggregateError);
+    return error.errors.some(
+      (candidate) =>
+        candidate instanceof DiskBackedCacheError &&
+        candidate.code === 'DISK_CACHE_DELETE_PARTICIPANT_LIMIT'
+    );
+  });
+  assert.equal(deleteCalls, 1);
+
+  continueDelete.resolve();
+  await Promise.all(participants.map((participant) => participant.whenReady()));
+  await Promise.all(participants.map((participant) => participant.flush()));
+  assert.equal(deleteCalls, 1);
+  await assert.rejects(access(dataPath), { code: 'ENOENT' });
 });
 
 test('stale background destination cleanup remains retryable after clear', async (context) => {
