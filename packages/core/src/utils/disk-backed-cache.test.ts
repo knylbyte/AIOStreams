@@ -61,6 +61,7 @@ function createCache(
     readonly fileSystem?: Partial<DiskBackedCacheFileSystem>;
     readonly name?: string;
     readonly deserialize?: (value: Buffer) => Buffer;
+    readonly beforeParticipantBlockedRetirement?: () => Promise<void>;
   }
 ): DiskBackedCache<Buffer> {
   const cache = new DiskBackedCache<Buffer>({
@@ -73,6 +74,8 @@ function createCache(
     sizeOf: (value) => value.length,
     renameFile: options.renameFile,
     fileSystem: options.fileSystem,
+    beforeParticipantBlockedRetirement:
+      options.beforeParticipantBlockedRetirement,
   });
   context.after(async () => {
     await cache.close();
@@ -126,15 +129,26 @@ interface SaturatedDeletePath {
   readonly lease: DiskFileLease;
   readonly dataPath: string;
   readonly deleteCalls: () => number;
+  readonly participants: readonly DiskBackedCache<Buffer>[];
+}
+
+interface SaturatedDeleteOptions {
+  readonly failFirstDelete?: boolean;
+  readonly beforeParticipantBlockedRetirement?: () => Promise<void>;
 }
 
 async function saturateDeleteParticipants(
   context: TestContext,
   root: string,
   key: string,
-  maxDiskBytes = 16
+  maxDiskBytes = 16,
+  options: SaturatedDeleteOptions = {}
 ): Promise<SaturatedDeletePath> {
-  const owner = createCache(context, root, { maxDiskBytes });
+  const owner = createCache(context, root, {
+    maxDiskBytes,
+    beforeParticipantBlockedRetirement:
+      options.beforeParticipantBlockedRetirement,
+  });
   await owner.whenReady();
   assert.equal(
     await owner.installPreparedFile(
@@ -153,20 +167,33 @@ async function saturateDeleteParticipants(
   let deleteCalls = 0;
   const guardedRm: DiskBackedCacheFileSystem['rm'] = async (
     candidate,
-    options
+    rmOptions
   ) => {
-    if (String(candidate) === dataPath) deleteCalls++;
-    return rm(candidate, options);
+    if (String(candidate) === dataPath) {
+      deleteCalls++;
+      if (options.failFirstDelete && deleteCalls === 1) {
+        throw codedError('EBUSY');
+      }
+    }
+    return rm(candidate, rmOptions);
   };
+  const participants: DiskBackedCache<Buffer>[] = [];
   for (let index = 0; index < DISK_CACHE_DELETE_PARTICIPANT_LIMIT; index++) {
     const participant = createCache(context, root, {
       maxDiskBytes,
       fileSystem: { rm: guardedRm },
     });
+    participants.push(participant);
     await participant.whenReady();
   }
   assert.equal(deleteCalls, 0);
-  return { owner, lease, dataPath, deleteCalls: () => deleteCalls };
+  return {
+    owner,
+    lease,
+    dataPath,
+    deleteCalls: () => deleteCalls,
+    participants,
+  };
 }
 
 async function saturateObservedDeleteParticipants(
@@ -201,6 +228,45 @@ async function indexedEntryCount(root: string, name = 'test-cache') {
 async function persistentEntryCount(root: string, name = 'test-cache') {
   const entries = await readdir(path.join(root, name));
   return entries.filter((entry) => /^[a-f0-9]{40}$/.test(entry)).length;
+}
+
+async function exactBudgetParticipantBlock(
+  context: TestContext,
+  root: string,
+  options: SaturatedDeleteOptions = {}
+): Promise<SaturatedDeletePath> {
+  const saturated = await saturateDeleteParticipants(
+    context,
+    root,
+    'blocked-old',
+    8,
+    options
+  );
+  assert.equal(
+    await saturated.owner.installPreparedFile(
+      'evicted-middle',
+      await prepared(saturated.owner, Buffer.from('mid!')),
+      4
+    ),
+    true
+  );
+  assert.equal(
+    await saturated.owner.installPreparedFile(
+      'survivor',
+      await prepared(saturated.owner, Buffer.from('keep')),
+      4
+    ),
+    true
+  );
+  await saturated.owner.flush();
+  assert.deepEqual(
+    {
+      diskBytes: saturated.owner.stats().diskBytes,
+      diskCount: saturated.owner.stats().diskCount,
+    },
+    { diskBytes: 8, diskCount: 2 }
+  );
+  return saturated;
 }
 
 interface LeasedSuccessorPath {
@@ -3949,4 +4015,214 @@ test('successful invalidation callbacks cannot affect a newer file incarnation',
   lease.confirmHit();
   await cache.flush();
   assert.equal((await cache.getAsync('same-key'))?.toString(), 'new!');
+});
+
+test('a resolved participant fence retires its stale entry at the exact disk budget', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-retire-budget-'));
+  const saturated = await exactBudgetParticipantBlock(context, root);
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  await saturated.lease.release();
+  await saturated.owner.flush();
+
+  assert.deepEqual(
+    {
+      diskBytes: saturated.owner.stats().diskBytes,
+      diskCount: saturated.owner.stats().diskCount,
+      indexEntries: await indexedEntryCount(root),
+      physicalEntries: await persistentEntryCount(root),
+    },
+    { diskBytes: 4, diskCount: 1, indexEntries: 1, physicalEntries: 1 }
+  );
+  assert.equal(saturated.deleteCalls(), 1);
+});
+
+test('an old cache cannot delete a same-key incarnation installed after fence retirement', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-retire-aba-'));
+  const saturated = await exactBudgetParticipantBlock(context, root);
+  await saturated.lease.release();
+  await saturated.owner.flush();
+
+  const replacement = createCache(context, root, { maxDiskBytes: 8 });
+  await replacement.whenReady();
+  assert.equal(
+    await replacement.installPreparedFile(
+      'blocked-old',
+      await prepared(replacement, Buffer.from('new!')),
+      4
+    ),
+    true
+  );
+  await replacement.flush();
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  await saturated.owner.flush();
+  assert.equal(await saturated.owner.delete('blocked-old'), false);
+  saturated.owner.resize(0, 0);
+  await saturated.owner.flush();
+  await saturated.owner.clear();
+
+  assert.equal((await readFile(saturated.dataPath)).toString(), 'new!');
+  assert.equal((await replacement.getAsync('blocked-old'))?.toString(), 'new!');
+});
+
+test('a superseded participant fence retires only the stale local incarnation', async (context) => {
+  const root = await mkdtemp(
+    path.join(tmpdir(), 'disk-cache-retire-superseded-')
+  );
+  const saturated = await exactBudgetParticipantBlock(context, root);
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  await rm(saturated.dataPath, { force: true });
+  await writeFile(saturated.dataPath, Buffer.from('new!'), { mode: 0o600 });
+  await saturated.lease.release();
+  await saturated.owner.flush();
+
+  assert.deepEqual(
+    {
+      diskBytes: saturated.owner.stats().diskBytes,
+      diskCount: saturated.owner.stats().diskCount,
+      indexEntries: await indexedEntryCount(root),
+      physicalEntries: await persistentEntryCount(root),
+      replacement: (await readFile(saturated.dataPath)).toString(),
+      deleteCalls: saturated.deleteCalls(),
+    },
+    {
+      diskBytes: 4,
+      diskCount: 1,
+      indexEntries: 1,
+      physicalEntries: 2,
+      replacement: 'new!',
+      deleteCalls: 0,
+    }
+  );
+});
+
+test('synchronous lookup retirement and entry identity protect an immediate local rewrite', async (context) => {
+  const root = await mkdtemp(
+    path.join(tmpdir(), 'disk-cache-retire-identity-')
+  );
+  const retirementEntered = deferred();
+  const continueRetirement = deferred();
+  const saturated = await exactBudgetParticipantBlock(context, root, {
+    beforeParticipantBlockedRetirement: async () => {
+      retirementEntered.resolve();
+      await continueRetirement.promise;
+    },
+  });
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  const release = saturated.lease.release();
+  await retirementEntered.promise;
+  await release;
+  assert.equal(await saturated.owner.acquireDiskFile('blocked-old'), undefined);
+  assert.equal(
+    await saturated.owner.installPreparedFile(
+      'blocked-old',
+      await prepared(saturated.owner, Buffer.from('new!')),
+      4
+    ),
+    true
+  );
+
+  continueRetirement.resolve();
+  await Promise.resolve();
+  await saturated.owner.flush();
+  assert.equal(
+    (await saturated.owner.getAsync('blocked-old'))?.toString(),
+    'new!'
+  );
+  assert.deepEqual(
+    {
+      diskBytes: saturated.owner.stats().diskBytes,
+      diskCount: saturated.owner.stats().diskCount,
+      misses: saturated.owner.stats().misses,
+    },
+    { diskBytes: 8, diskCount: 2, misses: 1 }
+  );
+});
+
+test('a transient fence failure stays blocked and retires once after explicit retry', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-retire-retry-'));
+  const saturated = await saturateDeleteParticipants(
+    context,
+    root,
+    'blocked-old',
+    4,
+    { failFirstDelete: true }
+  );
+  context.after(() => rm(root, { recursive: true, force: true }));
+
+  assert.equal(
+    await saturated.owner.installPreparedFile(
+      'discarded-before-retry',
+      await prepared(saturated.owner, Buffer.from('next')),
+      4
+    ),
+    false
+  );
+  await assert.rejects(saturated.lease.release(), { code: 'EBUSY' });
+  assert.deepEqual(
+    {
+      diskBytes: saturated.owner.stats().diskBytes,
+      diskCount: saturated.owner.stats().diskCount,
+      deleteCalls: saturated.deleteCalls(),
+    },
+    { diskBytes: 4, diskCount: 1, deleteCalls: 1 }
+  );
+  assert.equal(await saturated.owner.acquireDiskFile('blocked-old'), undefined);
+  assert.equal(
+    await saturated.owner.installPreparedFile(
+      'discarded-while-fenced',
+      await prepared(saturated.owner, Buffer.from('more')),
+      4
+    ),
+    false
+  );
+  assert.equal(saturated.owner.stats().diskBytes, 4);
+
+  const retryOwner = saturated.participants[0];
+  assert(retryOwner);
+  await retryOwner.flush();
+  await saturated.owner.flush();
+  assert.deepEqual(
+    {
+      diskBytes: saturated.owner.stats().diskBytes,
+      diskCount: saturated.owner.stats().diskCount,
+      deleteCalls: saturated.deleteCalls(),
+    },
+    { diskBytes: 0, diskCount: 0, deleteCalls: 2 }
+  );
+});
+
+test('close retires a resolved fence before its final index snapshot', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'disk-cache-retire-close-'));
+  const retirementEntered = deferred();
+  const continueRetirement = deferred();
+  const saturated = await exactBudgetParticipantBlock(context, root, {
+    beforeParticipantBlockedRetirement: async () => {
+      retirementEntered.resolve();
+      await continueRetirement.promise;
+    },
+  });
+
+  const release = saturated.lease.release();
+  await retirementEntered.promise;
+  await release;
+  await saturated.owner.close();
+  assert.equal(await indexedEntryCount(root), 1);
+  assert.equal(await persistentEntryCount(root), 1);
+
+  continueRetirement.resolve();
+  const restarted = createCache(context, root, { maxDiskBytes: 8 });
+  await restarted.whenReady();
+  context.after(() => rm(root, { recursive: true, force: true }));
+  assert.deepEqual(
+    {
+      diskBytes: restarted.stats().diskBytes,
+      diskCount: restarted.stats().diskCount,
+      value: (await restarted.getAsync('survivor'))?.toString(),
+    },
+    { diskBytes: 4, diskCount: 1, value: 'keep' }
+  );
 });

@@ -125,6 +125,8 @@ export interface DiskBackedCacheOptions<V> {
   renameFile?: (source: string, destination: string) => Promise<void>;
   /** Narrow generic filesystem seam for deterministic lifecycle/I/O tests. */
   fileSystem?: Partial<DiskBackedCacheFileSystem>;
+  /** Deterministic barrier before a resolved participant-fence retires its entry. */
+  beforeParticipantBlockedRetirement?: () => Promise<void>;
 }
 
 /**
@@ -181,6 +183,8 @@ interface DiskEntry {
    * stale and can be forgotten without issuing an ABA-prone current-path rm.
    */
   participantBlockedBy?: ProcessPathDeleteIntent;
+  /** Exactly one completion observer is registered for this entry identity. */
+  participantRetirementObserved?: true;
 }
 
 interface FileLeaseState {
@@ -1109,7 +1113,7 @@ export class DiskBackedCache<V> {
     signal?.throwIfAborted();
     if (!this.isCurrentGeneration(generation)) return undefined;
 
-    const entry = this.disk.get(fileKey);
+    const entry = this.currentDiskEntry(fileKey);
     const existingState = this.fileLeases.get(fileKey);
     if (!entry || existingState?.pendingDelete) {
       this.misses++;
@@ -1174,7 +1178,7 @@ export class DiskBackedCache<V> {
       return undefined;
     }
 
-    const current = this.disk.get(fileKey);
+    const current = this.currentDiskEntry(fileKey);
     if (!current || state.pendingDelete) {
       await this.releaseFileLease(fileKey, state);
       this.misses++;
@@ -1442,7 +1446,7 @@ export class DiskBackedCache<V> {
   }
 
   private commitDiskEntry(fileKey: string, serializedBytes: number): void {
-    const existing = this.disk.get(fileKey);
+    const existing = this.currentDiskEntry(fileKey);
     if (existing) this.diskBytes -= existing.size;
     this.disk.delete(fileKey);
     this.disk.set(fileKey, { size: serializedBytes });
@@ -1603,7 +1607,7 @@ export class DiskBackedCache<V> {
     if (!this.isCurrentGeneration(generation) || !this.diskEnabled()) {
       return false;
     }
-    const existing = this.disk.get(fileKey);
+    const existing = this.currentDiskEntry(fileKey);
     if (existing) {
       this.disk.delete(fileKey);
       this.disk.set(fileKey, existing);
@@ -1827,6 +1831,10 @@ export class DiskBackedCache<V> {
    * helper structure with the number of blocked paths.
    */
   private evictDisk(): void {
+    // Retirement is independent of the byte threshold: a resolved external
+    // fence has already finalized the old physical incarnation even when a
+    // different eviction brought the cache exactly back to budget.
+    this.retireResolvedParticipantBlockedEntries();
     const candidates = this.disk.keys();
     const candidateLimit = this.disk.size;
     for (
@@ -1838,16 +1846,9 @@ export class DiskBackedCache<V> {
       if (candidate.done) break;
       const fileKey = candidate.value;
       if (this.pendingWrites.has(fileKey)) continue;
-      const entry = this.disk.get(fileKey);
+      const entry = this.currentDiskEntry(fileKey);
       if (!entry) continue;
-      if (entry.participantBlockedBy) {
-        if (entry.participantBlockedBy.status === 'unresolved') continue;
-        // The pre-existing path fence has completed. This map entry describes
-        // the pre-fence incarnation and must not publish a current-incarnation
-        // delete that could unlink a replacement installed by another cache.
-        this.forgetDiskEntry(fileKey, entry);
-        continue;
-      }
+      if (entry.participantBlockedBy) continue;
       try {
         this.dropDisk(fileKey);
       } catch (error) {
@@ -1859,9 +1860,8 @@ export class DiskBackedCache<V> {
           // intact. Continue through the bounded LRU round so a later candidate
           // (including a newly committed entry after pending-write release) can
           // restore the hard logical budget.
-          entry.participantBlockedBy = processPathDeleteTail(
-            this.filePath(fileKey)
-          );
+          const fence = processPathDeleteTail(this.filePath(fileKey));
+          if (fence) this.markParticipantBlockedEntry(fileKey, entry, fence);
           continue;
         }
         throw error;
@@ -1870,7 +1870,10 @@ export class DiskBackedCache<V> {
   }
 
   private dropDisk(fileKey: string): void {
-    const entry = this.disk.get(fileKey);
+    // This is the defensive synchronization point shared by explicit delete,
+    // clear and every LRU caller. A resolved old fence is retirement-only and
+    // must never be converted into a current-incarnation filesystem delete.
+    const entry = this.currentDiskEntry(fileKey);
     if (!entry) return;
     const state = this.fileLeases.get(fileKey) ?? {
       leases: 0,
@@ -1885,6 +1888,83 @@ export class DiskBackedCache<V> {
     this.fileLeases.set(fileKey, state);
     this.forgetDiskEntry(fileKey, entry);
     void deletion.catch(() => undefined);
+  }
+
+  private markParticipantBlockedEntry(
+    fileKey: string,
+    entry: DiskEntry,
+    fence: ProcessPathDeleteIntent
+  ): void {
+    if (this.disk.get(fileKey) !== entry) return;
+    if (entry.participantBlockedBy) return;
+    entry.participantBlockedBy = fence;
+    if (entry.participantRetirementObserved) return;
+    entry.participantRetirementObserved = true;
+
+    // The observer owns no queue or registry slot. Weakly retaining the cache
+    // lets a closed instance become collectible even if a crash-left fence
+    // remains unresolved; entry/fence identity still protects a later local
+    // incarnation when completion eventually arrives.
+    const owner = new WeakRef(this);
+    const entryIdentity = new WeakRef(entry);
+    const beforeRetirement = this.opts.beforeParticipantBlockedRetirement;
+    const cacheName = this.opts.name;
+    void fence.completion
+      .then(async () => {
+        await beforeRetirement?.();
+        const liveEntry = entryIdentity.deref();
+        if (liveEntry) {
+          owner
+            .deref()
+            ?.retireParticipantBlockedEntry(fileKey, liveEntry, fence);
+        }
+      })
+      .catch((error: unknown) => {
+        logger.debug(
+          { name: cacheName, err: errorMessage(error) },
+          'disk cache participant-blocked entry retirement was deferred'
+        );
+      });
+  }
+
+  private retireParticipantBlockedEntry(
+    fileKey: string,
+    entry: DiskEntry,
+    fence: ProcessPathDeleteIntent
+  ): boolean {
+    if (
+      this.disk.get(fileKey) !== entry ||
+      entry.participantBlockedBy !== fence ||
+      fence.status !== 'resolved'
+    ) {
+      return false;
+    }
+    // The referenced fence owns the old physical outcome (`deleted`, `absent`
+    // or `superseded`). Retirement is deliberately logical-only so an external
+    // replacement at the same hash path can never be unlinked by this entry.
+    this.forgetDiskEntry(fileKey, entry);
+    return true;
+  }
+
+  private currentDiskEntry(fileKey: string): DiskEntry | undefined {
+    const entry = this.disk.get(fileKey);
+    const fence = entry?.participantBlockedBy;
+    if (entry && fence) {
+      this.retireParticipantBlockedEntry(fileKey, entry, fence);
+    }
+    return this.disk.get(fileKey);
+  }
+
+  private retireResolvedParticipantBlockedEntries(): void {
+    const entries = this.disk.entries();
+    const entryLimit = this.disk.size;
+    for (let inspected = 0; inspected < entryLimit; inspected++) {
+      const candidate = entries.next();
+      if (candidate.done) return;
+      const [fileKey, entry] = candidate.value;
+      const fence = entry.participantBlockedBy;
+      if (fence) this.retireParticipantBlockedEntry(fileKey, entry, fence);
+    }
   }
 
   private forgetDiskEntry(fileKey: string, entry: DiskEntry): void {
@@ -2257,6 +2337,7 @@ export class DiskBackedCache<V> {
   }
 
   stats(): DiskBackedCacheStats {
+    this.retireResolvedParticipantBlockedEntries();
     const total = this.hits + this.misses;
     return {
       memBytes: this.memBytes,
@@ -2275,7 +2356,7 @@ export class DiskBackedCache<V> {
     const fileKey = this.fileKey(key);
     const pending = this.pendingWrites.get(fileKey);
     if (pending) await pending.catch(() => undefined);
-    const diskEntry = this.disk.has(fileKey);
+    const diskEntry = this.currentDiskEntry(fileKey);
     // Disk-delete admission precedes every logical tier mutation. If the
     // bounded participant registry is saturated, the explicit delete rejects
     // without leaving either tier partially removed or retryable by accident.
@@ -2286,7 +2367,7 @@ export class DiskBackedCache<V> {
       this.mem.delete(key);
       this.memBytes -= memEntry.size;
     }
-    return memEntry !== undefined || diskEntry;
+    return memEntry !== undefined || diskEntry !== undefined;
   }
 
   clear(): Promise<void> {
@@ -2327,7 +2408,14 @@ export class DiskBackedCache<V> {
     await Promise.allSettled([...this.pendingWrites.values()]);
     // Any old snapshot already inside writeFile must settle before the final rm.
     await this.indexFlush.catch(() => undefined);
-    for (const fileKey of [...this.disk.keys()]) this.dropDisk(fileKey);
+    this.retireResolvedParticipantBlockedEntries();
+    const entries = this.disk.keys();
+    const entryLimit = this.disk.size;
+    for (let inspected = 0; inspected < entryLimit; inspected++) {
+      const candidate = entries.next();
+      if (candidate.done) break;
+      this.dropDisk(candidate.value);
+    }
     let deleteError: unknown;
     try {
       await this.retryPendingPhysicalDeletes(unindexedDeletesAtStart);
@@ -2395,6 +2483,7 @@ export class DiskBackedCache<V> {
 
   /** Persist the disk index. Coalesces concurrent callers. */
   async flushIndex(): Promise<void> {
+    this.retireResolvedParticipantBlockedEntries();
     if (
       !this.diskEnabled() ||
       !this.indexDirty ||
@@ -2412,6 +2501,10 @@ export class DiskBackedCache<V> {
     force: boolean
   ): Promise<void> {
     const operation = this.indexFlush.then(async () => {
+      // Snapshot creation is the index-durability linearization point. Sweep
+      // resolved external fences synchronously immediately before it so no
+      // stale logical incarnation can enter this generation's index.
+      this.retireResolvedParticipantBlockedEntries();
       if (
         !this.diskEnabled() ||
         (!force && !this.indexDirty) ||
@@ -2506,11 +2599,13 @@ export class DiskBackedCache<V> {
     cleanupFailures.push(...(await this.releaseAllPreparedFiles()));
     await Promise.allSettled([...this.pendingWrites.values()]);
     await this.indexFlush.catch(() => undefined);
+    this.retireResolvedParticipantBlockedEntries();
     try {
       await this.retryPendingPhysicalDeletes();
     } catch (error) {
       cleanupFailures.push(error);
     }
+    this.retireResolvedParticipantBlockedEntries();
     try {
       // Persist a final current snapshot after every admitted write. The
       // independent failure bit forces a retry even if an older attempt had
