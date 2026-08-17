@@ -376,6 +376,52 @@ test('registry replacement waits for the previous engine reader close', async ()
   await registry.closeAll();
 });
 
+test('engine close accepts a reader already stopped by the stream registry shutdown', async () => {
+  const [{ UsenetEngine }, { StreamRegistry }] = await Promise.all([
+    import('../index.js'),
+    import('../../stream-sessions/registry.js'),
+  ]);
+  const engine = new UsenetEngine([], {
+    ...DEFAULT_ENGINE_OPTIONS,
+    segmentDiskCacheBytes: 0,
+  });
+  const registry = new StreamRegistry(() => ({ ok: true }));
+  const opened = registry.open({
+    transport: 'usenet',
+    username: 'shutdown-user',
+    targetKey: 'coordinated-reader',
+  });
+  assert.equal(opened.ok, true);
+  if (!opened.ok) return;
+
+  const destroyGate = Promise.withResolvers<void>();
+  const reader = new BarrierReader(destroyGate.promise);
+  reader.on('error', () => undefined);
+  const access = engine as unknown as EngineTestAccess;
+  const tracked = access.track(barrierNzb, seekableReturning(reader));
+  const publicReader = tracked.createReadStream();
+  opened.handle.attach(publicReader);
+
+  registry.sealAndCloseAll('shutdown');
+  await reader.destroyEntered.promise;
+  assert.equal(reader.destroyed, true);
+  assert.equal(reader.closed, false);
+
+  let settled = false;
+  const closing = engine.close().then(() => {
+    settled = true;
+  });
+  await Promise.resolve();
+  assert.equal(settled, false);
+
+  destroyGate.resolve();
+  await closing;
+  assert.equal(reader.closed, true);
+  assert.equal(engine.liveStats().tiles.activeStreams, 0);
+  assert.equal(engine.liveStats().resources.memory.usedBytes, 0);
+  assert.equal(engine.liveStats().resources.spool.files, 0);
+});
+
 test('engine close aggregates reader and pool failures after cache cleanup', async () => {
   const { UsenetEngine } = await import('../index.js');
   const engine = new UsenetEngine([], {

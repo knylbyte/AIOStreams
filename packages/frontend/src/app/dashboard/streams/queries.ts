@@ -16,7 +16,8 @@ export type StreamEndReason =
   | 'banned'
   | 'limit'
   | 'error'
-  | 'stale';
+  | 'stale'
+  | 'shutdown';
 
 /**
  * What a session is doing. `paused` and `idle` both mean no bytes are moving,

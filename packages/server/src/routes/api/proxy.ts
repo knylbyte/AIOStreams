@@ -30,8 +30,11 @@ import { pipeline } from 'stream/promises';
 import { Transform } from 'stream';
 import { requireAdmin } from '../../middlewares/auth.js';
 import { corsMiddleware } from '../../middlewares/cors.js';
-import { StaticFiles } from '../../app.js';
-import { isStreamShutdownError } from './stream-shutdown.js';
+import { StaticFiles } from '../../static-files.js';
+import {
+  isStreamShutdownError,
+  sendStreamShutdownResponse,
+} from './stream-shutdown.js';
 
 const logger = createLogger('server');
 const router: Router = Router();
@@ -370,6 +373,23 @@ router.all(
     let data: z.infer<typeof ProxyDataSchema> | undefined;
     let clientIp: string | undefined;
     let session: ReturnType<typeof streamRegistry.open> | undefined;
+    const upstreamController = new AbortController();
+    let requestFinished = false;
+    const abortUpstream = (reason: unknown): void => {
+      if (!upstreamController.signal.aborted) {
+        upstreamController.abort(reason);
+      }
+    };
+    const onClientAborted = (): void => {
+      abortUpstream(new DOMException('Proxy client aborted', 'AbortError'));
+    };
+    const onResponseClose = (): void => {
+      if (!requestFinished && !res.writableEnded) {
+        abortUpstream(new DOMException('Proxy client closed', 'AbortError'));
+      }
+    };
+    req.once('aborted', onClientAborted);
+    res.once('close', onResponseClose);
 
     try {
       const { auth: decodedAuth, data: decodedData } =
@@ -437,10 +457,24 @@ router.all(
           }
           return;
         }
-        // A full-buffered player never notices a clean FIN.
+        // A full-buffered player never notices a clean FIN. Abort the active
+        // Undici request first: before response headers there is no body owner
+        // to destroy, and both request timeouts are deliberately disabled.
         session.handle.onKill(() => {
-          upstreamResponse?.body?.destroy();
-          if (!req.socket.destroyed) req.socket.resetAndDestroy();
+          const reason = session?.ok
+            ? session.handle.signal.reason
+            : new DOMException('Proxy stream stopped', 'AbortError');
+          abortUpstream(reason);
+          const bodyError = reason instanceof Error ? reason : undefined;
+          upstreamResponse?.body?.destroy(bodyError);
+          const canSendShutdownResponse =
+            isStreamShutdownError(reason) &&
+            !res.headersSent &&
+            !res.destroyed &&
+            !res.writableEnded;
+          if (!canSendShutdownResponse && !req.socket.destroyed) {
+            req.socket.resetAndDestroy();
+          }
         });
         session.handle.signal.throwIfAborted();
       }
@@ -455,6 +489,7 @@ router.all(
       let bodyDropped = false;
 
       while (true) {
+        upstreamController.signal.throwIfAborted();
         if (session?.ok) session.handle.signal.throwIfAborted();
         const grabContext = data.type === 'nzb' ? 'nzb_grabs' : undefined;
         const urlObj = rewriteRequestUrl(new URL(currentUrl));
@@ -500,6 +535,7 @@ router.all(
           body: isBodyRequest && !bodyDropped ? req : undefined,
           bodyTimeout: 0,
           headersTimeout: 0,
+          signal: upstreamController.signal,
         });
         if (session?.ok) session.handle.signal.throwIfAborted();
 
@@ -515,6 +551,7 @@ router.all(
         redirectCount++;
         // Release the pooled connection held by the intermediate response.
         await upstreamResponse.body.dump().catch(() => {});
+        upstreamController.signal.throwIfAborted();
         currentUrl = hop.location;
         method = hop.method as Dispatcher.HttpMethod;
         if (hop.methodChanged) {
@@ -615,16 +652,38 @@ router.all(
         upstreamResponse.body.destroy();
       }
 
-      const errorCode = (error as NodeJS.ErrnoException)?.code;
+      const terminalError =
+        session?.ok && session.handle.signal.aborted
+          ? session.handle.signal.reason
+          : upstreamController.signal.aborted
+            ? upstreamController.signal.reason
+            : error;
+      if (
+        isStreamShutdownError(terminalError) &&
+        !res.headersSent &&
+        !res.destroyed &&
+        !res.writableEnded
+      ) {
+        logger.info(
+          { code: (terminalError as NodeJS.ErrnoException)?.code },
+          'proxy stream stopped before response startup'
+        );
+        sendStreamShutdownResponse(res);
+        return;
+      }
+
+      const errorCode = (terminalError as NodeJS.ErrnoException)?.code;
       const isClientDisconnect =
         errorCode === 'ERR_STREAM_PREMATURE_CLOSE' ||
         errorCode === 'ERR_STREAM_UNABLE_TO_PIPE' ||
         errorCode === 'ECONNRESET' ||
         errorCode === 'EPIPE' ||
         errorCode === 'ERR_STREAM_DESTROYED' ||
-        isStreamShutdownError(error) ||
-        (error as Error)?.message?.includes('aborted') ||
-        (error as Error)?.message?.includes('destroyed');
+        errorCode === 'STREAM_STOPPED' ||
+        isStreamShutdownError(terminalError) ||
+        upstreamController.signal.aborted ||
+        (terminalError as Error)?.message?.includes('aborted') ||
+        (terminalError as Error)?.message?.includes('destroyed');
 
       if (!isClientDisconnect) {
         logger.error(`[${requestId}] Proxy request failed`, {
@@ -650,6 +709,9 @@ router.all(
         });
       }
     } finally {
+      requestFinished = true;
+      req.removeListener('aborted', onClientAborted);
+      res.removeListener('close', onResponseClose);
       // Ends this request only; the session idles out on its own.
       if (session?.ok) session.handle.close();
     }

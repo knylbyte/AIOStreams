@@ -41,6 +41,7 @@ import {
   pruneStreamSessions,
   recoverStreamSessions,
   streamRegistry,
+  shutdownNativeUsenetSessionOpens,
 } from '@aiostreams/core';
 
 const logger = createLogger('server');
@@ -334,10 +335,13 @@ let usenetShutdownPromise: Promise<void> | undefined;
 
 function beginUsenetShutdown(): Promise<void> {
   if (!usenetShutdownPromise) {
-    // closeAll() publishes the engine-registry fence synchronously. Attach a
-    // rejection observer immediately because session/analytics cleanup may run
-    // before the coordinator reaches the engine barrier.
-    usenetShutdownPromise = shutdownUsenetEngines();
+    // The native-open fence publishes synchronously and aborts remote NZB
+    // grabs. Its task-finally barrier must settle before engines (and later the
+    // DB) retire, so no crossing open can publish a warm session afterwards.
+    usenetShutdownPromise = (async () => {
+      await shutdownNativeUsenetSessionOpens();
+      await shutdownUsenetEngines();
+    })();
     void usenetShutdownPromise.catch(() => undefined);
   }
   return usenetShutdownPromise;
@@ -354,7 +358,7 @@ function shutdownCoordinatorInstance(): ShutdownCoordinator {
     server: () => httpServer,
     stopTasks: () => TaskManager.stopAll(),
     sealStreams: () => {
-      streamRegistry.sealAndCloseAll('stale');
+      streamRegistry.sealAndCloseAll('shutdown');
       beginUsenetShutdown();
     },
     beforeListenerClose: [

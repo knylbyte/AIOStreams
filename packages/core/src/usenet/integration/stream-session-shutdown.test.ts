@@ -9,6 +9,7 @@ import { closeDb, initDb } from '../../db/index.js';
 import { streamRegistry } from '../../stream-sessions/index.js';
 import {
   openNativeUsenetStream,
+  shutdownNativeUsenetSessionOpens,
   shutdownUsenetEngines,
   usenetEngineRegistry,
 } from './index.js';
@@ -33,10 +34,12 @@ test('native request stopped during session open creates no late reader or engin
 
   const entered = Promise.withResolvers<void>();
   const proceed = Promise.withResolvers<void>();
+  const upstreamClosed = Promise.withResolvers<void>();
   let server: Server | undefined;
   try {
     server = await new Promise<Server>((resolve, reject) => {
       const listener = createServer(async (_request, response) => {
+        _request.socket.once('close', () => upstreamClosed.resolve());
         entered.resolve();
         await proceed.promise;
         response.writeHead(200, {
@@ -90,15 +93,19 @@ test('native request stopped during session open creates no late reader or engin
     });
 
     await entered.promise;
-    streamRegistry.sealAndCloseAll('stale');
-    await shutdownUsenetEngines();
-    proceed.resolve();
-
-    await assert.rejects(
+    const rejected = assert.rejects(
       opening,
       (error: unknown) =>
-        (error as NodeJS.ErrnoException).code === 'STREAM_STOPPED'
+        (error as NodeJS.ErrnoException).code === 'STREAM_STOPPED' &&
+        (error as { reason?: unknown }).reason === 'shutdown'
     );
+    streamRegistry.sealAndCloseAll('shutdown');
+    const openingShutdown = shutdownNativeUsenetSessionOpens();
+    await upstreamClosed.promise;
+    await openingShutdown;
+    await shutdownUsenetEngines();
+
+    await rejected;
     assert.deepEqual(streamRegistry.snapshot(), []);
     assert.equal(usenetEngineRegistry.size, 0);
   } finally {

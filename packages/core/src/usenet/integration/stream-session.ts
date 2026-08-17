@@ -44,12 +44,17 @@ import {
 import { nzbContentKey } from '../../release-blocklist/keys.js';
 import { appConfig } from '../../utils/index.js';
 import {
+  StreamStoppedError,
   streamRegistry,
   usenetTargetKey,
 } from '../../stream-sessions/index.js';
 import { usenetEngineRegistry, getUsenetEngineConfig } from './engine.js';
 import { fetchNzb, parseNzbCached, canonicaliseNzbHash } from './library.js';
 import { noteStreamActivity, pruneStreamActivity } from './damage-policy.js';
+import {
+  BoundedOpeningFlights,
+  OpeningFlightError,
+} from './opening-flights.js';
 
 const logger = createLogger('usenet/stream');
 
@@ -113,8 +118,18 @@ function streamSessionKey(token: UsenetStreamToken): string {
 }
 
 const streamSessions = new Map<string, UsenetStreamSession>();
-/** Single-flight in-flight opens so concurrent first requests open once. */
-const openingSessions = new Map<string, Promise<UsenetStreamSession>>();
+/** Hard process cap for distinct cold native opens awaiting setup. */
+const MAX_NATIVE_SESSION_OPEN_FLIGHTS = 256;
+/** Hard fan-out cap for requests sharing one cold native open. */
+const MAX_NATIVE_SESSION_OPEN_WAITERS = 64;
+/**
+ * Cold/warm session resolution is single-flighted and hard bounded. A request
+ * abort removes only its waiter; process shutdown aborts the shared owner task.
+ */
+const openingSessions = new BoundedOpeningFlights<UsenetStreamSession>(
+  MAX_NATIVE_SESSION_OPEN_FLIGHTS,
+  MAX_NATIVE_SESSION_OPEN_WAITERS
+);
 /** Idle TTL for a warm session; comfortably below the 5-min engine idle evict. */
 const STREAM_SESSION_IDLE_MS = 90_000;
 
@@ -138,6 +153,31 @@ function isStreamFailing(key: string): boolean {
 /** Whether an error is a definitive "unservable by every provider" verdict. */
 function isDefinitiveMiss(err: unknown): boolean {
   return definitiveLossKind(err) !== undefined;
+}
+
+/** Give process shutdown precedence over fallout from the operation it aborts. */
+async function awaitSessionOpenStep<T>(
+  operation: Promise<T>,
+  signal: AbortSignal
+): Promise<T> {
+  try {
+    const value = await operation;
+    signal.throwIfAborted();
+    return value;
+  } catch (error) {
+    signal.throwIfAborted();
+    throw error;
+  }
+}
+
+/**
+ * Fence and settle every native session-open owner before engines/DB close.
+ * The fence is synchronous; the returned idempotent promise is the task-finally
+ * barrier. Warm handles are dropped because their owning engines retire next.
+ */
+export function shutdownNativeUsenetSessionOpens(): Promise<void> {
+  streamSessions.clear();
+  return openingSessions.close(new StreamStoppedError('shutdown'));
 }
 
 const sessionEvictionTimer = setInterval(() => {
@@ -404,18 +444,23 @@ function holeHooksFor(
 }
 
 /** Open (or reuse) the seekable handle for a resolved token. */
-async function getStreamSession(
+async function openStreamSession(
   decoded: UsenetStreamToken,
   providers: ProviderConfig[],
-  options: Partial<EngineOptions>
+  options: Partial<EngineOptions>,
+  signal: AbortSignal
 ): Promise<UsenetStreamSession> {
+  signal.throwIfAborted();
   const key = streamSessionKey(decoded);
   const existing = streamSessions.get(key);
   if (existing) {
     // Resolves the current engine (creating it after a provider edit) and
     // refreshes its idle clock so it isn't evicted out from under a session
     // that's serving range requests without re-entering the registry.
-    const engine = await usenetEngineRegistry.get(providers, options);
+    const engine = await awaitSessionOpenStep(
+      usenetEngineRegistry.get(providers, options),
+      signal
+    );
     if (existing.engine === engine) {
       existing.lastUsedAt = Date.now();
       logger.debug(
@@ -434,170 +479,194 @@ async function getStreamSession(
     streamSessions.delete(key);
   }
 
-  const inflight = openingSessions.get(key);
-  if (inflight) return inflight;
+  const startedAt = Date.now();
+  // The flight owns this process-level signal. Individual request signals are
+  // waiter-only so one disconnected client cannot poison another client.
+  const xml = await awaitSessionOpenStep(fetchNzb(decoded.nzb, signal), signal);
+  const grabbedAt = Date.now();
+  // Reuses the model the resolve just parsed (same hash); parsing the same
+  // multi-MB NZB twice per playback is pure waste.
+  const nzb = await awaitSessionOpenStep(
+    parseNzbCached(decoded.hash, xml),
+    signal
+  );
+  const parsedAt = Date.now();
+  // tokens minted before the content-hash rekey carry a search-time
+  // hash. Every library read/write below
+  // must use the canonical hash or it would patch/poison a stray row.
+  const hash = await awaitSessionOpenStep(
+    canonicaliseNzbHash(decoded.hash, nzb, decoded.nzb),
+    signal
+  );
+  // Legacy tokens carry a pre-rekey hash; stickiness is keyed canonically.
+  noteStreamActivity(hash);
+  const engine = await awaitSessionOpenStep(
+    usenetEngineRegistry.get(providers, options),
+    signal
+  );
+  // Fetched up-front: seeds the hole hooks (persisted hole map → replay
+  // pre-pad) and provides addedAt for Last-Modified below.
+  const entry = await awaitSessionOpenStep(
+    UsenetLibraryRepository.get(hash).catch(() => undefined),
+    signal
+  );
+  const { hooks: holeHooks, holeBytes } = holeHooksFor(
+    hash,
+    decoded,
+    entry,
+    key
+  );
 
-  const open = (async (): Promise<UsenetStreamSession> => {
-    const startedAt = Date.now();
-    // Open without the caller's request signal: a session is shared, so a
-    // disconnect mid-open must not poison it for everyone (segment timeouts
-    // still bound the work). Phase timings (grab/parse/open) are logged so a
-    // cold-start slowdown can be attributed.
-    const xml = await fetchNzb(decoded.nzb);
-    const grabbedAt = Date.now();
-    // Reuses the model the resolve just parsed (same hash); parsing the same
-    // multi-MB NZB twice per playback is pure waste.
-    const nzb = await parseNzbCached(decoded.hash, xml);
-    const parsedAt = Date.now();
-    // tokens minted before the content-hash rekey carry a search-time
-    // hash. Every library read/write below
-    // must use the canonical hash or it would patch/poison a stray row.
-    const hash = await canonicaliseNzbHash(decoded.hash, nzb, decoded.nzb);
-    // Legacy tokens carry a pre-rekey hash; stickiness is keyed canonically.
-    noteStreamActivity(hash);
-    const engine = await usenetEngineRegistry.get(providers, options);
-    // Fetched up-front: seeds the hole hooks (persisted hole map → replay
-    // pre-pad) and provides addedAt for Last-Modified below.
-    const entry = await UsenetLibraryRepository.get(hash).catch(
-      () => undefined
-    );
-    const { hooks: holeHooks, holeBytes } = holeHooksFor(
-      hash,
-      decoded,
-      entry,
-      key
-    );
-
-    let stream: SeekableStream | undefined;
-    let filename = decoded.filename;
-    try {
-      // Fast path: rebuild an archive inner stream from the layout captured at
-      // inspection, skipping re-fetching/parsing the archive header (and the
-      // encrypted-7z AES+LZMA decode that makes cold opens of large password 7z
-      // packs slow). Any miss/failure falls back to a full parse open.
-      if (decoded.innerPath) {
-        const layout = await loadArchiveLayout(hash, decoded.innerPath);
-        if (layout) {
-          try {
-            const hooks = hasPendingFragments(layout.target)
-              ? lazyHooksFor(hash, decoded.innerPath, layout, key)
-              : undefined;
-            stream = await engine.openArchiveStreamFromLayout(
+  let stream: SeekableStream | undefined;
+  let filename = decoded.filename;
+  try {
+    // Fast path: rebuild an archive inner stream from the layout captured at
+    // inspection, skipping re-fetching/parsing the archive header (and the
+    // encrypted-7z AES+LZMA decode that makes cold opens of large password 7z
+    // packs slow). Any miss/failure falls back to a full parse open.
+    if (decoded.innerPath) {
+      const layout = await awaitSessionOpenStep(
+        loadArchiveLayout(hash, decoded.innerPath),
+        signal
+      );
+      if (layout) {
+        try {
+          const hooks = hasPendingFragments(layout.target)
+            ? lazyHooksFor(hash, decoded.innerPath, layout, key)
+            : undefined;
+          stream = await awaitSessionOpenStep(
+            engine.openArchiveStreamFromLayout(
               nzb,
               layout,
-              undefined,
+              signal,
               hooks,
               holeHooks
-            );
-            filename = decoded.filename ?? stream.filename;
-          } catch (err) {
-            logger.warn(
-              {
-                hash,
-                innerPath: decoded.innerPath,
-                err: (err as Error)?.message,
-              },
-              'archive layout rebuild failed; falling back to full parse'
-            );
-            stream = undefined;
-          }
+            ),
+            signal
+          );
+          filename = decoded.filename ?? stream.filename;
+        } catch (err) {
+          signal.throwIfAborted();
+          logger.warn(
+            {
+              hash,
+              innerPath: decoded.innerPath,
+              err: (err as Error)?.message,
+            },
+            'archive layout rebuild failed; falling back to full parse'
+          );
+          stream = undefined;
         }
       }
-      if (!stream) {
-        if (
-          decoded.fileIndex !== undefined ||
-          decoded.innerPath ||
-          decoded.filename
-        ) {
-          stream = await engine.openFileStream(
+    }
+    if (!stream) {
+      if (
+        decoded.fileIndex !== undefined ||
+        decoded.innerPath ||
+        decoded.filename
+      ) {
+        stream = await awaitSessionOpenStep(
+          engine.openFileStream(
             nzb,
             {
               fileIndex: decoded.fileIndex,
               innerPath: decoded.innerPath,
               filename: decoded.filename,
             },
-            undefined,
+            signal,
             holeHooks
-          );
-          filename = decoded.innerPath
-            ? (decoded.filename ?? stream.filename)
-            : (stream.filename ?? decoded.filename);
-        } else {
-          const handle = await engine.selectAndOpen(
-            nzb,
-            { auto: true },
-            undefined,
-            holeHooks
-          );
-          stream = handle.stream;
-          filename = handle.file.filename ?? decoded.filename;
-        }
+          ),
+          signal
+        );
+        filename = decoded.innerPath
+          ? (decoded.filename ?? stream.filename)
+          : (stream.filename ?? decoded.filename);
+      } else {
+        const handle = await awaitSessionOpenStep(
+          engine.selectAndOpen(nzb, { auto: true }, signal, holeHooks),
+          signal
+        );
+        stream = handle.stream;
+        filename = handle.file.filename ?? decoded.filename;
       }
-    } catch (err) {
-      if (
-        err instanceof ArticleNotFoundError ||
-        err instanceof NotStreamableError
-      ) {
-        const friendly = friendlyUsenetError(err);
-        UsenetLibraryRepository.markFailed(
-          hash,
-          friendly.reason,
-          decoded.filename,
-          friendly.code
-        ).catch(() => {});
-        // The release exists on usenet, but a compressed/solid/unsupported
-        // archive is un-streamable for everyone (global); an all-provider
-        // article miss is backbone-scoped evidence.
-        if (err instanceof ArticleNotFoundError && err.allProviders) {
-          markReleaseDead(decoded.releaseKey, nzbContentKey(hash));
-        } else if (err instanceof NotStreamableError) {
-          markReleaseDeadForCode(
-            err.code,
-            decoded.releaseKey,
-            nzbContentKey(hash)
-          );
-        }
-      }
-      throw err;
     }
-
-    if (!stream) throw new Error('failed to open usenet stream');
-    const addedAt = entry?.addedAt ? new Date(entry.addedAt) : undefined;
-    const lastModified =
-      addedAt && !Number.isNaN(addedAt.getTime())
-        ? addedAt
-        : USENET_LAST_MODIFIED;
-    const session: UsenetStreamSession = {
-      stream,
-      size: stream.size(),
-      filename,
-      hash,
-      lastUsedAt: Date.now(),
-      lastModified,
-      engine,
-      holeBytes,
-      voidPlan: new MatroskaVoidPlan(),
-      matroska: /\.(mkv|mka|webm)$/i.test(filename ?? ''),
-    };
-    streamSessions.set(key, session);
-    const openedAt = Date.now();
-    logger.debug(
-      {
+  } catch (err) {
+    if (
+      err instanceof ArticleNotFoundError ||
+      err instanceof NotStreamableError
+    ) {
+      const friendly = friendlyUsenetError(err);
+      UsenetLibraryRepository.markFailed(
         hash,
-        filename,
-        size: session.size,
-        grabMs: grabbedAt - startedAt,
-        parseMs: parsedAt - grabbedAt,
-        openMs: openedAt - parsedAt,
-        latency: openedAt - startedAt,
-      },
-      'opened native usenet stream session'
-    );
-    return session;
-  })().finally(() => openingSessions.delete(key));
+        friendly.reason,
+        decoded.filename,
+        friendly.code
+      ).catch(() => {});
+      // The release exists on usenet, but a compressed/solid/unsupported
+      // archive is un-streamable for everyone (global); an all-provider
+      // article miss is backbone-scoped evidence.
+      if (err instanceof ArticleNotFoundError && err.allProviders) {
+        markReleaseDead(decoded.releaseKey, nzbContentKey(hash));
+      } else if (err instanceof NotStreamableError) {
+        markReleaseDeadForCode(
+          err.code,
+          decoded.releaseKey,
+          nzbContentKey(hash)
+        );
+      }
+    }
+    throw err;
+  }
 
-  openingSessions.set(key, open);
-  return open;
+  if (!stream) throw new Error('failed to open usenet stream');
+  const addedAt = entry?.addedAt ? new Date(entry.addedAt) : undefined;
+  const lastModified =
+    addedAt && !Number.isNaN(addedAt.getTime())
+      ? addedAt
+      : USENET_LAST_MODIFIED;
+  const session: UsenetStreamSession = {
+    stream,
+    size: stream.size(),
+    filename,
+    hash,
+    lastUsedAt: Date.now(),
+    lastModified,
+    engine,
+    holeBytes,
+    voidPlan: new MatroskaVoidPlan(),
+    matroska: /\.(mkv|mka|webm)$/i.test(filename ?? ''),
+  };
+  signal.throwIfAborted();
+  streamSessions.set(key, session);
+  const openedAt = Date.now();
+  logger.debug(
+    {
+      hash,
+      filename,
+      size: session.size,
+      grabMs: grabbedAt - startedAt,
+      parseMs: parsedAt - grabbedAt,
+      openMs: openedAt - parsedAt,
+      latency: openedAt - startedAt,
+    },
+    'opened native usenet stream session'
+  );
+  return session;
+}
+
+/** Join the bounded single-flight while retaining request-local abortability. */
+function getStreamSession(
+  decoded: UsenetStreamToken,
+  providers: ProviderConfig[],
+  options: Partial<EngineOptions>,
+  requestSignals: readonly (AbortSignal | undefined)[]
+): Promise<UsenetStreamSession> {
+  const key = streamSessionKey(decoded);
+  return openingSessions.run(
+    key,
+    (signal) => openStreamSession(decoded, providers, options, signal),
+    requestSignals
+  );
 }
 
 /**
@@ -709,7 +778,10 @@ export async function openNativeUsenetStream(opts: {
   let session: UsenetStreamSession;
   let stream: Readable | undefined;
   try {
-    session = await getStreamSession(decoded, providers, options);
+    session = await getStreamSession(decoded, providers, options, [
+      handle.signal,
+      opts.signal,
+    ]);
     handle.signal.throwIfAborted();
     opts.signal?.throwIfAborted();
     const { size, filename } = session;
@@ -769,6 +841,20 @@ export async function openNativeUsenetStream(opts: {
       : undefined;
     handle.close();
     if (stoppedReason !== undefined) throw stoppedReason;
+    if (
+      err instanceof OpeningFlightError &&
+      err.code === 'USENET_SESSION_OPEN_CAPACITY'
+    ) {
+      throw new DebridError(err.message, {
+        statusCode: 503,
+        statusText: 'Service Unavailable',
+        code: 'SERVICE_UNAVAILABLE',
+        headers: {},
+        body: null,
+        type: 'api_error',
+        cause: err,
+      });
+    }
     throw err;
   }
 }

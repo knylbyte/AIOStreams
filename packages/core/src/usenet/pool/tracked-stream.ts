@@ -21,13 +21,29 @@ export class UsenetEngineClosedError extends Error {
   }
 }
 
-function isExpectedEngineCloseError(
+/**
+ * Whether a reader error is an expected lifecycle terminal cause while the
+ * engine is closing. This list is deliberately narrow: arbitrary errors from
+ * an asynchronous `_destroy()` (for example EIO) remain cleanup failures.
+ */
+export function isExpectedReaderTermination(
   error: unknown,
   closeError: UsenetEngineClosedError
 ): boolean {
+  if (error === closeError) return true;
+  if (typeof error !== 'object' || error === null) return false;
+
+  const code = 'code' in error ? error.code : undefined;
+  const name = 'name' in error ? error.name : undefined;
+  const message = 'message' in error ? error.message : undefined;
   return (
-    error === closeError ||
-    (error instanceof UsenetEngineClosedError && error.code === closeError.code)
+    code === closeError.code ||
+    code === 'STREAM_STOPPED' ||
+    code === 'USENET_STREAM_REAPED' ||
+    code === 'ABORT_ERR' ||
+    code === 'USENET_CLIENT_CLOSED' ||
+    name === 'AbortError' ||
+    message === 'client closed'
   );
 }
 
@@ -45,13 +61,15 @@ export async function destroyTrackedReaders(
     readers.map(
       (reader) =>
         new Promise<unknown[]>((resolve) => {
-          if (reader.closed) {
+          const wasDestroyed = reader.destroyed;
+          const wasClosed = reader.closed;
+          if (wasClosed) {
             resolve([]);
             return;
           }
           const errors: unknown[] = [];
           const onError = (error: unknown): void => {
-            if (!isExpectedEngineCloseError(error, closeError)) {
+            if (!isExpectedReaderTermination(error, closeError)) {
               errors.push(error);
             }
           };
@@ -61,6 +79,7 @@ export async function destroyTrackedReaders(
           };
           reader.on('error', onError);
           reader.once('close', onClose);
+          if (wasDestroyed) return;
           try {
             reader.destroy(closeError);
           } catch (error) {

@@ -1,8 +1,26 @@
 import type { Server } from 'node:http';
 import { once } from 'node:events';
+import { Readable } from 'node:stream';
 import express from 'express';
 import { describe, expect, test } from 'vitest';
+import { StreamRegistry } from '@aiostreams/core';
 import { ShutdownAdmissionGate, ShutdownCoordinator } from './shutdown.js';
+
+class CoordinatedReader extends Readable {
+  readonly destroyEntered = Promise.withResolvers<void>();
+
+  constructor(private readonly destroyGate: Promise<void>) {
+    super({ read() {} });
+  }
+
+  override _destroy(
+    error: Error | null,
+    callback: (error?: Error | null) => void
+  ): void {
+    this.destroyEntered.resolve();
+    void this.destroyGate.then(() => callback(error));
+  }
+}
 
 async function listen(app: express.Express): Promise<{
   server: Server;
@@ -178,5 +196,55 @@ describe('shutdown admission and ordering', () => {
       'database',
     ]);
     expect(server.listening).toBe(false);
+  });
+
+  test('coordinated stream seal remains the reader-owner close barrier', async () => {
+    const registry = new StreamRegistry(() => ({ ok: true }));
+    const opened = registry.open({
+      transport: 'usenet',
+      username: 'shutdown-user',
+      targetKey: 'coordinated-engine-reader',
+    });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+
+    const destroyGate = Promise.withResolvers<void>();
+    const reader = new CoordinatedReader(destroyGate.promise);
+    reader.on('error', () => undefined);
+    opened.handle.attach(reader);
+
+    const coordinator = new ShutdownCoordinator({
+      admission: new ShutdownAdmissionGate(),
+      server: () => undefined,
+      stopTasks: () => undefined,
+      sealStreams: () => registry.sealAndCloseAll('shutdown'),
+      beforeListenerClose: [
+        {
+          label: 'reader owner',
+          run: async () => {
+            if (!reader.closed) {
+              await new Promise<void>((resolve) =>
+                reader.once('close', resolve)
+              );
+            }
+          },
+        },
+      ],
+      afterListenerClose: [],
+    });
+    let settled = false;
+    const closing = coordinator.close().then(() => {
+      settled = true;
+    });
+    await reader.destroyEntered.promise;
+    await Promise.resolve();
+    expect(reader.destroyed).toBe(true);
+    expect(reader.closed).toBe(false);
+    expect(settled).toBe(false);
+
+    destroyGate.resolve();
+    await closing;
+    expect(reader.closed).toBe(true);
+    expect(registry.snapshot()).toEqual([]);
   });
 });

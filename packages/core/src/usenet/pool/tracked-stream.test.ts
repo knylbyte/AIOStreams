@@ -2,12 +2,14 @@ import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
 import test from 'node:test';
 import '../../config/index.js';
+import { StreamStoppedError } from '../../stream-sessions/registry.js';
 import { StatsAccumulator } from '../stats/accumulator.js';
 import type { SeekableStream } from './file-stream.js';
 import {
   destroyTrackedReaders,
   trackSeekableStream,
   UsenetEngineClosedError,
+  UsenetStreamReapedError,
 } from './tracked-stream.js';
 
 class ControlledSeekableStream implements SeekableStream {
@@ -193,5 +195,69 @@ test('reader teardown reports cleanup errors after every close barrier settles',
 
   secondGate.resolve();
   assert.deepEqual(await closing, [cleanupError]);
+  assert.equal(readers.size, 0);
+});
+
+test('reader teardown observes readers already terminalized by lifecycle owners', async (t) => {
+  const cases: Array<{ name: string; error: Error }> = [
+    {
+      name: 'stream registry shutdown',
+      error: new StreamStoppedError('shutdown'),
+    },
+    {
+      name: 'idle reaper',
+      error: new UsenetStreamReapedError('idle stream'),
+    },
+    {
+      name: 'abort',
+      error: new DOMException('client aborted', 'AbortError'),
+    },
+    { name: 'client close', error: new Error('client closed') },
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const gate = Promise.withResolvers<void>();
+      const reader = new DelayedDestroyReadable(gate.promise);
+      const readers = new Map([[1, reader as Readable]]);
+      reader.once('close', () => readers.delete(1));
+      reader.destroy(entry.error);
+      await reader.destroyEntered.promise;
+
+      let settled = false;
+      const closing = destroyTrackedReaders(
+        readers,
+        new UsenetEngineClosedError()
+      ).then((errors) => {
+        settled = true;
+        return errors;
+      });
+      await Promise.resolve();
+      assert.equal(settled, false);
+      assert.equal(reader.closed, false);
+
+      gate.resolve();
+      assert.deepEqual(await closing, []);
+      assert.equal(reader.closed, true);
+      assert.equal(readers.size, 0);
+    });
+  }
+});
+
+test('reader teardown retains a real cleanup error after prior lifecycle termination', async () => {
+  const gate = Promise.withResolvers<void>();
+  const cleanupError = Object.assign(new Error('reader cleanup failed'), {
+    code: 'EIO',
+  });
+  const reader = new DelayedDestroyReadable(gate.promise, cleanupError);
+  const readers = new Map([[1, reader as Readable]]);
+  reader.once('close', () => readers.delete(1));
+  reader.destroy(new StreamStoppedError('shutdown'));
+  await reader.destroyEntered.promise;
+
+  const closing = destroyTrackedReaders(readers, new UsenetEngineClosedError());
+  gate.resolve();
+  assert.deepEqual(await closing, [cleanupError]);
+  assert.equal(reader.closed, true);
   assert.equal(readers.size, 0);
 });

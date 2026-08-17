@@ -43,6 +43,18 @@ canonical concept itself is unchanged.
 - [x] `UsenetEngine.close()` alone waits for actual reader `close`, pool owners
       and cache finalisation; previously issued seekable wrappers reject new or
       crossing work once the synchronous engine fence is published.
+- [x] Coordinated process shutdown seals `StreamRegistry` with the distinct
+      `shutdown` reason before engine retirement. Readers already terminalised
+      by that seal are awaited through their real `close` event without turning
+      expected lifecycle errors into engine-cleanup failures.
+- [x] A proxy request waiting for upstream headers receives the stable 503
+      shutdown response only for the explicit shutdown reason; its active
+      Undici request (including the current redirect hop) is actually aborted.
+      Limit, stale and administrative stops retain their disconnect semantics.
+- [x] Native shared session opens use bounded per-key flights and bounded
+      request waiters. Process shutdown synchronously fences new opens, aborts
+      remote NZB work, awaits every flight finalizer, and prevents late warm
+      session publication before engines and the database retire.
 - [x] Startup orphan cleanup is heartbeat/fence protected and emits a structured
       completion record.
 - [x] Stable spool failures map to actionable user and HTTP/debrid errors.

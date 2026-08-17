@@ -14,7 +14,8 @@ export type StreamEndReason =
   | 'banned'
   | 'limit'
   | 'error'
-  | 'stale';
+  | 'stale'
+  | 'shutdown';
 
 /** A persisted session row (active when `endedAt` is undefined). */
 export interface StreamSessionRow {

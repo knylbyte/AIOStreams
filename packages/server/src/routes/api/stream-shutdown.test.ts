@@ -33,8 +33,17 @@ describe('stream shutdown response contract', () => {
   });
 
   test('recognises stream and engine admission fences only', () => {
-    expect(isStreamShutdownError({ code: 'STREAM_STOPPED' })).toBe(true);
+    expect(
+      isStreamShutdownError({ code: 'STREAM_STOPPED', reason: 'shutdown' })
+    ).toBe(true);
     expect(isStreamShutdownError({ code: 'USENET_ENGINE_CLOSED' })).toBe(true);
+    expect(
+      isStreamShutdownError({ code: 'STREAM_STOPPED', reason: 'limit' })
+    ).toBe(false);
+    expect(
+      isStreamShutdownError({ code: 'STREAM_STOPPED', reason: 'stale' })
+    ).toBe(false);
+    expect(isStreamShutdownError({ code: 'STREAM_STOPPED' })).toBe(false);
     expect(isStreamShutdownError({ code: 'ECONNRESET' })).toBe(false);
     expect(isStreamShutdownError(new Error('stopped'))).toBe(false);
   });

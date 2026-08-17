@@ -65,6 +65,10 @@ const END_REASONS: Record<
     label: 'Interrupted',
     className: 'border-amber-500/40 bg-amber-500/10 text-amber-300',
   },
+  shutdown: {
+    label: 'Server shutdown',
+    className: 'border-amber-500/40 bg-amber-500/10 text-amber-300',
+  },
 };
 
 const TRANSPORT_OPTIONS = [
