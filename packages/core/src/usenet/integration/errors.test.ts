@@ -36,6 +36,16 @@ test('maps transient resource admission errors to service unavailable', () => {
   }
 });
 
+test('maps the engine admission fence to service unavailable', async () => {
+  const { UsenetEngineClosedError } = await import('../pool/tracked-stream.js');
+  const error = new UsenetEngineClosedError();
+  assert.equal(friendlyUsenetError(error).code, 'USENET_ENGINE_CLOSED');
+  const mapped = toDebridError(error);
+  assert.equal(mapped.statusCode, 503);
+  assert.equal(mapped.code, 'SERVICE_UNAVAILABLE');
+  assert.deepEqual(mapped.body, { usenetCode: 'USENET_ENGINE_CLOSED' });
+});
+
 test('maps segment metadata corruption to a download failure', () => {
   const error = new UsenetSpoolError(
     'USENET_SPOOL_METADATA_MISMATCH',

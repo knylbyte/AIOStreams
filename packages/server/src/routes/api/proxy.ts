@@ -31,6 +31,7 @@ import { Transform } from 'stream';
 import { requireAdmin } from '../../middlewares/auth.js';
 import { corsMiddleware } from '../../middlewares/cors.js';
 import { StaticFiles } from '../../app.js';
+import { isStreamShutdownError } from './stream-shutdown.js';
 
 const logger = createLogger('server');
 const router: Router = Router();
@@ -441,6 +442,7 @@ router.all(
           upstreamResponse?.body?.destroy();
           if (!req.socket.destroyed) req.socket.resetAndDestroy();
         });
+        session.handle.signal.throwIfAborted();
       }
 
       const upstreamStartTime = Date.now();
@@ -453,6 +455,7 @@ router.all(
       let bodyDropped = false;
 
       while (true) {
+        if (session?.ok) session.handle.signal.throwIfAborted();
         const grabContext = data.type === 'nzb' ? 'nzb_grabs' : undefined;
         const urlObj = rewriteRequestUrl(new URL(currentUrl));
         const { dispatcher, useProxy, proxyIndex } = resolveDispatcher(
@@ -498,6 +501,7 @@ router.all(
           bodyTimeout: 0,
           headersTimeout: 0,
         });
+        if (session?.ok) session.handle.signal.throwIfAborted();
 
         const hop = getRedirectHop(
           upstreamResponse.statusCode,
@@ -532,6 +536,7 @@ router.all(
         return;
       }
       const upstreamDuration = getTimeTakenSincePoint(upstreamStartTime);
+      if (session?.ok) session.handle.signal.throwIfAborted();
 
       // forward upstream response to client
       res.set(sanitiseHeaders(upstreamResponse.headers));
@@ -617,6 +622,7 @@ router.all(
         errorCode === 'ECONNRESET' ||
         errorCode === 'EPIPE' ||
         errorCode === 'ERR_STREAM_DESTROYED' ||
+        isStreamShutdownError(error) ||
         (error as Error)?.message?.includes('aborted') ||
         (error as Error)?.message?.includes('destroyed');
 

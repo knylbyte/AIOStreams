@@ -10,7 +10,12 @@ import { PrioritySemaphore } from './pool/priority-semaphore.js';
 import { SegmentCache, type CacheStats } from './pool/segment-cache.js';
 import { StatsAccumulator } from './stats/accumulator.js';
 import { FileStream, SeekableStream, SegmentMemo } from './pool/file-stream.js';
-import { trackSeekableStream, reapIdleStreams } from './pool/tracked-stream.js';
+import {
+  destroyTrackedReaders,
+  trackSeekableStream,
+  reapIdleStreams,
+  UsenetEngineClosedError,
+} from './pool/tracked-stream.js';
 import {
   inspectNzb,
   selectBestVideo,
@@ -136,6 +141,7 @@ export {
 export type { CacheStats } from './pool/segment-cache.js';
 export { FileStream } from './pool/file-stream.js';
 export type { SeekableStream } from './pool/file-stream.js';
+export { UsenetEngineClosedError } from './pool/tracked-stream.js';
 export { NotStreamableError } from './pool/archive/errors.js';
 export type { ArchiveErrorCode } from './pool/archive/errors.js';
 export type {
@@ -197,6 +203,8 @@ export class UsenetEngine {
   readonly resourcePlan: EngineResourcePlan;
   private purgeTimer?: NodeJS.Timeout;
   private closePromise: Promise<void> | undefined;
+  /** Synchronous work-admission fence shared by all issued stream wrappers. */
+  private closedError: UsenetEngineClosedError | undefined;
   /** Engine-lifetime per-provider STAT trust (census calibration results). */
   private statTrust = new StatTrustCache();
   /** Live census runs, so close() can cancel their workers promptly. */
@@ -352,6 +360,7 @@ export class UsenetEngine {
         content.heads = undefined;
         content.streamable = false;
         content.availability = { sampled: snap.sampled, missing: snap.missing };
+        this.assertOpen();
         return content;
       }
       // A definitive availability verdict from the probe dead-abort means the
@@ -360,6 +369,7 @@ export class UsenetEngine {
       if ((content.availability?.missing ?? 0) > 0) {
         census?.cancel();
         content.heads = undefined;
+        this.assertOpen();
         return content;
       }
       await this.inspectArchives(
@@ -379,9 +389,11 @@ export class UsenetEngine {
         this.applyCensusVerdict(nzb, content, census, snap);
       }
       opts.signal?.throwIfAborted();
+      this.assertOpen();
       return content;
     } catch (err) {
       census?.cancel();
+      this.assertOpen();
       throw err;
     } finally {
       if (opts.signal) {
@@ -788,15 +800,14 @@ export class UsenetEngine {
   ): Promise<SeekableStream> {
     this.touch();
     if (selector.innerPath) {
-      return this.track(
+      const stream = await this.openArchiveFileByPath(
         nzb,
-        await this.openArchiveFileByPath(
-          nzb,
-          selector.innerPath,
-          signal,
-          holeHooks
-        )
+        selector.innerPath,
+        signal,
+        holeHooks
       );
+      this.assertOpen();
+      return this.track(nzb, stream);
     }
     let file =
       selector.fileIndex !== undefined
@@ -811,13 +822,19 @@ export class UsenetEngine {
       );
     }
     const fileIndex = nzb.files.indexOf(file);
-    return this.track(
+    const stream = await this.openFile(
       nzb,
-      await this.openFile(nzb, file, signal, undefined, undefined, {
+      file,
+      signal,
+      undefined,
+      undefined,
+      {
         holeHooks,
         fileIndex,
-      })
+      }
     );
+    this.assertOpen();
+    return this.track(nzb, stream);
   }
 
   /**
@@ -827,17 +844,14 @@ export class UsenetEngine {
    * {@link openFileStream}, which delivers a file in playback (in-order) order
    * and so reports the lower single-stream rate.
    */
-  fetchArticle(
+  async fetchArticle(
     segment: NzbSegmentRef,
     nzbHash: string,
     signal?: AbortSignal
   ): Promise<SegmentData> {
     this.touch();
-    return this.pool.fetchSegment(
-      segment,
-      nzbHash,
-      signal,
-      CommandPriority.High
+    return this.awaitWork(
+      this.pool.fetchSegment(segment, nzbHash, signal, CommandPriority.High)
     );
   }
 
@@ -955,6 +969,7 @@ export class UsenetEngine {
             fileIndex: chosen.index,
           }
         );
+    this.assertOpen();
     return { stream: this.track(nzb, stream), file: chosen };
   }
 
@@ -978,11 +993,13 @@ export class UsenetEngine {
     const knownSizes = fileSizes
       ? set.memberIndices.map((i) => fileSizes.get(i))
       : undefined;
-    const opened = await openArchiveInner(set, opener, innerPath, {
-      knownSizes,
-      password: nzb.meta.password,
-      ...this.archiveStreamOpts(holeHooks, set.index),
-    });
+    const opened = await this.awaitWork(
+      openArchiveInner(set, opener, innerPath, {
+        knownSizes,
+        password: nzb.meta.password,
+        ...this.archiveStreamOpts(holeHooks, set.index),
+      })
+    );
     return opened.stream;
   }
 
@@ -1002,11 +1019,13 @@ export class UsenetEngine {
     this.touch();
     const opener: FileOpener = (index, knownSize, memo) =>
       this.openFile(nzb, nzb.files[index], signal, knownSize, memo);
-    const stream = await rebuildArchiveStream(layout, opener, {
-      password: nzb.meta.password,
-      ...this.archiveStreamOpts(holeHooks, layout.memberIndices[0]),
-      lazyHooks,
-    });
+    const stream = await this.awaitWork(
+      rebuildArchiveStream(layout, opener, {
+        password: nzb.meta.password,
+        ...this.archiveStreamOpts(holeHooks, layout.memberIndices[0]),
+        lazyHooks,
+      })
+    );
     return this.track(nzb, stream);
   }
 
@@ -1082,6 +1101,7 @@ export class UsenetEngine {
      */
     holes?: { holeHooks?: HoleHooks; fileIndex: number }
   ): Promise<FileStream> {
+    this.assertOpen();
     const stream = new FileStream(
       this.pool,
       {
@@ -1097,7 +1117,7 @@ export class UsenetEngine {
         : undefined,
       this.resourcePlan
     );
-    await stream.open(signal);
+    await this.awaitWork(stream.open(signal));
     return stream;
   }
 
@@ -1108,7 +1128,14 @@ export class UsenetEngine {
    * paths alike), while internal per-volume streams stay untracked.
    */
   private track(nzb: Nzb, stream: SeekableStream): SeekableStream {
-    return trackSeekableStream(stream, this.stats, nzb.hash, this.liveReaders);
+    this.assertOpen();
+    return trackSeekableStream(
+      stream,
+      this.stats,
+      nzb.hash,
+      this.liveReaders,
+      () => this.assertOpen()
+    );
   }
 
   poolInfo(): PoolInfo {
@@ -1220,40 +1247,100 @@ export class UsenetEngine {
   }
 
   private touch(): void {
+    this.assertOpen();
     this.lastUsedAt = Date.now();
+  }
+
+  private assertOpen(): void {
+    if (this.closedError) throw this.closedError;
+  }
+
+  private async awaitWork<T>(operation: Promise<T>): Promise<T> {
+    try {
+      const result = await operation;
+      this.assertOpen();
+      return result;
+    } catch (error) {
+      this.assertOpen();
+      throw error;
+    }
   }
 
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
-    this.closePromise = this.closeOnce();
+    // This assignment is the engine's work-admission linearization point. It
+    // precedes the first cleanup await and is observed by every issued wrapper.
+    const closeError = new UsenetEngineClosedError();
+    const completion = Promise.withResolvers<void>();
+    this.closedError = closeError;
+    this.closePromise = completion.promise;
+    void this.closeOnce(closeError).then(completion.resolve, completion.reject);
     return this.closePromise;
   }
 
-  private async closeOnce(): Promise<void> {
+  private async closeOnce(closeError: UsenetEngineClosedError): Promise<void> {
     if (this.purgeTimer) clearInterval(this.purgeTimer);
     this.purgeTimer = undefined;
     // Cancel any shadow census first so its workers stop submitting to the
     // pool being closed (they self-resolve with `complete: false`).
     for (const census of this.liveCensus) census.cancel();
     this.liveCensus.clear();
-    // Destroy in-flight readers before  closing the pool so their HTTP
-    // pipelines terminate
+    // Observe reader close before destroy, then close the pool concurrently:
+    // readers may need pool/producer teardown to finish their async _destroy.
     const readers = this.liveReaders.size;
     if (readers > 0) {
       logger.debug({ readers }, 'destroying live readers on engine close');
-      for (const reader of [...this.liveReaders.values()]) {
-        reader.destroy(new Error('usenet engine closed'));
-      }
     }
+    const readerClose = destroyTrackedReaders(this.liveReaders, closeError);
+    const poolClose = Promise.resolve().then(() => this.pool.close());
     const errors: unknown[] = [];
-    try {
-      await this.pool.close();
-    } catch (error) {
-      errors.push(error);
+    const [readerResult, poolResult] = await Promise.allSettled([
+      readerClose,
+      poolClose,
+    ]);
+    if (readerResult.status === 'fulfilled') {
+      errors.push(...readerResult.value);
+    } else {
+      errors.push(readerResult.reason);
+    }
+    if (poolResult.status === 'rejected') {
+      errors.push(poolResult.reason);
       logger.error(
-        { fingerprint: this.fingerprint, err: error },
+        { fingerprint: this.fingerprint, err: poolResult.reason },
         'usenet pool close failed'
       );
+    }
+    if (this.liveReaders.size !== 0 || this.stats.activeStreams !== 0) {
+      errors.push(
+        new Error(
+          `Usenet reader cleanup incomplete (${this.liveReaders.size}/${this.stats.activeStreams})`
+        )
+      );
+    }
+    try {
+      const poolOwners = this.pool.poolInfo();
+      const runtimeOwners = this.pool.spoolingStats();
+      const ownerCounts = [
+        poolOwners.globalDownloadsInUse,
+        poolOwners.globalDownloadsWaiting,
+        poolOwners.globalDownloadsOnWire,
+        runtimeOwners?.memory.usedBytes ?? 0,
+        runtimeOwners?.memory.waiting ?? 0,
+        runtimeOwners?.spool.budget.reservedBytes ?? 0,
+        runtimeOwners?.spool.budget.actualBytes ?? 0,
+        runtimeOwners?.spool.sessions ?? 0,
+        runtimeOwners?.spool.artifacts ?? 0,
+        runtimeOwners?.spool.files.openFiles ?? 0,
+        runtimeOwners?.spool.budget.waiting ?? 0,
+        runtimeOwners?.spool.files.waiting ?? 0,
+      ];
+      if (ownerCounts.some((count) => count !== 0)) {
+        errors.push(
+          new Error('Usenet pool cleanup left active resource owners')
+        );
+      }
+    } catch (error) {
+      errors.push(error);
     }
     // The pool/runtime owns producers and spool promotion sources. Close it
     // before persisting the segment-cache index so no late writer can overlap

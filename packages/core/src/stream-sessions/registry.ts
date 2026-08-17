@@ -80,6 +80,37 @@ interface LiveRead {
   bytes: number;
   stream?: Readable;
   kill?: () => void;
+  /** Terminal state retained by every previously issued handle closure. */
+  closed: boolean;
+  stoppedError?: StreamStoppedError;
+  killDelivered: boolean;
+  controller: AbortController;
+}
+
+/** Publish a stable terminal cause before any read-owned teardown runs. */
+function terminalizeRead(
+  read: LiveRead,
+  reason: StreamEndReason
+): StreamStoppedError {
+  if (!read.stoppedError) {
+    read.stoppedError = new StreamStoppedError(reason);
+    read.closed = true;
+    read.controller.abort(read.stoppedError);
+  }
+  return read.stoppedError;
+}
+
+/** Deliver an installed kill callback at most once. */
+function deliverReadKill(read: LiveRead): void {
+  if (!read.kill || read.killDelivered) return;
+  const kill = read.kill;
+  read.kill = undefined;
+  read.killDelivered = true;
+  try {
+    kill();
+  } catch {
+    // Teardown remains best-effort; terminal ownership is already fenced.
+  }
 }
 
 interface Session {
@@ -258,6 +289,9 @@ export class StreamRegistry {
       id: ++this.readSeq,
       start: Math.max(0, input.start ?? 0),
       bytes: 0,
+      closed: false,
+      killDelivered: false,
+      controller: new AbortController(),
     };
     session.reads.set(read.id, read);
     session.newestReadId = read.id;
@@ -276,11 +310,11 @@ export class StreamRegistry {
       session.displayUrl = input.displayUrl;
     }
 
-    let closed = false;
     return {
       sessionId: session.id,
+      signal: read.controller.signal,
       addBytes: (bytes: number) => {
-        if (bytes <= 0) return;
+        if (read.closed || bytes <= 0) return;
         const at = Date.now();
         const dtMs = at - session.lastChunkAt;
         session.bytesServed += bytes;
@@ -299,19 +333,31 @@ export class StreamRegistry {
         }
       },
       setInfo: (info) => {
+        if (read.closed) return;
         if (info.size && info.size > 0) session.size = info.size;
         if (info.filename) session.filename = info.filename;
         session.dirty = true;
       },
       attach: (stream: Readable) => {
+        if (read.closed) {
+          stream.destroy(read.stoppedError ?? terminalizeRead(read, 'stopped'));
+          return;
+        }
         read.stream = stream;
       },
       onKill: (fn: () => void) => {
+        if (read.closed) {
+          if (!read.killDelivered) {
+            read.kill = fn;
+            deliverReadKill(read);
+          }
+          return;
+        }
         read.kill = fn;
       },
       close: () => {
-        if (closed) return;
-        closed = true;
+        if (read.closed) return;
+        terminalizeRead(read, 'stopped');
         session.reads.delete(read.id);
         session.lastSeenAt = Date.now();
         session.dirty = true;
@@ -329,13 +375,10 @@ export class StreamRegistry {
     session.ended = { at: now, reason };
     session.dirty = true;
     for (const read of session.reads.values()) {
-      try {
-        read.kill?.();
-      } catch {
-        /* teardown is best-effort */
-      }
+      const stoppedError = terminalizeRead(read, reason);
+      deliverReadKill(read);
       if (read.stream && !read.stream.destroyed) {
-        read.stream.destroy(new StreamStoppedError(reason));
+        read.stream.destroy(stoppedError);
       }
     }
     session.reads.clear();

@@ -7,6 +7,10 @@ import {
 } from '@aiostreams/core';
 import { mapDebridErrorToStaticFile } from '../../app.js';
 import { corsMiddleware } from '../../middlewares/cors.js';
+import {
+  isStreamShutdownError,
+  sendStreamShutdownResponse,
+} from './stream-shutdown.js';
 
 const logger = createLogger('server:usenet');
 const router: Router = Router();
@@ -148,7 +152,8 @@ router.get(
       stream.once('error', (err: NodeJS.ErrnoException) => {
         if (
           (err?.code === 'USENET_STREAM_REAPED' ||
-            err?.code === 'STREAM_STOPPED') &&
+            err?.code === 'STREAM_STOPPED' ||
+            err?.code === 'USENET_ENGINE_CLOSED') &&
           !socket.destroyed
         ) {
           socket.resetAndDestroy();
@@ -160,6 +165,16 @@ router.get(
       if (opened && !opened.stream.destroyed) opened.stream.destroy();
 
       const code = (err as NodeJS.ErrnoException)?.code;
+      if (
+        isStreamShutdownError(err) &&
+        !controller.signal.aborted &&
+        !res.headersSent &&
+        !res.destroyed
+      ) {
+        logger.info({ code }, 'usenet stream stopped before response startup');
+        sendStreamShutdownResponse(res);
+        return;
+      }
       const isClientDisconnect =
         controller.signal.aborted ||
         code === 'ERR_STREAM_PREMATURE_CLOSE' ||
@@ -168,7 +183,7 @@ router.get(
         code === 'ERR_STREAM_DESTROYED' ||
         code === 'ABORT_ERR' ||
         code === 'USENET_STREAM_REAPED' ||
-        code === 'STREAM_STOPPED';
+        isStreamShutdownError(err);
 
       if (isClientDisconnect) {
         logger.debug({ code }, 'client disconnected from usenet stream');

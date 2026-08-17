@@ -707,56 +707,68 @@ export async function openNativeUsenetStream(opts: {
 
   noteStreamActivity(decoded.hash);
   let session: UsenetStreamSession;
+  let stream: Readable | undefined;
   try {
     session = await getStreamSession(decoded, providers, options);
+    handle.signal.throwIfAborted();
     opts.signal?.throwIfAborted();
+    const { size, filename } = session;
+    const start = Math.max(0, opts.start ?? 0);
+    const end = Math.min(size, opts.end ?? size);
+    handle.setInfo({ size, filename });
+
+    // A handle admitted before shutdown may have been terminalized while the
+    // warm session/open path awaited. Do not create an untracked reader after
+    // that linearization point.
+    handle.signal.throwIfAborted();
+    stream = session.stream.createReadStream({ start, end });
+    if (session.matroska && appConfig.usenet.matroskaHoleFill) {
+      stream = wrapMatroskaHoleFill(stream, {
+        startOffset: start,
+        fileSize: size,
+        holes: session.holeBytes,
+        plan: session.voidPlan,
+        nzbHash: session.hash,
+      });
+    }
+    if (opts.signal) addAbortSignal(opts.signal, stream);
+    // Intercept push rather than listening for 'data', which would flip the
+    // stream into flowing mode before the response attaches and lose chunks.
+    const push = stream.push.bind(stream);
+    stream.push = (chunk: unknown, encoding?: BufferEncoding): boolean => {
+      const length = (chunk as { length?: number } | null)?.length;
+      if (typeof length === 'number' && length > 0) handle.addBytes(length);
+      return push(chunk as never, encoding);
+    };
+    handle.signal.throwIfAborted();
+    handle.attach(stream);
+    stream.once('close', () => {
+      handle.close();
+      noteStreamActivity(session.hash);
+    });
+
+    stream.once('error', (err) => {
+      if (isDefinitiveMiss(err)) {
+        failingStreams.set(sessionKey, Date.now() + FAILING_STREAM_TTL_MS);
+      }
+    });
+
+    return {
+      stream,
+      size,
+      start,
+      end,
+      filename,
+      etag: streamEtag(decoded, size),
+      lastModified: session.lastModified,
+    };
   } catch (err) {
+    if (stream && !stream.destroyed) stream.destroy();
+    const stoppedReason = handle.signal.aborted
+      ? handle.signal.reason
+      : undefined;
     handle.close();
+    if (stoppedReason !== undefined) throw stoppedReason;
     throw err;
   }
-  const { size, filename } = session;
-  const start = Math.max(0, opts.start ?? 0);
-  const end = Math.min(size, opts.end ?? size);
-  handle.setInfo({ size, filename });
-
-  let stream = session.stream.createReadStream({ start, end });
-  if (session.matroska && appConfig.usenet.matroskaHoleFill) {
-    stream = wrapMatroskaHoleFill(stream, {
-      startOffset: start,
-      fileSize: size,
-      holes: session.holeBytes,
-      plan: session.voidPlan,
-      nzbHash: session.hash,
-    });
-  }
-  if (opts.signal) addAbortSignal(opts.signal, stream);
-  // Intercept push rather than listening for 'data', which would flip the
-  // stream into flowing mode before the response attaches and lose chunks.
-  const push = stream.push.bind(stream);
-  stream.push = (chunk: unknown, encoding?: BufferEncoding): boolean => {
-    const length = (chunk as { length?: number } | null)?.length;
-    if (typeof length === 'number' && length > 0) handle.addBytes(length);
-    return push(chunk as never, encoding);
-  };
-  handle.attach(stream);
-  stream.once('close', () => {
-    handle.close();
-    noteStreamActivity(session.hash);
-  });
-
-  stream.once('error', (err) => {
-    if (isDefinitiveMiss(err)) {
-      failingStreams.set(sessionKey, Date.now() + FAILING_STREAM_TTL_MS);
-    }
-  });
-
-  return {
-    stream,
-    size,
-    start,
-    end,
-    filename,
-    etag: streamEtag(decoded, size),
-    lastModified: session.lastModified,
-  };
 }

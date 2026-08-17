@@ -8,6 +8,9 @@ import {
 import { UsenetResourcePlanConfigError } from '../resource-plan.js';
 import { DEFAULT_ENGINE_OPTIONS, type ProviderConfig } from '../types.js';
 import { usenetSchema } from '../../config/schema/usenet.js';
+import type { SeekableStream } from '../pool/file-stream.js';
+import type { Nzb } from '../nzb/model.js';
+import type { SharedSegment } from '../pool/segment-arena.js';
 
 const MEBIBYTE_BYTES = 1024 * 1024;
 
@@ -22,6 +25,50 @@ const providers: ProviderConfig[] = [
     priority: 0,
   },
 ];
+
+class BarrierReader extends Readable {
+  readonly destroyEntered = Promise.withResolvers<void>();
+
+  constructor(
+    private readonly gate: Promise<void>,
+    private readonly replacementError?: Error
+  ) {
+    super({ read() {} });
+  }
+
+  override _destroy(
+    error: Error | null,
+    callback: (error?: Error | null) => void
+  ): void {
+    this.destroyEntered.resolve();
+    void this.gate.then(() => callback(this.replacementError ?? error));
+  }
+}
+
+function seekableReturning(reader: Readable): SeekableStream {
+  return {
+    filename: 'barrier.bin',
+    size: () => 1,
+    open: async () => undefined,
+    readAt: async () => Buffer.from([0]),
+    createReadStream: () => reader,
+  };
+}
+
+const barrierNzb: Nzb = {
+  hash: 'reader-close-barrier',
+  meta: {},
+  files: [],
+};
+
+interface EngineTestAccess {
+  track(nzb: Nzb, stream: SeekableStream): SeekableStream;
+  pool: {
+    close(): Promise<void>;
+    fetchSegmentShared(...args: readonly unknown[]): Promise<SharedSegment>;
+  };
+  cache: { close(): Promise<void> };
+}
 
 function runtimeSettings(
   overrides: Partial<UsenetEngineRuntimeSettings> = {}
@@ -279,6 +326,180 @@ test('registry waits for the previous stable cache writer before replacement', a
   assert.notEqual(second, first);
   assert.equal(replacementResolved, true);
   await registry.closeAll();
+});
+
+test('registry replacement waits for the previous engine reader close', async () => {
+  const { UsenetEngineRegistry } = await import('../index.js');
+  const registry = new UsenetEngineRegistry(60_000);
+  const firstProvider: ProviderConfig = {
+    id: 'reader-first',
+    host: '127.0.0.1',
+    port: 119,
+    tls: false,
+    maxConnections: 1,
+    priority: 0,
+  };
+  const first = await registry.get([firstProvider], {
+    ...DEFAULT_ENGINE_OPTIONS,
+    segmentDiskCacheBytes: 0,
+  });
+  const destroyGate = Promise.withResolvers<void>();
+  const reader = new BarrierReader(destroyGate.promise);
+  reader.on('error', () => undefined);
+  const tracked = (first as unknown as EngineTestAccess).track(
+    barrierNzb,
+    seekableReturning(reader)
+  );
+  tracked.createReadStream();
+
+  let replacementResolved = false;
+  const replacement = registry.get(
+    [{ ...firstProvider, id: 'reader-second', port: 120 }],
+    {
+      ...DEFAULT_ENGINE_OPTIONS,
+      segmentDiskCacheBytes: 0,
+    }
+  );
+  void replacement.then(() => {
+    replacementResolved = true;
+  });
+  await reader.destroyEntered.promise;
+  await Promise.resolve();
+  assert.equal(reader.destroyed, true);
+  assert.equal(reader.closed, false);
+  assert.equal(replacementResolved, false);
+
+  destroyGate.resolve();
+  const second = await replacement;
+  assert.equal(reader.closed, true);
+  assert.notEqual(second, first);
+  await registry.closeAll();
+});
+
+test('engine close aggregates reader and pool failures after cache cleanup', async () => {
+  const { UsenetEngine } = await import('../index.js');
+  const engine = new UsenetEngine([], {
+    ...DEFAULT_ENGINE_OPTIONS,
+    segmentDiskCacheBytes: 0,
+  });
+  const readerGate = Promise.withResolvers<void>();
+  const readerError = new Error('synthetic reader close failure');
+  const poolError = new Error('synthetic pool close failure');
+  const reader = new BarrierReader(readerGate.promise, readerError);
+  reader.on('error', () => undefined);
+  const access = engine as unknown as EngineTestAccess;
+  access.track(barrierNzb, seekableReturning(reader)).createReadStream();
+
+  const originalPoolClose = access.pool.close.bind(access.pool);
+  access.pool.close = async () => {
+    await originalPoolClose();
+    throw poolError;
+  };
+  let cacheCloseCalls = 0;
+  const originalCacheClose = access.cache.close.bind(access.cache);
+  access.cache.close = async () => {
+    cacheCloseCalls++;
+    await originalCacheClose();
+  };
+
+  const closing = engine.close();
+  await reader.destroyEntered.promise;
+  readerGate.resolve();
+  await assert.rejects(closing, (error: unknown) => {
+    assert.ok(error instanceof AggregateError);
+    assert.ok(error.errors.includes(readerError));
+    assert.ok(error.errors.includes(poolError));
+    return true;
+  });
+  assert.equal(cacheCloseCalls, 1);
+  assert.equal(reader.closed, true);
+  assert.equal(engine.liveStats().tiles.activeStreams, 0);
+});
+
+test('an engine open crossing close cannot publish a seekable handle', async () => {
+  const { UsenetEngine } = await import('../index.js');
+  const engine = new UsenetEngine([], {
+    ...DEFAULT_ENGINE_OPTIONS,
+    segmentDiskCacheBytes: 0,
+  });
+  const access = engine as unknown as EngineTestAccess;
+  const entered = Promise.withResolvers<void>();
+  const proceed = Promise.withResolvers<void>();
+  let releases = 0;
+  access.pool.fetchSegmentShared = async () => {
+    entered.resolve();
+    await proceed.promise;
+    return {
+      data: {
+        body: Buffer.from('data'),
+        size: 4,
+        fileSize: 4,
+        name: 'crossing.bin',
+      },
+      owned: true,
+      release: () => {
+        releases++;
+      },
+    };
+  };
+  const nzb: Nzb = {
+    hash: 'crossing-open',
+    meta: {},
+    files: [
+      {
+        subject: 'crossing.bin',
+        groups: ['alt.binaries.test'],
+        encodedSize: 8,
+        filename: 'crossing.bin',
+        segments: [{ messageId: 'crossing', number: 1, bytes: 8 }],
+      },
+    ],
+  };
+
+  const opening = engine.openFileStream(nzb, { fileIndex: 0 });
+  await entered.promise;
+  const firstClose = engine.close();
+  assert.equal(engine.close(), firstClose);
+  await firstClose;
+  proceed.resolve();
+
+  await assert.rejects(
+    opening,
+    (error: unknown) =>
+      (error as NodeJS.ErrnoException).code === 'USENET_ENGINE_CLOSED'
+  );
+  assert.equal(releases, 1);
+  assert.equal(engine.liveStats().tiles.activeStreams, 0);
+});
+
+test('engine close synchronously fences every public work entry point', async () => {
+  const { UsenetEngine } = await import('../index.js');
+  const engine = new UsenetEngine([], {
+    ...DEFAULT_ENGINE_OPTIONS,
+    segmentDiskCacheBytes: 0,
+  });
+  const nzb: Nzb = { hash: 'closed-work', meta: {}, files: [] };
+
+  const closing = engine.close();
+  const outcomes = await Promise.allSettled([
+    engine.inspect(nzb),
+    engine.openFileStream(nzb, { fileIndex: 0 }),
+    engine.selectAndOpen(nzb),
+    engine.fetchArticle({ messageId: 'closed', bytes: 1 }, nzb.hash),
+  ]);
+  const reasons = outcomes.map((outcome) => {
+    assert.equal(outcome.status, 'rejected');
+    if (outcome.status !== 'rejected') {
+      throw new Error('closed engine unexpectedly admitted work');
+    }
+    assert.equal(
+      (outcome.reason as NodeJS.ErrnoException).code,
+      'USENET_ENGINE_CLOSED'
+    );
+    return outcome.reason;
+  });
+  assert.ok(reasons.every((reason) => reason === reasons[0]));
+  await closing;
 });
 
 test('registry close fences all getters waiting behind an active retirement', async () => {

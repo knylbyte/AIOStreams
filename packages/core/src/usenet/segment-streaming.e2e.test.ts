@@ -559,16 +559,30 @@ test('engine close terminates an active provider/read pipeline and reaches zero 
   reader.on('error', () => undefined);
   reader.resume();
   await server.waitForBodyCount(2);
-  const readerClosed = new Promise<void>((resolve) =>
-    reader.once('close', resolve)
+  await engine.close();
+  assert.equal(reader.closed, true);
+  assert.throws(
+    () => file.createReadStream(),
+    (error: unknown) =>
+      (error as NodeJS.ErrnoException).code === 'USENET_ENGINE_CLOSED'
   );
-
-  const closing = engine.close();
-  await Promise.all([closing, readerClosed]);
+  await assert.rejects(
+    file.readAt(0, 1),
+    (error: unknown) =>
+      (error as NodeJS.ErrnoException).code === 'USENET_ENGINE_CLOSED'
+  );
+  await assert.rejects(
+    file.open(),
+    (error: unknown) =>
+      (error as NodeJS.ErrnoException).code === 'USENET_ENGINE_CLOSED'
+  );
   playbackGate.resolve();
   await engine.close();
 
-  const resources = engine.liveStats().resources;
+  const live = engine.liveStats();
+  const resources = live.resources;
+  assert.equal(live.tiles.activeStreams, 0);
+  assert.equal(live.streams.length, 0);
   assert.equal(resources.memory.usedBytes, 0);
   assert.equal(resources.memory.waiting, 0);
   assert.equal(resources.spool.reservedBytes, 0);

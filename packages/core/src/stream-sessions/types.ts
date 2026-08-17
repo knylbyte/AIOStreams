@@ -46,6 +46,11 @@ export interface StreamOpenInput {
  */
 export interface StreamHandle {
   readonly sessionId: string;
+  /**
+   * Aborted with the stable StreamStoppedError that terminalized this read.
+   * Async request setup must check it before creating or attaching resources.
+   */
+  readonly signal: AbortSignal;
   /** Report bytes pushed to the client. */
   addBytes(bytes: number): void;
   /** Fill in details only known after the upstream responded. */

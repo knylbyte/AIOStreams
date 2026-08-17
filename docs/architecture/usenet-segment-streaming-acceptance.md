@@ -37,6 +37,12 @@ canonical concept itself is unchanged.
 - [x] Shutdown first fences HTTP, stream-session and engine admission; provider
       change and process shutdown then await the prior engine's spool and final
       stable-cache index writer before replacement/exit.
+- [x] A `StreamHandle` retained by a pre-seal request is terminal: late
+      `attach()` destroys the resource, late `onKill()` runs once, and late
+      byte/metadata updates cannot republish the finalised session.
+- [x] `UsenetEngine.close()` alone waits for actual reader `close`, pool owners
+      and cache finalisation; previously issued seekable wrappers reject new or
+      crossing work once the synchronous engine fence is published.
 - [x] Startup orphan cleanup is heartbeat/fence protected and emits a structured
       completion record.
 - [x] Stable spool failures map to actionable user and HTTP/debrid errors.

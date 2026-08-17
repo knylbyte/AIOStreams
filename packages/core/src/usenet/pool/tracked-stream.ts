@@ -12,6 +12,68 @@ export class UsenetStreamReapedError extends Error {
   readonly code = 'USENET_STREAM_REAPED';
 }
 
+/** Stable admission error published synchronously when an engine starts close. */
+export class UsenetEngineClosedError extends Error {
+  readonly code = 'USENET_ENGINE_CLOSED';
+
+  constructor() {
+    super('usenet engine closed');
+  }
+}
+
+function isExpectedEngineCloseError(
+  error: unknown,
+  closeError: UsenetEngineClosedError
+): boolean {
+  return (
+    error === closeError ||
+    (error instanceof UsenetEngineClosedError && error.code === closeError.code)
+  );
+}
+
+/**
+ * Destroy the current reader snapshot and settle only after every reader has
+ * emitted `close`. Observation is installed before `destroy()`, so synchronous
+ * and asynchronous `_destroy()` implementations share the same barrier.
+ */
+export async function destroyTrackedReaders(
+  liveReaders: ReadonlyMap<number, Readable>,
+  closeError: UsenetEngineClosedError
+): Promise<unknown[]> {
+  const readers = [...liveReaders.values()];
+  const outcomes = await Promise.all(
+    readers.map(
+      (reader) =>
+        new Promise<unknown[]>((resolve) => {
+          if (reader.closed) {
+            resolve([]);
+            return;
+          }
+          const errors: unknown[] = [];
+          const onError = (error: unknown): void => {
+            if (!isExpectedEngineCloseError(error, closeError)) {
+              errors.push(error);
+            }
+          };
+          const onClose = (): void => {
+            reader.removeListener('error', onError);
+            resolve(errors);
+          };
+          reader.on('error', onError);
+          reader.once('close', onClose);
+          try {
+            reader.destroy(closeError);
+          } catch (error) {
+            reader.removeListener('error', onError);
+            reader.removeListener('close', onClose);
+            resolve([error]);
+          }
+        })
+    )
+  );
+  return outcomes.flat();
+}
+
 /**
  * Destroy every tracked reader that has pushed no bytes for `thresholdMs`.
  * Cleanup then flows through the reader's own 'close' handler (the one
@@ -60,9 +122,16 @@ export function trackSeekableStream(
   stream: SeekableStream,
   stats: StatsAccumulator,
   nzbHash: string,
-  liveReaders?: Map<number, Readable>
+  liveReaders: Map<number, Readable> | undefined,
+  assertOpen: () => void
 ): SeekableStream {
-  return new TrackedSeekableStream(stream, stats, nzbHash, liveReaders);
+  return new TrackedSeekableStream(
+    stream,
+    stats,
+    nzbHash,
+    liveReaders,
+    assertOpen
+  );
 }
 
 class TrackedSeekableStream implements SeekableStream {
@@ -70,7 +139,8 @@ class TrackedSeekableStream implements SeekableStream {
     private readonly inner: SeekableStream,
     private readonly stats: StatsAccumulator,
     private readonly nzbHash: string,
-    private readonly liveReaders?: Map<number, Readable>
+    private readonly liveReaders: Map<number, Readable> | undefined,
+    private readonly assertOpen: () => void
   ) {}
 
   get filename(): string | undefined {
@@ -81,31 +151,55 @@ class TrackedSeekableStream implements SeekableStream {
     return this.inner.size();
   }
 
-  open(signal?: AbortSignal): Promise<void> {
-    return this.inner.open(signal);
+  private async awaitInner<T>(operation: Promise<T>): Promise<T> {
+    try {
+      const result = await operation;
+      this.assertOpen();
+      return result;
+    } catch (error) {
+      // Closing wins over transport/cache fallout caused by that same close,
+      // giving every issued wrapper one stable terminal contract.
+      this.assertOpen();
+      throw error;
+    }
   }
 
-  readAt(offset: number, length: number): Promise<Buffer> {
-    return this.inner.readAt(offset, length);
+  async open(signal?: AbortSignal): Promise<void> {
+    this.assertOpen();
+    await this.awaitInner(this.inner.open(signal));
   }
 
-  readAtInto(
+  async readAt(offset: number, length: number): Promise<Buffer> {
+    this.assertOpen();
+    return this.awaitInner(this.inner.readAt(offset, length));
+  }
+
+  async readAtInto(
     dst: Buffer,
     dstOffset: number,
     offset: number,
     length: number
   ): Promise<number> {
+    this.assertOpen();
     if (this.inner.readAtInto) {
-      return this.inner.readAtInto(dst, dstOffset, offset, length);
+      return this.awaitInner(
+        this.inner.readAtInto(dst, dstOffset, offset, length)
+      );
     }
-    return this.inner.readAt(offset, length).then((buf) => {
-      buf.copy(dst, dstOffset);
-      return buf.length;
-    });
+    const buffer = await this.awaitInner(this.inner.readAt(offset, length));
+    buffer.copy(dst, dstOffset);
+    return buffer.length;
   }
 
   createReadStream(range?: { start?: number; end?: number }): Readable {
+    this.assertOpen();
     const out = this.inner.createReadStream(range);
+    try {
+      this.assertOpen();
+    } catch (error) {
+      out.destroy();
+      throw error;
+    }
     const id = this.stats.streamOpened({
       nzbHash: this.nzbHash,
       filename: this.inner.filename,

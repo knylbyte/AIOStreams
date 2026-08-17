@@ -3,6 +3,7 @@ import {
   ArticleNotFoundError,
   NntpError,
   NotStreamableError,
+  UsenetEngineClosedError,
   type ArchiveErrorCode,
   type NzbContent,
 } from '../index.js';
@@ -168,6 +169,13 @@ export function friendlyUsenetError(err: unknown): {
   if (err instanceof UsenetSpoolError) {
     return { reason: SPOOL_REASONS[err.code], code: err.code };
   }
+  if (err instanceof UsenetEngineClosedError) {
+    return {
+      reason:
+        'The Usenet streaming engine closed while the request was active.',
+      code: err.code,
+    };
+  }
   if (err instanceof YencDecodeError) {
     return {
       reason: 'The Usenet article is malformed or not valid yEnc data.',
@@ -236,6 +244,20 @@ export function toDebridError(err: unknown): DebridError {
       type: 'upstream_error',
       cause: err,
     });
+  }
+  if (err instanceof UsenetEngineClosedError) {
+    return new DebridError(
+      'The Usenet streaming engine closed while the request was active.',
+      {
+        statusCode: 503,
+        statusText: 'Service Unavailable',
+        code: 'SERVICE_UNAVAILABLE',
+        headers: {},
+        body: { usenetCode: err.code },
+        type: 'upstream_error',
+        cause: err,
+      }
+    );
   }
   if (
     err instanceof YencDecodeError ||
