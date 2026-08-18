@@ -667,3 +667,188 @@ test('an uninterrupted generation persists both feedback keys exactly once', asy
   assert.equal(owner.retirementTails, 0);
   await owner.close();
 });
+
+test('a cancelled successor retains capacity and its tail until its own census settles', async () => {
+  const owner = new CensusShadowOwner<TestSnapshot>(2);
+  const firstSnapshot = Promise.withResolvers<TestSnapshot>();
+  const secondSnapshot = Promise.withResolvers<TestSnapshot>();
+  const firstSource = controlledCensus(firstSnapshot.promise);
+  const secondSource = controlledCensus(secondSnapshot.promise);
+  const first = requiredHandle(
+    owner.spawn({
+      nzbHash: 'cancelled-successor',
+      census: firstSource.census,
+      apply: async () => undefined,
+      onError: noError,
+    })
+  );
+  const second = requiredHandle(
+    owner.spawn({
+      nzbHash: 'cancelled-successor',
+      census: secondSource.census,
+      apply: async () => undefined,
+      onError: noError,
+    })
+  );
+  second.cancel();
+  let secondSettled = false;
+  let closeSettled = false;
+  void second.done.then(() => {
+    secondSettled = true;
+  });
+  const closing = owner.close().then(() => {
+    closeSettled = true;
+  });
+
+  firstSnapshot.resolve({ complete: false, generation: 'A' });
+  await first.done;
+  await Promise.resolve();
+  assert.equal(secondSettled, false);
+  assert.equal(closeSettled, false);
+  assert.equal(owner.activeTasks, 1);
+  assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 1);
+  assert.equal(firstSource.cancelCalls(), 1);
+  assert.equal(secondSource.cancelCalls(), 1);
+
+  secondSnapshot.resolve({ complete: false, generation: 'B' });
+  await Promise.all([second.done, closing]);
+  assert.equal(owner.activeTasks, 0);
+  assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 0);
+});
+
+test('a third generation waits for a cancelled successor census before publishing', async () => {
+  const owner = new CensusShadowOwner<TestSnapshot>(3);
+  const firstSnapshot = Promise.withResolvers<TestSnapshot>();
+  const secondSnapshot = Promise.withResolvers<TestSnapshot>();
+  const writes: string[] = [];
+  const first = requiredHandle(
+    owner.spawn({
+      nzbHash: 'three-census-generations',
+      census: controlledCensus(firstSnapshot.promise).census,
+      apply: async () => undefined,
+      onError: noError,
+    })
+  );
+  const second = requiredHandle(
+    owner.spawn({
+      nzbHash: 'three-census-generations',
+      census: controlledCensus(secondSnapshot.promise).census,
+      apply: async () => undefined,
+      onError: noError,
+    })
+  );
+  second.cancel();
+  const third = requiredHandle(
+    owner.spawn({
+      nzbHash: 'three-census-generations',
+      census: controlledCensus(
+        Promise.resolve({ complete: true, generation: 'C' })
+      ).census,
+      apply: async (snapshot, publication) => {
+        await publication.step(async () => {
+          writes.push(snapshot.generation);
+        });
+      },
+      onError: noError,
+    })
+  );
+
+  firstSnapshot.resolve({ complete: false, generation: 'A' });
+  await first.done;
+  await Promise.resolve();
+  assert.deepEqual(writes, []);
+  assert.equal(owner.activeTasks, 2);
+  assert.equal(owner.retirementTails, 1);
+
+  secondSnapshot.resolve({ complete: false, generation: 'B' });
+  await Promise.all([second.done, third.done]);
+  assert.deepEqual(writes, ['C']);
+  assert.equal(owner.activeTasks, 0);
+  assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 0);
+  await owner.close();
+});
+
+test('a cancelled census does not free bounded shadow capacity before settlement', async () => {
+  const owner = new CensusShadowOwner<TestSnapshot>(1);
+  const firstSnapshot = Promise.withResolvers<TestSnapshot>();
+  const first = requiredHandle(
+    owner.spawn({
+      nzbHash: 'capacity-until-census-done',
+      census: controlledCensus(firstSnapshot.promise).census,
+      apply: async () => undefined,
+      onError: noError,
+    })
+  );
+  first.cancel();
+  const rejected = controlledCensus(
+    Promise.resolve({ complete: false, generation: 'rejected' })
+  );
+  let rejection: CensusShadowOwnerError | undefined;
+
+  assert.equal(
+    owner.spawn({
+      nzbHash: 'capacity-rejected',
+      census: rejected.census,
+      apply: async () => undefined,
+      onError: noError,
+      onRejected: (error) => {
+        rejection = error;
+      },
+    }),
+    undefined
+  );
+  assert.equal(rejection?.code, 'USENET_CENSUS_SHADOW_CAPACITY');
+  assert.equal(rejected.cancelCalls(), 1);
+  assert.equal(owner.activeTasks, 1);
+
+  firstSnapshot.resolve({ complete: false, generation: 'first' });
+  await first.done;
+  const accepted = requiredHandle(
+    owner.spawn({
+      nzbHash: 'capacity-released',
+      census: controlledCensus(
+        Promise.resolve({ complete: true, generation: 'accepted' })
+      ).census,
+      apply: async () => undefined,
+      onError: noError,
+    })
+  );
+  await accepted.done;
+  await owner.close();
+  assert.equal(owner.activeTasks, 0);
+  assert.equal(owner.retirementTails, 0);
+});
+
+test('owner close awaits a cancelled census finalizer with no repository work', async () => {
+  const owner = new CensusShadowOwner<TestSnapshot>(1);
+  const snapshot = Promise.withResolvers<TestSnapshot>();
+  const source = controlledCensus(snapshot.promise);
+  const shadow = requiredHandle(
+    owner.spawn({
+      nzbHash: 'close-census-finalizer',
+      census: source.census,
+      apply: async () => undefined,
+      onError: noError,
+    })
+  );
+  let closeSettled = false;
+  const closing = owner.close().then(() => {
+    closeSettled = true;
+  });
+
+  await Promise.resolve();
+  assert.equal(closeSettled, false);
+  assert.equal(source.cancelCalls(), 1);
+  assert.equal(owner.activeTasks, 1);
+  assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 1);
+
+  snapshot.resolve({ complete: false, generation: 'cancelled' });
+  await Promise.all([shadow.done, closing]);
+  assert.equal(owner.activeTasks, 0);
+  assert.equal(owner.currentGenerations, 0);
+  assert.equal(owner.retirementTails, 0);
+});

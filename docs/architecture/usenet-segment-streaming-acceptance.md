@@ -78,14 +78,18 @@ canonical concept itself is unchanged.
 - [x] Census continuations use a process-wide owner capped at 64 active tasks
       with one current monotonic generation per NZB hash. Reimports and engine
       retirement invalidate stale generations, while an identity-safe per-hash
-      retirement tail remains until the complete predecessor task settles.
-      Concurrent invalidators share that same tail. Every hole, streamability
-      and status mutation rechecks publication ownership before and after its
-      awaited operation; release feedback additionally fences each individual
-      key mutation. Process shutdown synchronously observes every cleanup
-      rejection, fences new shadows, cancels census workers, awaits crossing
-      repository writes and aggregates their bounded failures before stream-hook
-      persistence and the database close barrier.
+      retirement tail remains until both the predecessor's `CensusRun.done` and
+      repository task settle. `CensusShadowHandle.done` therefore represents
+      the complete owned census/repository lifecycle, and the 64-task capacity
+      includes every accepted census until that full settlement. Concurrent
+      invalidators share the same tail. Every hole, streamability and status
+      mutation rechecks publication ownership before and after its awaited
+      operation; release feedback additionally fences each individual key
+      mutation. Process shutdown synchronously observes every cleanup
+      rejection, fences new shadows, cancels census workers, and awaits the
+      actual engine-owned `CensusRun` finalizers in parallel with readers, pool
+      and shadow tasks. Crossing repository writes and bounded failures settle
+      before stream-hook persistence and the database close barrier.
 - [x] Startup orphan cleanup is heartbeat/fence protected and emits a structured
       completion record.
 - [x] Stable spool failures map to actionable user and HTTP/debrid errors.

@@ -11,6 +11,8 @@ import { usenetSchema } from '../../config/schema/usenet.js';
 import type { SeekableStream } from '../pool/file-stream.js';
 import type { Nzb } from '../nzb/model.js';
 import type { SharedSegment } from '../pool/segment-arena.js';
+import type { CensusRun, CensusSnapshot } from '../pool/inspect/index.js';
+import { HoleAccumulator } from '../holes.js';
 import { CensusShadowOwner } from './census-shadow-owner.js';
 
 const MEBIBYTE_BYTES = 1024 * 1024;
@@ -64,11 +66,52 @@ const barrierNzb: Nzb = {
 
 interface EngineTestAccess {
   track(nzb: Nzb, stream: SeekableStream): SeekableStream;
+  registerCensus(census: CensusRun): void;
+  liveCensus: { readonly size: number };
   pool: {
     close(): Promise<void>;
     fetchSegmentShared(...args: readonly unknown[]): Promise<SharedSegment>;
   };
   cache: { close(): Promise<void> };
+}
+
+interface ControlledEngineCensus {
+  readonly census: CensusRun;
+  readonly cancelCalls: () => number;
+}
+
+function emptyCensusSnapshot(complete: boolean): CensusSnapshot {
+  return {
+    total: 0,
+    sampled: 0,
+    missing: 0,
+    unknowns: 0,
+    longestRun: 0,
+    holes: new HoleAccumulator(),
+    trustedProviders: [],
+    untrustedProviders: [],
+    mode: 'stat',
+    complete,
+  };
+}
+
+function controlledEngineCensus(
+  done: Promise<CensusSnapshot>
+): ControlledEngineCensus {
+  let cancels = 0;
+  return {
+    census: {
+      onCatastrophic: () => undefined,
+      hasConfirmedMiss: () => false,
+      endBlockingPhase: () => done,
+      done,
+      snapshot: () => emptyCensusSnapshot(false),
+      cancel: () => {
+        cancels++;
+      },
+    },
+    cancelCalls: () => cancels,
+  };
 }
 
 function runtimeSettings(
@@ -592,6 +635,106 @@ test('engine close aggregates reader and pool failures after cache cleanup', asy
   assert.equal(cacheCloseCalls, 1);
   assert.equal(reader.closed, true);
   assert.equal(engine.liveStats().tiles.activeStreams, 0);
+});
+
+test('engine close waits for a census run without an active shadow', async () => {
+  const { UsenetEngine } = await import('../index.js');
+  const engine = new UsenetEngine([], {
+    ...DEFAULT_ENGINE_OPTIONS,
+    segmentDiskCacheBytes: 0,
+  });
+  const access = engine as unknown as EngineTestAccess;
+  const finalizer = Promise.withResolvers<CensusSnapshot>();
+  const source = controlledEngineCensus(finalizer.promise);
+  access.registerCensus(source.census);
+  assert.equal(access.liveCensus.size, 1);
+
+  let closeSettled = false;
+  const closing = engine.close().then(() => {
+    closeSettled = true;
+  });
+  await Promise.resolve();
+  assert.equal(closeSettled, false);
+  assert.equal(source.cancelCalls(), 1);
+  assert.equal(access.liveCensus.size, 1);
+
+  finalizer.resolve(emptyCensusSnapshot(false));
+  await closing;
+  assert.equal(access.liveCensus.size, 0);
+  assert.equal(engine.liveStats().pool.globalDownloadsInUse, 0);
+  assert.equal(engine.liveStats().pool.globalDownloadsWaiting, 0);
+  assert.equal(engine.liveStats().resources.memory.usedBytes, 0);
+});
+
+test('engine starts pool close while awaiting census worker settlement', async () => {
+  const { UsenetEngine } = await import('../index.js');
+  const engine = new UsenetEngine([], {
+    ...DEFAULT_ENGINE_OPTIONS,
+    segmentDiskCacheBytes: 0,
+  });
+  const access = engine as unknown as EngineTestAccess;
+  const poolCloseStarted = Promise.withResolvers<void>();
+  const permitCensusFinalizer = Promise.withResolvers<void>();
+  const originalPoolClose = access.pool.close.bind(access.pool);
+  access.pool.close = async () => {
+    poolCloseStarted.resolve();
+    await originalPoolClose();
+  };
+  const source = controlledEngineCensus(
+    poolCloseStarted.promise.then(async () => {
+      await permitCensusFinalizer.promise;
+      return emptyCensusSnapshot(false);
+    })
+  );
+  access.registerCensus(source.census);
+
+  let closeSettled = false;
+  const closing = engine.close().then(() => {
+    closeSettled = true;
+  });
+  await poolCloseStarted.promise;
+  await Promise.resolve();
+  assert.equal(closeSettled, false);
+  assert.equal(source.cancelCalls(), 1);
+  assert.equal(access.liveCensus.size, 1);
+
+  permitCensusFinalizer.resolve();
+  await closing;
+  assert.equal(access.liveCensus.size, 0);
+});
+
+test('repeated engine close shares one census barrier and one bounded failure', async () => {
+  const { UsenetEngine } = await import('../index.js');
+  const engine = new UsenetEngine([], {
+    ...DEFAULT_ENGINE_OPTIONS,
+    segmentDiskCacheBytes: 0,
+  });
+  const access = engine as unknown as EngineTestAccess;
+  const finalizer = Promise.withResolvers<CensusSnapshot>();
+  const source = controlledEngineCensus(finalizer.promise);
+  const finalizerError = Object.assign(
+    new Error('synthetic census finalizer failure'),
+    { code: 'EIO' }
+  );
+  access.registerCensus(source.census);
+
+  const firstClose = engine.close();
+  const secondClose = engine.close();
+  assert.equal(secondClose, firstClose);
+  assert.equal(source.cancelCalls(), 1);
+  finalizer.reject(finalizerError);
+
+  await assert.rejects(firstClose, (error: unknown) => {
+    assert(error instanceof AggregateError);
+    assert.equal(
+      error.errors.filter((entry) => entry === finalizerError).length,
+      1
+    );
+    return true;
+  });
+  assert.equal(engine.close(), firstClose);
+  assert.equal(source.cancelCalls(), 1);
+  assert.equal(access.liveCensus.size, 0);
 });
 
 test('an engine open crossing close cannot publish a seekable handle', async () => {

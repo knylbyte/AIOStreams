@@ -195,6 +195,116 @@ interface EngineCensusShadow {
   cancel(): void;
 }
 
+interface EngineCensusRunState {
+  readonly census: CensusRun;
+  readonly settlement: Promise<void>;
+}
+
+const MAX_ENGINE_CENSUS_CLOSE_FAILURES = 64;
+
+/**
+ * Engine-lifetime ownership for CensusRun workers and their finalizers.
+ * Active entries disappear only after `CensusRun.done` settles; close fences
+ * admission, cancels every owned run and shares one complete settlement
+ * barrier with all callers. Unexpected failures are retained with a hard cap
+ * until close can report them without leaving a rejected promise unobserved.
+ */
+class EngineCensusRunOwner {
+  private readonly active = new Map<CensusRun, EngineCensusRunState>();
+  private readonly failures: unknown[] = [];
+  private droppedFailures = 0;
+  private closed = false;
+  private closePromise: Promise<unknown[]> | undefined;
+
+  get size(): number {
+    return this.active.size;
+  }
+
+  register(census: CensusRun): boolean {
+    if (this.closed) {
+      // Engine work admission is synchronously fenced before close starts, so
+      // this is a defensive edge only. Still cancel and observe the run.
+      this.observeRejectedRun(census);
+      return false;
+    }
+    if (this.active.has(census)) return true;
+
+    const completion = Promise.withResolvers<void>();
+    const state: EngineCensusRunState = {
+      census,
+      settlement: completion.promise,
+    };
+    this.active.set(census, state);
+    // Attach both handlers in the registration turn. CensusRun.done promises
+    // normally fulfil even after cancellation, but an implementation failure
+    // must neither become unhandled nor bypass the engine close barrier.
+    void census.done.then(
+      () => this.settle(state, completion.resolve),
+      (error: unknown) => {
+        this.recordFailure(error);
+        this.settle(state, completion.resolve);
+      }
+    );
+    return true;
+  }
+
+  close(): Promise<unknown[]> {
+    if (this.closePromise) return this.closePromise;
+    this.closed = true;
+    const states = [...this.active.values()];
+    for (const state of states) {
+      try {
+        state.census.cancel();
+      } catch (error) {
+        this.recordFailure(error);
+      }
+    }
+    this.closePromise = Promise.all(
+      states.map((state) => state.settlement)
+    ).then(() => this.takeFailures());
+    return this.closePromise;
+  }
+
+  private observeRejectedRun(census: CensusRun): void {
+    void census.done.then(
+      () => undefined,
+      (error: unknown) => this.recordFailure(error)
+    );
+    try {
+      census.cancel();
+    } catch (error) {
+      this.recordFailure(error);
+    }
+  }
+
+  private settle(state: EngineCensusRunState, resolve: () => void): void {
+    if (this.active.get(state.census) === state) {
+      this.active.delete(state.census);
+    }
+    resolve();
+  }
+
+  private recordFailure(error: unknown): void {
+    if (this.failures.some((failure) => Object.is(failure, error))) return;
+    if (this.failures.length < MAX_ENGINE_CENSUS_CLOSE_FAILURES - 1) {
+      this.failures.push(error);
+    } else {
+      this.droppedFailures++;
+    }
+  }
+
+  private takeFailures(): unknown[] {
+    const errors = this.failures.splice(0);
+    if (this.droppedFailures > 0) {
+      errors.push(
+        new Error(`${this.droppedFailures} additional census run failures`)
+      );
+      this.droppedFailures = 0;
+    }
+    return errors;
+  }
+}
+
 /**
  * Pure, HTTP-agnostic usenet engine: given provider configs + an NZB it
  * produces file lists, seekable streams, and stats. No UserData, no Express.
@@ -212,8 +322,8 @@ export class UsenetEngine {
   private closedError: UsenetEngineClosedError | undefined;
   /** Engine-lifetime per-provider STAT trust (census calibration results). */
   private statTrust = new StatTrustCache();
-  /** Live census runs, so close() can cancel their workers promptly. */
-  private liveCensus = new Set<CensusRun>();
+  /** Live census runs, including their worker/finalizer settlement barrier. */
+  private liveCensus = new EngineCensusRunOwner();
   /** Integration continuations owned until their final mutation settles. */
   private liveCensusShadows = new Set<EngineCensusShadow>();
   /**
@@ -508,8 +618,9 @@ export class UsenetEngine {
 
   /** Track a live census so {@link close} can cancel its workers promptly. */
   private registerCensus(census: CensusRun): void {
-    this.liveCensus.add(census);
-    void census.done.finally(() => this.liveCensus.delete(census));
+    if (!this.liveCensus.register(census)) {
+      throw this.closedError ?? new UsenetEngineClosedError();
+    }
   }
 
   /** Bind an adopted census continuation to this engine's close barrier. */
@@ -1303,10 +1414,10 @@ export class UsenetEngine {
   private async closeOnce(closeError: UsenetEngineClosedError): Promise<void> {
     if (this.purgeTimer) clearInterval(this.purgeTimer);
     this.purgeTimer = undefined;
-    // Cancel any shadow census first so its workers stop submitting to the
-    // pool being closed (they self-resolve with `complete: false`).
-    for (const census of this.liveCensus) census.cancel();
-    this.liveCensus.clear();
+    // Cancel every census and immediately own its full worker/finalizer
+    // settlement. Pool close starts in parallel below so a census blocked in
+    // pool work cannot deadlock engine retirement.
+    const censusClose = this.liveCensus.close();
     const censusShadows = [...this.liveCensusShadows];
     for (const shadow of censusShadows) shadow.cancel();
     // Observe reader close before destroy, then close the pool concurrently:
@@ -1325,11 +1436,13 @@ export class UsenetEngine {
       )
     );
     const errors: unknown[] = [];
-    const [readerResult, poolResult, shadowResult] = await Promise.allSettled([
-      readerClose,
-      poolClose,
-      shadowClose,
-    ]);
+    const [readerResult, poolResult, shadowResult, censusResult] =
+      await Promise.allSettled([
+        readerClose,
+        poolClose,
+        shadowClose,
+        censusClose,
+      ]);
     if (readerResult.status === 'fulfilled') {
       errors.push(...readerResult.value);
     } else {
@@ -1347,6 +1460,11 @@ export class UsenetEngine {
     } else {
       errors.push(shadowResult.reason);
     }
+    if (censusResult.status === 'fulfilled') {
+      errors.push(...censusResult.value);
+    } else {
+      errors.push(censusResult.reason);
+    }
     if (this.liveReaders.size !== 0 || this.stats.activeStreams !== 0) {
       errors.push(
         new Error(
@@ -1356,6 +1474,9 @@ export class UsenetEngine {
     }
     if (this.liveCensusShadows.size !== 0) {
       errors.push(new Error('Usenet census shadow cleanup incomplete'));
+    }
+    if (this.liveCensus.size !== 0) {
+      errors.push(new Error('Usenet census run cleanup incomplete'));
     }
     try {
       const poolOwners = this.pool.poolInfo();

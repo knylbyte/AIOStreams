@@ -65,6 +65,10 @@ interface CensusShadowState<TSnapshot> {
   cancelled: boolean;
 }
 
+type CensusSettlement<TSnapshot> =
+  | { readonly status: 'fulfilled'; readonly snapshot: TSnapshot }
+  | { readonly status: 'rejected'; readonly reason: unknown };
+
 const DEFAULT_MAX_CENSUS_SHADOW_TASKS = 64;
 const MAX_CENSUS_SHADOW_CLOSE_FAILURES = 64;
 
@@ -188,12 +192,20 @@ export class CensusShadowOwner<TSnapshot> {
     predecessor: CensusShadowState<TSnapshot> | undefined,
     args: CensusShadowSpawn<TSnapshot>
   ): Promise<void> {
+    // Observe the accepted census immediately. A cancelled successor may still
+    // be queued behind its predecessor, but its task continues to own the
+    // underlying CensusRun until both lifecycles have fully settled.
+    const censusSettlement: Promise<CensusSettlement<TSnapshot>> =
+      state.census.done.then(
+        (snapshot) => ({ status: 'fulfilled', snapshot }),
+        (reason: unknown) => ({ status: 'rejected', reason })
+      );
     try {
       if (predecessor) await predecessor.task;
+      const settlement = await censusSettlement;
+      if (settlement.status === 'rejected') throw settlement.reason;
       if (!this.isCurrent(state)) return;
-      const snapshot = await state.census.done;
-      if (!this.isCurrent(state)) return;
-      await args.apply(snapshot, this.publicationFor(state));
+      await args.apply(settlement.snapshot, this.publicationFor(state));
     } catch (error) {
       if (this.closed) this.recordCloseFailure(error);
       this.reportError(args, error);
