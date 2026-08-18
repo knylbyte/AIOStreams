@@ -1,4 +1,5 @@
 import yencode from 'yencode';
+import type { SegmentSpoolingHotpathCounters } from './hotpath-counters.js';
 
 /**
  * Result of decoding a single yEnc article (segment).
@@ -219,6 +220,10 @@ export class StreamingYencDecoder {
   private state: string | null = null;
   private _ended = false;
 
+  constructor(
+    private readonly hotpathCounters?: SegmentSpoolingHotpathCounters
+  ) {}
+
   get ended(): boolean {
     return this._ended;
   }
@@ -230,12 +235,50 @@ export class StreamingYencDecoder {
    */
   push(chunk: Buffer): Buffer {
     if (this._ended || chunk.length === 0) return Buffer.alloc(0);
+    if (this.hotpathCounters) {
+      this.hotpathCounters.yencDecodeCalls++;
+      this.hotpathCounters.yencOutputBackingAllocations++;
+    }
     const res = yencode.decodeChunk(chunk, undefined, this.state);
     this.state = res.state;
     if (res.ended) this._ended = true;
+    if (this.hotpathCounters) {
+      this.hotpathCounters.yencDecodedBytes += res.written;
+    }
     return res.written === res.output.length
       ? res.output
       : res.output.subarray(0, res.written);
+  }
+
+  /**
+   * Decode directly into a caller-owned destination. The destination must
+   * cover the encoded input's safe upper bound; the native addon then returns
+   * a written count without allocating an output backing.
+   */
+  pushInto(chunk: Buffer, output: Buffer): number {
+    if (this._ended || chunk.length === 0) return 0;
+    if (output.length < chunk.length) {
+      throw new RangeError('Streaming yEnc destination is smaller than input');
+    }
+    if (this.hotpathCounters) {
+      this.hotpathCounters.yencDecodeCalls++;
+      this.hotpathCounters.yencOutputBackingReuses++;
+    }
+    const result = yencode.decodeChunk(chunk, output, this.state);
+    if (
+      result.output.buffer !== output.buffer ||
+      result.output.byteOffset !== output.byteOffset ||
+      result.written < 0 ||
+      result.written > output.length
+    ) {
+      throw new Error('Native yEnc decoder violated direct-output ownership');
+    }
+    this.state = result.state;
+    if (result.ended) this._ended = true;
+    if (this.hotpathCounters) {
+      this.hotpathCounters.yencDecodedBytes += result.written;
+    }
+    return result.written;
   }
 }
 

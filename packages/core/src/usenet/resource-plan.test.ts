@@ -22,6 +22,10 @@ import {
   NNTP_READ_CARRY_MAX_CHUNKS,
   NNTP_READ_WINDOW_BYTES,
 } from './nntp/read-carry.js';
+import {
+  SEGMENT_STREAM_MAX_CHUNK_BYTES,
+  resolveSegmentStreamMemoryBytes,
+} from './stream-queue-budget.js';
 
 const KIBIBYTE_BYTES = 1024;
 const MEBIBYTE_BYTES = KIBIBYTE_BYTES * KIBIBYTE_BYTES;
@@ -174,7 +178,7 @@ test('default engine options resolve to the specified effective plans', () => {
   });
 });
 
-test('download admission reserves decoder, sink and bounded TLS carry atomically', () => {
+test('download admission reserves the two-chunk direct batch and TLS carry atomically', () => {
   const plan = resolveEngineResourcePlan(
     resourceOptions({
       segmentSpoolingMemoryBudgetBytes: 16 * MEBIBYTE_BYTES,
@@ -193,6 +197,19 @@ test('download admission reserves decoder, sink and bounded TLS carry atomically
     plan.perDownloadBaseLeaseBytes <=
       plan.memoryBudgetBytes - plan.perStreamBufferBytes,
     'the 16 MiB minimum must admit one download beside one stream window'
+  );
+});
+
+test('128 KiB artifact chunks retain one file stream inside the 2 MiB minimum', () => {
+  const readerHighWaterMarkBytes =
+    resolveSegmentSpoolingReaderHighWaterMarkBytes(2 * MEBIBYTE_BYTES);
+  assert.equal(SEGMENT_STREAM_MAX_CHUNK_BYTES, 128 * KIBIBYTE_BYTES);
+  assert(
+    resolveSegmentStreamMemoryBytes(
+      readerHighWaterMarkBytes,
+      readerHighWaterMarkBytes
+    ) <=
+      2 * MEBIBYTE_BYTES
   );
 });
 

@@ -20,6 +20,7 @@ import {
   NNTP_READ_CARRY_MAX_CHUNKS,
   NNTP_READ_WINDOW_BYTES,
 } from './read-carry.js';
+import type { SegmentSpoolingHotpathCounters } from '../pool/hotpath-counters.js';
 
 const logger = createLogger('usenet/connection');
 
@@ -64,6 +65,8 @@ export interface ConnectionOptions {
   allocateReadCarryBuffer?: (bytes: number) => Buffer;
   /** Optional bounded telemetry seam; never receives payload bytes. */
   onLateRead?: (stats: NntpReadCarryStats) => void;
+  /** Optional fixed-size benchmark counters; never receives payload bytes. */
+  hotpathCounters?: SegmentSpoolingHotpathCounters;
 }
 
 /**
@@ -956,6 +959,10 @@ export class NntpConnection {
     const parser = this.parser;
     if (!parser || this.destroyed) return false;
     if (nread <= 0) return true;
+    if (this.opts.hotpathCounters) {
+      this.opts.hotpathCounters.rawReadCallbacks++;
+      this.opts.hotpathCounters.rawReadBytes += nread;
+    }
     if (this.failExpiredPipelineDeadline()) return false;
 
     // `socket.pause()` is not a TLS delivery fence: data already decrypted or
@@ -1280,6 +1287,7 @@ export class NntpConnection {
     if (this.socketLocallyPaused) return;
     this.localPauseStartedAt = now;
     this.socket.pause();
+    if (this.opts.hotpathCounters) this.opts.hotpathCounters.socketPauseCalls++;
     this.socketLocallyPaused = true;
     logger.trace(
       {
@@ -1360,6 +1368,9 @@ export class NntpConnection {
       this.socketLocallyPaused = false;
       this.localPauseStartedAt = undefined;
       this.socket.resume();
+      if (this.opts.hotpathCounters) {
+        this.opts.hotpathCounters.socketResumeCalls++;
+      }
       logger.trace(
         {
           provider: this.label,

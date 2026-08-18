@@ -4,9 +4,11 @@ import yencode from 'yencode';
 import {
   StreamingYencArticleDecoder,
   type BackpressuredByteSink,
+  type DirectDecodeByteSink,
   type DecodedSegmentMetadata,
 } from './streaming-yenc-article-decoder.js';
 import { decodeArticle, YencDecodeError } from './yenc.js';
+import { SegmentSpoolingHotpathCounters } from './hotpath-counters.js';
 
 class CollectingSink implements BackpressuredByteSink {
   readonly chunks: Buffer[] = [];
@@ -45,6 +47,51 @@ class CollectingSink implements BackpressuredByteSink {
 
   decoded(): Buffer {
     return Buffer.concat(this.chunks);
+  }
+}
+
+class DirectCollectingSink implements DirectDecodeByteSink {
+  readonly directDecode = true as const;
+  readonly maxDecodeInputBytes = 4096;
+  readonly backing = Buffer.allocUnsafeSlow(64 * 1024);
+  readonly targetBackings = new Set<ArrayBufferLike>();
+  cursor = 0;
+  endCalls = 0;
+  failure: Error | undefined;
+
+  write(): boolean {
+    throw new Error('legacy write must not be used by a direct sink');
+  }
+
+  acquireDecodeTarget(maxDecodedBytes: number): Buffer {
+    const target = this.backing.subarray(
+      this.cursor,
+      this.cursor + maxDecodedBytes
+    );
+    this.targetBackings.add(target.buffer);
+    return target;
+  }
+
+  commitDecoded(bytes: number): boolean {
+    this.cursor += bytes;
+    return true;
+  }
+
+  onceDrain(): void {
+    throw new Error('direct collecting sink never backpressures');
+  }
+
+  end(): Promise<void> {
+    this.endCalls++;
+    return Promise.resolve();
+  }
+
+  fail(error: Error): void {
+    this.failure ??= error;
+  }
+
+  decoded(): Buffer {
+    return Buffer.from(this.backing.subarray(0, this.cursor));
   }
 }
 
@@ -173,6 +220,53 @@ test('propagates sink backpressure and delegates one drain notification', async 
   const metadata = await decoder.finish();
   assert.deepEqual(sink.decoded(), Buffer.from('payload'));
   assert.equal(metadata.size, 7);
+});
+
+test('decodes many native calls into one caller-owned output backing', async () => {
+  const body = Buffer.alloc(32 * 1024, 0x31);
+  const raw = yencode.post('direct-output.bin', body, 128);
+  const sink = new DirectCollectingSink();
+  const counters = new SegmentSpoolingHotpathCounters();
+  const decoder = new StreamingYencArticleDecoder(sink, undefined, counters);
+
+  for (let offset = 0; offset < raw.length; offset += 97) {
+    assert.equal(decoder.write(raw.subarray(offset, offset + 97)), true);
+  }
+  await decoder.finish();
+
+  assert.deepEqual(sink.decoded(), body);
+  assert.equal(sink.targetBackings.size, 1);
+  assert(counters.yencDecodeCalls > 100);
+  assert.equal(counters.yencOutputBackingReuses, counters.yencDecodeCalls);
+  assert.equal(counters.yencOutputBackingAllocations, 0);
+});
+
+test('direct header transition avoids the legacy combined transition buffer', async () => {
+  const body = Buffer.from('header transition data');
+  const raw = yencode.post('transition.bin', body, 128);
+  const directCounters = new SegmentSpoolingHotpathCounters();
+  const directSink = new DirectCollectingSink();
+  const direct = new StreamingYencArticleDecoder(
+    directSink,
+    undefined,
+    directCounters
+  );
+  assert.equal(direct.write(raw), true);
+  await direct.finish();
+  assert.deepEqual(directSink.decoded(), body);
+  assert.equal(directCounters.headerTransitionCopies, 0);
+
+  const legacyCounters = new SegmentSpoolingHotpathCounters();
+  const legacySink = new CollectingSink();
+  const legacy = new StreamingYencArticleDecoder(
+    legacySink,
+    undefined,
+    legacyCounters
+  );
+  assert.equal(legacy.write(raw), true);
+  await legacy.finish();
+  assert.deepEqual(legacySink.decoded(), body);
+  assert.equal(legacyCounters.headerTransitionCopies, 1);
 });
 
 test('classifies missing ybegin and missing yend and fails the sink', async () => {

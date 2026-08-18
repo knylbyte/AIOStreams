@@ -37,6 +37,7 @@ import type {
   UsenetResourceLifecycleEvent,
 } from '../pool/resource-events.js';
 import type { CommandPriority } from '../types.js';
+import type { SegmentSpoolingHotpathCounters } from '../pool/hotpath-counters.js';
 
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -75,6 +76,7 @@ export interface SpoolManagerOptions {
   readonly scheduler?: SpoolScheduler;
   readonly maxArtifacts?: number;
   readonly onEvent?: UsenetResourceEventObserver;
+  readonly hotpathCounters?: SegmentSpoolingHotpathCounters;
 }
 
 export interface CreateSpoolArtifactOptions {
@@ -290,6 +292,7 @@ export class SpoolManager {
   private readonly budget: SpoolBudget;
   private readonly filePool: OpenFilePool;
   private readonly onEvent: UsenetResourceEventObserver | undefined;
+  private readonly hotpathCounters: SegmentSpoolingHotpathCounters | undefined;
   private readonly writeRate: ByteRateMeter;
   private readonly readRate: ByteRateMeter;
   private readonly artifacts = new Set<GrowingSpoolArtifact>();
@@ -339,6 +342,7 @@ export class SpoolManager {
     };
     this.clock = options.clock ?? Date.now;
     this.onEvent = options.onEvent;
+    this.hotpathCounters = options.hotpathCounters;
     this.writeRate = new ByteRateMeter(this.clock);
     this.readRate = new ByteRateMeter(this.clock);
     this.idGenerator = options.idGenerator ?? randomUUID;
@@ -453,6 +457,7 @@ export class SpoolManager {
           },
           onWriteBytes: (bytes) => this.writeRate.record(bytes),
           onReadBytes: (bytes) => this.readRate.record(bytes),
+          hotpathCounters: this.hotpathCounters,
         };
         try {
           artifact = await GrowingSpoolArtifact.create(artifactOptions);
@@ -515,6 +520,9 @@ export class SpoolManager {
     } catch {
       // Metrics/log consumers never participate in resource ownership.
     }
+    // A parent runtime is the single logging owner. Standalone SpoolManager
+    // users retain the legacy diagnostics without double serialization.
+    if (this.onEvent) return;
     const level = event.type === 'disk_safety_warning' ? 'warn' : 'debug';
     logSpool(level, event, `usenet resource event: ${event.type}`);
   }

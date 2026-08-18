@@ -116,7 +116,7 @@ The benchmark defaults to the concept's full 500 one-MiB segment run with a
 64-segment prefetch window, a 16 MiB memory budget and 60 configured producer
 slots. It reports the lower effective producer limit derived from the hard
 stream and productive per-download windows rather than claiming all 60 slots
-when that memory cannot be leased. With the current 655,358-byte stream window,
+when that memory cannot be leased. With the current 786,430-byte stream window,
 the 16 MiB default admits ten downloads. The regression suite uses 96 MiB to
 prove the complete 60-download ceiling; 80 MiB is explicitly insufficient:
 
@@ -135,6 +135,104 @@ base-lease window. A larger explicit
 Latency, throughput, V8 memory and event-loop values are diagnostic because
 machine and filesystem variance makes fixed CI thresholds flaky. Internal
 memory/spool ceilings and final-zero ownership remain hard assertions.
+
+## CPU hotpath acceptance
+
+The dedicated `benchmark:segment-spooling:cpu` command drives the production
+path from a local TLS NNTP server through native incremental yEnc decode,
+spooling, a growing file reader and the ordered `FileStream` consumer. Its
+defaults are 512 MiB per scenario, one-MiB segments, a 32-MiB warmup and five
+measured runs for each of S1–S5. The comparison below used base
+`3ae95e7a1f5f840067663812f5967bde63a472fe`, followed by two independent
+five-run final series on the same machine. The final medians therefore cover
+ten measured runs; p95 values remain diagnostic.
+
+The production spooling decoder now writes directly into one unpooled 512-KiB
+batch (`2 × 256 KiB`). Its exact child lease remains writer-owned until the
+complete short-write-safe file operation settles. The first payload flushes
+immediately; steady state combines up to two decoder inputs. Header transition
+pieces are decoded sequentially into the same window. Because the physical
+batch is contiguous, one ordinary positional write is cheaper and simpler than
+`writev`; no bounded iovec list is needed.
+
+On-wire memory admission remains one atomic 1,572,864-byte lease:
+
+```text
+512 KiB direct decode/write batch
++ 1 MiB guaranteed TLS/onread carry
+= 1,572,864 bytes
+```
+
+Artifact readers use at most 128-KiB chunks. Each Node queue reserves
+`HWM + 128 KiB - 1`, and a direct stream/FileStream relay atomically reserves
+two/three such capacities. The 128-KiB choice keeps the minimum 2-MiB stream
+window valid (`3 × (512 KiB + 128 KiB - 1) = 1,966,077` bytes). The measured
+reader alternatives were:
+
+| Reader chunk | S1 CPU ms/GiB | S1 first byte | Internal peak | Decision                                 |
+| ------------ | ------------: | ------------: | ------------: | ---------------------------------------- |
+| 64 KiB       |         7,471 |      18.07 ms |  19,070,973 B | CPU gate missed                          |
+| 128 KiB      |         6,268 |      17.50 ms |  19,267,581 B | selected                                 |
+| 256 KiB      |         6,030 |      19.27 ms |  19,660,797 B | exceeds the 2-MiB minimum queue contract |
+
+The NNTP/decoder window stays at 256 KiB. A production-equivalent 512-KiB
+experiment did not reduce TLS read/decode callbacks, raised the S1 internal
+peak to 31,850,493 bytes and moved first byte to 19.61 ms; S3 first byte rose to
+21.21 ms. It was therefore rejected rather than trading concurrency and memory
+for fewer writes.
+
+Median results (bytes/second for throughput) were:
+
+| Scenario         | CPU ms/GiB before | CPU ms/GiB after | CPU delta | First byte before/after |   Throughput before/after | Event-loop p95 before/after |
+| ---------------- | ----------------: | ---------------: | --------: | ----------------------: | ------------------------: | --------------------------: |
+| S1 single        |             8,497 |            6,268 |    −26.2% |        17.74 / 17.50 ms | 264,365,521 / 355,721,894 |            10.36 / 10.46 ms |
+| S2 + promotion   |            10,482 |            7,051 |    −32.7% |        17.72 / 16.96 ms | 227,272,949 / 328,847,881 |            10.54 / 10.54 ms |
+| S3 two streams   |             7,912 |            5,763 |    −27.2% |        16.88 / 18.38 ms | 274,159,093 / 385,288,899 |            10.78 / 10.76 ms |
+| S4 shared stream |             7,798 |            5,567 |    −28.6% |        17.38 / 17.24 ms | 303,365,568 / 397,095,571 |            10.62 / 10.63 ms |
+| S5 slow consumer |             8,060 |            6,489 |    −19.5% |        16.89 / 17.91 ms | 272,424,039 / 357,378,578 |            10.35 / 10.53 ms |
+
+The largest median p95-lag change is 0.172 ms against a 10-ms sampling
+resolution; mean lag is unchanged to 0.001 ms in S5. This is treated as
+measurement granularity rather than a material event-loop regression. First
+byte stays within 10% in every scenario (the largest change is +8.9% for S3),
+and throughput improves throughout.
+
+For one 512-segment S1 run, output-backing allocations fell from 33,792 to 512;
+spool writes, syscalls and drain cycles fell from 33,792 to 2,560; socket
+pause/resume calls fell from 13,824/13,824 to 2,560/2,560. Transition copies
+are zero. With debug disabled, 2,561 raw resource events produce no debug
+records; the deterministic debug-level regression test reduces 500 successful
+events to two summaries (99.6%) while errors and long waits remain immediate.
+
+Persistent promotion has no queue. New work is skipped for memory, spool,
+open-file or foreground-download pressure, and active playback admits at most
+one promotion. Global download admission keeps High/Low priority behavior and
+uses bounded owner round-robin within a priority, FIFO within each owner. S3
+recorded exactly 256 admits for each independent owner. All measured runs ended
+with zero download, memory, spool-artifact and open-file owners.
+
+Reproduce the benchmark and a Node 24 CPU profile with:
+
+```bash
+LOG_LEVEL=error pnpm -F core benchmark:segment-spooling:cpu
+
+cd packages/core
+LOG_LEVEL=error \
+AIOSTREAMS_CPU_BENCHMARK_SCENARIOS=S1 \
+AIOSTREAMS_CPU_BENCHMARK_RUNS=1 \
+AIOSTREAMS_CPU_BENCHMARK_TOTAL_BYTES=536870912 \
+AIOSTREAMS_CPU_BENCHMARK_WARMUP_BYTES=33554432 \
+node --cpu-prof --cpu-prof-dir="$(mktemp -d)" \
+  --import tsx --import ./test/setup.ts \
+  src/usenet/benchmarks/segment-spooling-cpu.ts
+```
+
+Profiles remain local and are excluded from commits and source exports. Before
+the change, native decode and file writes were leading application hot spots;
+afterward, benchmark checksum hashing and file writes lead, while sampled
+native `decodeChunk` work is substantially lower. A Worker-thread path was not
+adopted: native decode no longer dominates, and moving the same work would add
+transfer/ownership complexity without evidence of lower total CPU.
 
 ## Production TLS smoke test
 

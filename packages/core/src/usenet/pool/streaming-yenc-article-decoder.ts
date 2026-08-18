@@ -1,9 +1,21 @@
 import { StreamingYencDecoder, YencDecodeError } from './yenc.js';
+import type { SegmentSpoolingHotpathCounters } from './hotpath-counters.js';
 
 const LF = 0x0a;
 const CR = 0x0d;
 const CONTROL_LINE_CAP_BYTES = 4096;
 const PREAMBLE_CAP_BYTES = 64 * 1024;
+const YBEGIN_PREFIX = Buffer.from('=ybegin ', 'latin1');
+const YPART_PREFIX = Buffer.from('=ypart ', 'latin1');
+
+interface ControlAttributes {
+  readonly size?: number;
+  readonly total?: number;
+  readonly part?: number;
+  readonly begin?: number;
+  readonly end?: number;
+  readonly name?: string;
+}
 
 type DecoderState =
   | 'seeking_begin'
@@ -50,6 +62,25 @@ export interface BackpressuredByteSink {
 }
 
 /**
+ * Direct native-decode destination used by segment spooling. `commitDecoded`
+ * publishes only a written count; the sink already owns the backing. A false
+ * result means the complete raw input was accepted but the NNTP connection
+ * must wait before presenting another input window.
+ */
+export interface DirectDecodeByteSink extends BackpressuredByteSink {
+  readonly directDecode: true;
+  readonly maxDecodeInputBytes: number;
+  acquireDecodeTarget(maxDecodedBytes: number): Buffer;
+  commitDecoded(bytes: number, inputBoundary: boolean): boolean;
+}
+
+function isDirectDecodeSink(
+  sink: BackpressuredByteSink
+): sink is DirectDecodeByteSink {
+  return 'directDecode' in sink && sink.directDecode === true;
+}
+
+/**
  * Incrementally parses one complete NNTP BODY and streams decoded yEnc bytes.
  *
  * Invariants:
@@ -63,7 +94,7 @@ export interface BackpressuredByteSink {
  * - `finish`, `end`, and `fail` are idempotent.
  */
 export class StreamingYencArticleDecoder {
-  private readonly decoder = new StreamingYencDecoder();
+  private readonly decoder: StreamingYencDecoder;
   private readonly controlLine = Buffer.allocUnsafe(CONTROL_LINE_CAP_BYTES);
   private controlLineLength = 0;
   private preambleBytes = 0;
@@ -79,11 +110,18 @@ export class StreamingYencArticleDecoder {
   private nameValue: string | undefined;
   private multipartDeclared = false;
   private headerNotified = false;
+  private readonly directSink: DirectDecodeByteSink | undefined;
 
   constructor(
     private readonly sink: BackpressuredByteSink,
-    private readonly onHeader?: (metadata: DecodedSegmentHeaderMetadata) => void
-  ) {}
+    private readonly onHeader?: (
+      metadata: DecodedSegmentHeaderMetadata
+    ) => void,
+    private readonly hotpathCounters?: SegmentSpoolingHotpathCounters
+  ) {
+    this.decoder = new StreamingYencDecoder(hotpathCounters);
+    this.directSink = isDirectDecodeSink(sink) ? sink : undefined;
+  }
 
   /**
    * Consume a raw, still dot-stuffed BODY chunk synchronously. A false result
@@ -168,14 +206,28 @@ export class StreamingYencArticleDecoder {
         return off < raw.length ? this.decodeData(raw.subarray(off)) : true;
       }
 
-      // The line immediately after =ybegin is data when =ypart is absent.
-      const transitionLength = this.controlLineLength + raw.length - off;
-      const transition = Buffer.allocUnsafe(transitionLength);
-      this.controlLine.copy(transition, 0, 0, this.controlLineLength);
-      raw.copy(transition, this.controlLineLength, off);
+      // The line immediately after =ybegin is data when =ypart is absent. A
+      // direct sink consumes both bounded slices into the same decode window;
+      // legacy sinks keep their compatibility copy.
+      const pendingLength = this.controlLineLength;
       this.controlLineLength = 0;
       this.state = 'data';
       this.notifyHeader();
+      if (this.directSink) {
+        const first = this.decodeData(
+          this.controlLine.subarray(0, pendingLength),
+          off >= raw.length
+        );
+        if (!first) return false;
+        return off < raw.length
+          ? this.decodeData(raw.subarray(off), true)
+          : true;
+      }
+      const transitionLength = pendingLength + raw.length - off;
+      if (this.hotpathCounters) this.hotpathCounters.headerTransitionCopies++;
+      const transition = Buffer.allocUnsafe(transitionLength);
+      this.controlLine.copy(transition, 0, 0, pendingLength);
+      raw.copy(transition, pendingLength, off);
       return this.decodeData(transition);
     }
     return this.state === 'data' && off < raw.length
@@ -211,24 +263,36 @@ export class StreamingYencArticleDecoder {
       }
       return false;
     }
-    const attrs = line.slice('=ybegin '.length);
-    this.fileSizeValue = parseIntegerAttribute(attrs, 'size');
-    this.totalPartsValue = parseIntegerAttribute(attrs, 'total');
-    this.nameValue = /(?:^|\s)name=(.*)$/.exec(attrs)?.[1];
+    const attrs = parseControlAttributes(line, YBEGIN_PREFIX.length);
+    this.fileSizeValue = attrs.size;
+    this.totalPartsValue = attrs.total;
+    this.nameValue = attrs.name;
     this.multipartDeclared =
-      parseIntegerAttribute(attrs, 'part') !== undefined ||
+      attrs.part !== undefined ||
       (this.totalPartsValue !== undefined && this.totalPartsValue > 1);
     return true;
   }
 
   private isPartHeader(): boolean {
-    return this.controlLineText().startsWith('=ypart ');
+    return (
+      this.controlLineLength >= YPART_PREFIX.length &&
+      this.controlLine.compare(
+        YPART_PREFIX,
+        0,
+        YPART_PREFIX.length,
+        0,
+        YPART_PREFIX.length
+      ) === 0
+    );
   }
 
   private parsePartHeader(): void {
-    const attrs = this.controlLineText().slice('=ypart '.length);
-    const begin = parseIntegerAttribute(attrs, 'begin');
-    const end = parseIntegerAttribute(attrs, 'end');
+    const attrs = parseControlAttributes(
+      this.controlLineText(),
+      YPART_PREFIX.length
+    );
+    const begin = attrs.begin;
+    const end = attrs.end;
     if (begin !== undefined && end !== undefined) {
       this.byteRangeValue = [begin - 1, end];
     }
@@ -258,14 +322,28 @@ export class StreamingYencArticleDecoder {
   }
 
   private controlLineText(): string {
+    if (this.hotpathCounters) this.hotpathCounters.headerLinesParsed++;
     let end = this.controlLineLength;
     if (end > 0 && this.controlLine[end - 1] === LF) end--;
     if (end > 0 && this.controlLine[end - 1] === CR) end--;
     return this.controlLine.toString('latin1', 0, end);
   }
 
-  private decodeData(raw: Buffer): boolean {
+  private decodeData(raw: Buffer, inputBoundary = true): boolean {
     if (this.decoder.ended || raw.length === 0) return true;
+    if (this.directSink) {
+      if (raw.length > this.directSink.maxDecodeInputBytes) {
+        throw new YencDecodeError(
+          'invalid_chunk_size',
+          'Streaming yEnc input exceeds the direct decode window',
+          { terminal: true }
+        );
+      }
+      const target = this.directSink.acquireDecodeTarget(raw.length);
+      const written = this.decoder.pushInto(raw, target);
+      this.decodedBytes += written;
+      return this.directSink.commitDecoded(written, inputBoundary);
+    }
     const decoded = this.decoder.push(raw);
     if (decoded.length === 0) return true;
     const acceptsMore = this.sink.write(decoded);
@@ -334,12 +412,51 @@ export class StreamingYencArticleDecoder {
   }
 }
 
-function parseIntegerAttribute(
-  attributes: string,
-  name: string
-): number | undefined {
-  const value = new RegExp(`(?:^|\\s)${name}=(\\d+)`).exec(attributes)?.[1];
-  if (value === undefined) return undefined;
-  const parsed = Number.parseInt(value, 10);
-  return Number.isSafeInteger(parsed) ? parsed : undefined;
+function parseControlAttributes(
+  line: string,
+  attributesOffset: number
+): ControlAttributes {
+  let size: number | undefined;
+  let total: number | undefined;
+  let part: number | undefined;
+  let begin: number | undefined;
+  let end: number | undefined;
+  let name: string | undefined;
+  let cursor = attributesOffset;
+  while (cursor < line.length) {
+    while (line.charCodeAt(cursor) === 0x20) cursor++;
+    if (cursor >= line.length) break;
+    const equals = line.indexOf('=', cursor);
+    if (equals < 0) break;
+    const key = line.slice(cursor, equals);
+    const valueStart = equals + 1;
+    if (key === 'name') {
+      name = line.slice(valueStart);
+      break;
+    }
+    const space = line.indexOf(' ', valueStart);
+    const valueEnd = space < 0 ? line.length : space;
+    const parsed = Number.parseInt(line.slice(valueStart, valueEnd), 10);
+    if (Number.isSafeInteger(parsed)) {
+      switch (key) {
+        case 'size':
+          size = parsed;
+          break;
+        case 'total':
+          total = parsed;
+          break;
+        case 'part':
+          part = parsed;
+          break;
+        case 'begin':
+          begin = parsed;
+          break;
+        case 'end':
+          end = parsed;
+          break;
+      }
+    }
+    cursor = valueEnd + 1;
+  }
+  return { size, total, part, begin, end, name };
 }

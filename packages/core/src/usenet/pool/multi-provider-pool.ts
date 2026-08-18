@@ -469,7 +469,13 @@ export class MultiProviderPool {
     // The fetcher owns the connection pools + failover + decode; the engine's
     // StatsAccumulator is its (in-process) stats sink.
     this.fetcher =
-      dependencies.fetcher ?? new LocalSegmentFetcher(providers, opts, stats);
+      dependencies.fetcher ??
+      new LocalSegmentFetcher(
+        providers,
+        opts,
+        stats,
+        dependencies.spooling?.hotpathCounters
+      );
     this.spooling = dependencies.spooling;
     this.onActiveOperationCountChanged =
       dependencies.onActiveOperationCountChanged;
@@ -765,7 +771,8 @@ export class MultiProviderPool {
       const operationSignal = this.operationSignal(signal);
       const releaseGlobal = await this.globalDownloads.acquire(
         priority,
-        operationSignal
+        operationSignal,
+        nzbHash
       );
       const wire = this.wireTracker();
       try {
@@ -978,6 +985,7 @@ export class MultiProviderPool {
       | Awaited<ReturnType<SegmentSpoolingRuntime['acquireDownloadMemory']>>
       | undefined;
     let releaseGlobal: (() => void) | undefined;
+    let downloadCounted = false;
     const wire = this.wireTracker();
     let unownedArtifact: GrowingSpoolArtifact | undefined;
     try {
@@ -989,8 +997,11 @@ export class MultiProviderPool {
       try {
         releaseGlobal = await this.globalDownloads.acquire(
           priority,
-          flight.ctl.signal
+          flight.ctl.signal,
+          nzbHash
         );
+        runtime.hotpathCounters?.downloadStarted(nzbHash);
+        downloadCounted = true;
       } catch (error) {
         if (flight.ctl.signal.aborted) {
           throw new NntpError('connection', 'aborted');
@@ -1015,7 +1026,8 @@ export class MultiProviderPool {
           const sink = new SpoolingSegmentSink(
             artifact,
             2 * runtime.plan.decoderChunkBytes,
-            runtime.plan.decoderChunkBytes
+            runtime.plan.decoderChunkBytes,
+            runtime.hotpathCounters
           );
           const prepareGrowingOwner = (
             header: DecodedSegmentHeaderMetadata
@@ -1140,6 +1152,7 @@ export class MultiProviderPool {
       for (const waiter of waiters) waiter.fail(normalized);
     } finally {
       wire.end();
+      if (downloadCounted) runtime.hotpathCounters?.downloadEnded();
       releaseGlobal?.();
       memoryLease?.release();
     }
@@ -1161,16 +1174,25 @@ export class MultiProviderPool {
       runtime.recordPromotion('skipped');
       return;
     }
+    const releaseAdmission = runtime.tryStartPromotion(
+      this.globalDownloads.waiting > 0
+    );
+    if (!releaseAdmission) {
+      runtime.recordPromotion('skipped');
+      return;
+    }
     let source: ReturnType<GrowingSpoolArtifact['acquirePromotion']>;
     try {
       source = artifact.acquirePromotion();
     } catch (error) {
+      releaseAdmission();
       runtime.recordPromotion('skipped');
       logger.debug({ err: error }, 'segment cache promotion was skipped');
       return;
     }
     let promotion: Promise<boolean>;
     try {
+      if (runtime.hotpathCounters) runtime.hotpathCounters.promotionsStarted++;
       promotion = promote.call(
         runtime.artifactCache,
         messageId,
@@ -1180,6 +1202,7 @@ export class MultiProviderPool {
       );
     } catch (error) {
       source.release();
+      releaseAdmission();
       runtime.recordPromotion('failed');
       logger.debug({ err: error }, 'segment cache promotion failed to start');
       return;
@@ -1187,6 +1210,9 @@ export class MultiProviderPool {
     const protectedPromotion = promotion
       .then(
         (installed) => {
+          if (installed && runtime.hotpathCounters) {
+            runtime.hotpathCounters.promotionBytesCopied += metadata.size;
+          }
           runtime.recordPromotion(installed ? 'success' : 'skipped');
           return installed;
         },
@@ -1202,7 +1228,10 @@ export class MultiProviderPool {
         logger.debug({ err: error }, 'segment cache promotion failed');
         return false;
       })
-      .finally(() => source.release());
+      .finally(() => {
+        source.release();
+        releaseAdmission();
+      });
     owner.trackPromotion(protectedPromotion);
   }
 
@@ -1445,7 +1474,8 @@ export class MultiProviderPool {
     try {
       releaseGlobal = await this.globalDownloads.acquire(
         priority,
-        operationSignal
+        operationSignal,
+        nzbHash
       );
     } catch (error) {
       if (this.closedError) throw this.closedError;
@@ -1528,7 +1558,8 @@ export class MultiProviderPool {
           const operationSignal = this.operationSignal();
           const releaseGlobal = await this.globalDownloads.acquire(
             priority,
-            operationSignal
+            operationSignal,
+            nzbHash
           );
           const wire = this.wireTracker();
           try {
@@ -1621,7 +1652,8 @@ export class MultiProviderPool {
       const operationSignal = this.operationSignal(signal);
       const releaseGlobal = await this.globalDownloads.acquire(
         CommandPriority.Low,
-        operationSignal
+        operationSignal,
+        'probe'
       );
       const wire = this.wireTracker();
       try {

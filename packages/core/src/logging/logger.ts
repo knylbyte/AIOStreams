@@ -18,13 +18,16 @@ export interface Logger {
   silly(...args: LogArgs): void;
   /** @deprecated legacy winston level — alias for `info`. */
   http(...args: LogArgs): void;
+  /** Cheap guard for hot paths that would otherwise build discarded records. */
+  isLevelEnabled(level: LogLevel): boolean;
   child(bindings: Record<string, unknown>): Logger;
 }
 
 export type LogArg = unknown;
 type LogArgs = LogArg[];
 
-type Level = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal';
+export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal';
+type Level = LogLevel;
 export type LogFormat = 'json' | 'text';
 
 /** The levels pino actually emits, and the only ones offered in the UI. */
@@ -314,6 +317,9 @@ function wrap(pinoInstance: PinoLogger): Logger {
     verbose: emit('verbose'),
     silly: emit('silly'),
     http: emit('http'),
+    isLevelEnabled(level) {
+      return pinoInstance.isLevelEnabled(level);
+    },
     child(bindings) {
       return wrap(pinoInstance.child(bindings));
     },

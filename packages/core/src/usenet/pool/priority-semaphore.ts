@@ -2,17 +2,22 @@ import { CommandPriority } from '../types.js';
 
 interface QueuedWaiter {
   priority: CommandPriority;
-  seq: number;
+  ownerKey: string;
   resolve: (release: () => void) => void;
   reject: (err: Error) => void;
   signal?: AbortSignal;
   onAbort?: () => void;
 }
 
+const ANONYMOUS_OWNER = '';
+const MAX_WAITERS = 65_536;
+const MAX_WAITERS_PER_OWNER = 1024;
+const MAX_OWNER_KEY_LENGTH = 128;
+
 /**
  * A counting semaphore whose waiters are served by priority (lower enum value
- * first → High before Low), FIFO within a priority. Used as the global download
- * budget (gates BODY/ARTICLE).
+ * first → High before Low), owner round-robin within a priority, and FIFO
+ * within each owner. Used as the global download budget (gates BODY/ARTICLE).
  *
  * High-priority playback is strongly favoured but does NOT strictly starve
  * Low-priority background work (health checks / inspect / seek probes): when both
@@ -35,7 +40,10 @@ export class PrioritySemaphore {
   /** Permits currently leased out. */
   private inUseCount = 0;
   private waiters: QueuedWaiter[] = [];
-  private seq = 0;
+  private readonly highOwners: string[] = [];
+  private readonly lowOwners: string[] = [];
+  private highOwnerCursor = 0;
+  private lowOwnerCursor = 0;
   /** Per-100 odds a contended grant goes to Low (0 = strict priority). */
   private readonly lowOdds: number;
   /** Accumulator driving the deterministic High/Low pick. */
@@ -73,25 +81,45 @@ export class PrioritySemaphore {
   }
 
   /**
-   * Acquire one permit. Resolves with a release function. The returned release
-   * is idempotent. Rejects if the (optional) signal aborts before acquisition.
+   * Acquire one permit. `ownerKey` is bounded and drives fair turns among
+   * active streams; omitted callers share the anonymous FIFO owner. Resolves
+   * with an idempotent release function and rejects if the signal aborts.
    */
   acquire(
     priority: CommandPriority = CommandPriority.High,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    ownerKey = ANONYMOUS_OWNER
   ): Promise<() => void> {
     if (this.closedError) return Promise.reject(this.closedError);
     if (signal?.aborted) {
       return Promise.reject(new Error('aborted'));
     }
-    if (this.inUseCount < this.limit) {
+    if (
+      typeof ownerKey !== 'string' ||
+      ownerKey.length > MAX_OWNER_KEY_LENGTH
+    ) {
+      return Promise.reject(new Error('invalid semaphore owner key'));
+    }
+    if (this.inUseCount < this.limit && this.waiters.length === 0) {
       this.inUseCount++;
       return Promise.resolve(this.makeRelease());
+    }
+    if (this.waiters.length >= MAX_WAITERS) {
+      return Promise.reject(new Error('semaphore waiter capacity reached'));
+    }
+    let ownerWaiters = 0;
+    for (const waiter of this.waiters) {
+      if (waiter.ownerKey === ownerKey) ownerWaiters++;
+    }
+    if (ownerWaiters >= MAX_WAITERS_PER_OWNER) {
+      return Promise.reject(
+        new Error('semaphore owner waiter capacity reached')
+      );
     }
     return new Promise<() => void>((resolve, reject) => {
       const waiter: QueuedWaiter = {
         priority,
-        seq: this.seq++,
+        ownerKey,
         resolve: (release) => resolve(release),
         reject,
         signal,
@@ -99,19 +127,21 @@ export class PrioritySemaphore {
       if (signal) {
         waiter.onAbort = () => {
           const idx = this.waiters.indexOf(waiter);
-          if (idx !== -1) this.waiters.splice(idx, 1);
+          if (idx !== -1) {
+            this.waiters.splice(idx, 1);
+            this.removeIdleOwner(waiter.priority, waiter.ownerKey);
+          }
           reject(new Error('aborted'));
+          this.drainAvailable();
         };
         signal.addEventListener('abort', waiter.onAbort, { once: true });
       }
-      // Insert preserving priority then FIFO order.
-      const insertAt = this.waiters.findIndex(
-        (w) =>
-          w.priority > priority ||
-          (w.priority === priority && w.seq > waiter.seq)
-      );
-      if (insertAt === -1) this.waiters.push(waiter);
-      else this.waiters.splice(insertAt, 0, waiter);
+      // Global insertion order plus the owner ring gives FIFO within each
+      // owner and round-robin service across contending owners.
+      this.waiters.push(waiter);
+      const owners = this.ownerOrder(priority);
+      if (!owners.includes(ownerKey)) owners.push(ownerKey);
+      this.drainAvailable();
     });
   }
 
@@ -146,6 +176,10 @@ export class PrioritySemaphore {
     this.closedError = error;
     const waiters = this.waiters;
     this.waiters = [];
+    this.highOwners.length = 0;
+    this.lowOwners.length = 0;
+    this.highOwnerCursor = 0;
+    this.lowOwnerCursor = 0;
     for (const waiter of waiters) {
       if (waiter.signal && waiter.onAbort) {
         waiter.signal.removeEventListener('abort', waiter.onAbort);
@@ -181,6 +215,7 @@ export class PrioritySemaphore {
     const idx = this.pickWaiterIndex();
     if (idx < 0) return;
     const w = this.waiters.splice(idx, 1)[0];
+    this.advanceOwnerTurn(w.priority, w.ownerKey);
     if (w.signal && w.onAbort) {
       w.signal.removeEventListener('abort', w.onAbort);
     }
@@ -189,24 +224,93 @@ export class PrioritySemaphore {
   }
 
   /**
-   * Index of the waiter to serve. Waiters are kept sorted High-first then FIFO,
-   * so the head is High when any High waits. When BOTH classes wait, the
-   * accumulator diverts `1 - highShare` of grants to the first Low waiter so
-   * background work makes progress instead of starving; otherwise the head wins.
+   * Index of the waiter to serve. High/Low selection retains the configured
+   * deterministic share. Within that class, owners receive round-robin turns;
+   * the first queued waiter for the selected owner preserves owner-local FIFO.
    */
   private pickWaiterIndex(): number {
     if (this.waiters.length === 0) return -1;
-    if (this.lowOdds <= 0) return 0; // strict priority
-    if (this.waiters[0].priority !== CommandPriority.High) return 0; // only Low waits
-    const firstLow = this.waiters.findIndex(
-      (w) => w.priority === CommandPriority.Low
-    );
-    if (firstLow === -1) return 0; // only High waits
+    const highWaiting = this.highOwners.length > 0;
+    const lowWaiting = this.lowOwners.length > 0;
+    if (!highWaiting) return this.pickOwnerWaiterIndex(CommandPriority.Low);
+    if (!lowWaiting || this.lowOdds <= 0) {
+      return this.pickOwnerWaiterIndex(CommandPriority.High);
+    }
     this.lowAcc += this.lowOdds;
     if (this.lowAcc >= 100) {
       this.lowAcc -= 100;
-      return firstLow;
+      return this.pickOwnerWaiterIndex(CommandPriority.Low);
     }
-    return 0;
+    return this.pickOwnerWaiterIndex(CommandPriority.High);
+  }
+
+  private ownerOrder(priority: CommandPriority): string[] {
+    return priority === CommandPriority.High ? this.highOwners : this.lowOwners;
+  }
+
+  private ownerCursor(priority: CommandPriority): number {
+    return priority === CommandPriority.High
+      ? this.highOwnerCursor
+      : this.lowOwnerCursor;
+  }
+
+  private setOwnerCursor(priority: CommandPriority, cursor: number): void {
+    if (priority === CommandPriority.High) this.highOwnerCursor = cursor;
+    else this.lowOwnerCursor = cursor;
+  }
+
+  private pickOwnerWaiterIndex(priority: CommandPriority): number {
+    const owners = this.ownerOrder(priority);
+    if (owners.length === 0) return -1;
+    const cursor = this.ownerCursor(priority) % owners.length;
+    const ownerKey = owners[cursor];
+    return this.waiters.findIndex(
+      (waiter) => waiter.priority === priority && waiter.ownerKey === ownerKey
+    );
+  }
+
+  private advanceOwnerTurn(priority: CommandPriority, ownerKey: string): void {
+    const owners = this.ownerOrder(priority);
+    const ownerIndex = owners.indexOf(ownerKey);
+    if (ownerIndex < 0) return;
+    let cursor = owners.length === 0 ? 0 : (ownerIndex + 1) % owners.length;
+    const ownerStillWaiting = this.waiters.some(
+      (waiter) => waiter.priority === priority && waiter.ownerKey === ownerKey
+    );
+    if (!ownerStillWaiting) {
+      owners.splice(ownerIndex, 1);
+      if (owners.length === 0) cursor = 0;
+      else if (ownerIndex < cursor) cursor--;
+      if (cursor >= owners.length) cursor = 0;
+    }
+    this.setOwnerCursor(priority, cursor);
+  }
+
+  private removeIdleOwner(priority: CommandPriority, ownerKey: string): void {
+    if (
+      this.waiters.some(
+        (waiter) => waiter.priority === priority && waiter.ownerKey === ownerKey
+      )
+    ) {
+      return;
+    }
+    const owners = this.ownerOrder(priority);
+    const index = owners.indexOf(ownerKey);
+    if (index < 0) return;
+    let cursor = this.ownerCursor(priority);
+    owners.splice(index, 1);
+    if (index < cursor) cursor--;
+    if (cursor >= owners.length) cursor = 0;
+    this.setOwnerCursor(priority, Math.max(0, cursor));
+  }
+
+  private drainAvailable(): void {
+    while (
+      !this.closedError &&
+      this.inUseCount < this.limit &&
+      this.waiters.length > 0
+    ) {
+      this.grantNext();
+    }
   }
 }

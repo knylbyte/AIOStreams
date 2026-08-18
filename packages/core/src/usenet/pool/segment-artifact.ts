@@ -186,7 +186,7 @@ function metadataFromShared(shared: SharedSegment): DecodedSegmentMetadata {
 /**
  * A single-reader artifact that keeps one SegmentArena pin alive while copying
  * each emitted chunk into independent owned memory. No view into the recyclable
- * arena slot escapes `_read`; chunks are at most 64 KiB and the internal
+ * arena slot escapes `_read`; chunks are at most 128 KiB and the internal
  * Readable high-water mark is capped at 2 MiB.
  */
 export class ArenaSegmentArtifact implements SegmentArtifact {
@@ -447,7 +447,7 @@ class ZeroReadable extends Readable {
 
 /**
  * A sparse logical segment that emits independently owned zero chunks of at
- * most 64 KiB. Its Readable queue is bounded by the 2 MiB HWM cap and no
+ * most 128 KiB. Its Readable queue is bounded by the 2 MiB HWM cap and no
  * allocation scales with the logical hole length.
  */
 export class ZeroSegmentArtifact implements SegmentArtifact {

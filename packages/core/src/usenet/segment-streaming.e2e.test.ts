@@ -17,6 +17,7 @@ import { SpoolManager } from './spool/manager.js';
 import type { SpoolFileHandle, SpoolFileSystem } from './spool/types.js';
 import type { SegmentSpoolingPlan } from './resource-plan.js';
 import { NNTP_READ_CARRY_MAX_BYTES } from './nntp/read-carry.js';
+import { resolveSegmentStreamMemoryBytes } from './stream-queue-budget.js';
 import type { UsenetResourceEventObserver } from './pool/resource-events.js';
 import type { Nzb } from './nzb/model.js';
 import {
@@ -233,14 +234,18 @@ function articleResponse(
 function testPlan(
   overrides: Partial<SegmentSpoolingPlan> = {}
 ): SegmentSpoolingPlan {
+  const readerHighWaterMarkBytes = 64 * KIBIBYTE_BYTES;
   return {
     memoryBudgetBytes: 4 * MEBIBYTE_BYTES,
-    perStreamBufferBytes: 512 * KIBIBYTE_BYTES,
+    perStreamBufferBytes: resolveSegmentStreamMemoryBytes(
+      readerHighWaterMarkBytes,
+      readerHighWaterMarkBytes
+    ),
     spoolBytes: 16 * MEBIBYTE_BYTES,
     minFreeDiskBytes: 0,
     decoderChunkBytes: 64 * KIBIBYTE_BYTES,
     writerQueueBytes: 128 * KIBIBYTE_BYTES,
-    readerHighWaterMarkBytes: 64 * KIBIBYTE_BYTES,
+    readerHighWaterMarkBytes,
     perDownloadBaseLeaseBytes: 128 * KIBIBYTE_BYTES + NNTP_READ_CARRY_MAX_BYTES,
     maxOpenSpoolFiles: 16,
     orphanTtlMs: 60_000,

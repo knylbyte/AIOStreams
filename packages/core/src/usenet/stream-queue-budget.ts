@@ -4,7 +4,7 @@ const KIBIBYTE_BYTES = 1024;
  * Largest Buffer any segment artifact reader may transfer in one `push()`.
  * This is a binary unit and is shared by arena, zero and growing-file readers.
  */
-export const SEGMENT_STREAM_MAX_CHUNK_BYTES = 64 * KIBIBYTE_BYTES;
+export const SEGMENT_STREAM_MAX_CHUNK_BYTES = 128 * KIBIBYTE_BYTES;
 
 /** Hard ownership plan for one Node Readable queue. */
 export interface SegmentStreamQueuePlan {

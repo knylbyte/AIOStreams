@@ -32,6 +32,7 @@ import {
   type DecodedSegmentMetadata,
   type DecodedSegmentHeaderMetadata,
 } from '../pool/streaming-yenc-article-decoder.js';
+import type { SegmentSpoolingHotpathCounters } from '../pool/hotpath-counters.js';
 
 const logger = createLogger('usenet/segment-fetcher');
 
@@ -340,7 +341,8 @@ export class LocalSegmentFetcher implements SegmentFetcher {
   constructor(
     providers: ProviderConfig[],
     private opts: EngineOptions,
-    private stats: StatsSink
+    private stats: StatsSink,
+    private readonly hotpathCounters?: SegmentSpoolingHotpathCounters
   ) {
     const depthOf = (p: ProviderConfig): number =>
       Math.max(1, p.pipelineDepth ?? 1);
@@ -362,6 +364,7 @@ export class LocalSegmentFetcher implements SegmentFetcher {
               providerId: p.id,
               ttfbMs,
             }),
+          hotpathCounters: this.hotpathCounters,
         };
         return new ProviderWorkerPool(p, poolOpts);
       });
@@ -437,7 +440,8 @@ export class LocalSegmentFetcher implements SegmentFetcher {
                 attempt,
                 decoder: new StreamingYencArticleDecoder(
                   attempt.sink,
-                  attempt.onHeader
+                  attempt.onHeader,
+                  this.hotpathCounters
                 ),
               };
             } catch (error) {

@@ -19,6 +19,7 @@ import type {
   SpoolPromotionLease,
 } from './types.js';
 import { SpoolWriter } from './writer.js';
+import type { SegmentSpoolingHotpathCounters } from '../pool/hotpath-counters.js';
 
 interface ChangeWaiter {
   readonly resolve: () => void;
@@ -40,6 +41,7 @@ export interface GrowingSpoolArtifactOptions {
   readonly onDisposed: () => void;
   readonly onWriteBytes?: (bytes: number) => void;
   readonly onReadBytes?: (bytes: number) => void;
+  readonly hotpathCounters?: SegmentSpoolingHotpathCounters;
 }
 
 function isPositiveSafeInteger(value: number): boolean {
@@ -112,6 +114,7 @@ export class GrowingSpoolArtifact implements GrowingReadableSource {
         options.onWriteBytes?.(bytes);
       },
       onFailed: (error) => this.transitionFailed(error),
+      hotpathCounters: options.hotpathCounters,
     });
     this.assertInvariants();
   }

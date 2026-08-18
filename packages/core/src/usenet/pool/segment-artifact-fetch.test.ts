@@ -46,6 +46,7 @@ import {
 import { MultiProviderPool } from './multi-provider-pool.js';
 import { SpoolingSegmentsStream } from './spooling-segments-stream.js';
 import { YencDecodeError, YencMetadataError } from './yenc.js';
+import { resolveSegmentStreamMemoryBytes } from '../stream-queue-budget.js';
 
 const KIBIBYTE_BYTES = 1024;
 const MEBIBYTE_BYTES = KIBIBYTE_BYTES * KIBIBYTE_BYTES;
@@ -400,14 +401,18 @@ async function writeBodyChunks(
 }
 
 function spoolingPlan(): SegmentSpoolingPlan {
+  const readerHighWaterMarkBytes = 64 * KIBIBYTE_BYTES;
   return {
-    memoryBudgetBytes: MEBIBYTE_BYTES,
-    perStreamBufferBytes: 512 * KIBIBYTE_BYTES,
+    memoryBudgetBytes: 2 * MEBIBYTE_BYTES,
+    perStreamBufferBytes: resolveSegmentStreamMemoryBytes(
+      readerHighWaterMarkBytes,
+      readerHighWaterMarkBytes
+    ),
     spoolBytes: 16 * MEBIBYTE_BYTES,
     minFreeDiskBytes: 0,
     decoderChunkBytes: 64 * KIBIBYTE_BYTES,
     writerQueueBytes: 128 * KIBIBYTE_BYTES,
-    readerHighWaterMarkBytes: 64 * KIBIBYTE_BYTES,
+    readerHighWaterMarkBytes,
     perDownloadBaseLeaseBytes: 128 * KIBIBYTE_BYTES,
     maxOpenSpoolFiles: 16,
     orphanTtlMs: 60_000,
@@ -1907,18 +1912,60 @@ test('an explicitly disabled persistent cache skips promotion entirely', async (
 test('best-effort promotion memory never bypasses a queued stream request', async (context) => {
   const fetcher = new FakeSegmentFetcher();
   const { runtime } = await createHarness(context, fetcher);
-  const admissionBytes = Math.floor(spoolingPlan().memoryBudgetBytes / 2);
+  const admissionBytes = spoolingPlan().perStreamBufferBytes;
   const first = await runtime.acquireStreamMemory(
     admissionBytes,
     CommandPriority.High
   );
-  const queued = runtime.acquireStreamMemory(1, CommandPriority.High);
+  const queued = runtime.acquireStreamMemory(
+    admissionBytes,
+    CommandPriority.High
+  );
 
   assert.equal(runtime.tryAcquirePromotionMemory(1), undefined);
   first.release();
   const second = await queued;
   second.release();
   assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+});
+
+test('active playback caps promotion and a foreground waiter blocks a new promotion', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const windowBytes = spoolingPlan().perDownloadBaseLeaseBytes;
+  const { runtime } = await createHarness(context, fetcher, {
+    memoryBudget: new ByteBudget(windowBytes * 2),
+  });
+  const stream = await runtime.acquireStreamMemory(
+    windowBytes,
+    CommandPriority.High
+  );
+  const firstAdmission = runtime.tryStartPromotion(false);
+  assert(firstAdmission);
+  assert.equal(runtime.tryStartPromotion(false), undefined);
+
+  const promotionMemory = runtime.tryAcquirePromotionMemory(windowBytes);
+  assert(promotionMemory);
+  const playback = runtime.acquireDownloadMemory(CommandPriority.High);
+  await Promise.resolve();
+  assert.equal(runtime.tryStartPromotion(false), undefined);
+
+  promotionMemory.release();
+  const playbackLease = await playback;
+  playbackLease.release();
+  firstAdmission();
+  stream.release();
+  assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+});
+
+test('idle runtime retains bounded queue-free promotion admission', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const { runtime } = await createHarness(context, fetcher);
+  const first = runtime.tryStartPromotion(false);
+  const second = runtime.tryStartPromotion(false);
+  assert(first);
+  assert(second);
+  first();
+  second();
 });
 
 test('promotion release immediately wakes a queued download window', async (context) => {

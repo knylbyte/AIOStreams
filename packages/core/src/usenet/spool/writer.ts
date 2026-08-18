@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import type { ByteLease } from '../pool/byte-budget.js';
 import { classifySpoolFileError, UsenetSpoolError } from './errors.js';
 import type { ManagedSpoolFile } from './types.js';
+import type { SegmentSpoolingHotpathCounters } from '../pool/hotpath-counters.js';
 
 interface QueuedChunk {
   readonly chunk: Buffer;
@@ -13,6 +14,7 @@ export interface SpoolWriterOptions {
   readonly maxQueueBytes: number;
   readonly onCommitted: (bytes: number) => void;
   readonly onFailed: (error: Error) => void;
+  readonly hotpathCounters?: SegmentSpoolingHotpathCounters;
 }
 
 function isPositiveSafeInteger(value: number): boolean {
@@ -33,6 +35,7 @@ export class SpoolWriter {
   private readonly lowWaterMarkBytes: number;
   private readonly onCommitted: (bytes: number) => void;
   private readonly onFailed: (error: Error) => void;
+  private readonly hotpathCounters: SegmentSpoolingHotpathCounters | undefined;
   private readonly queue: QueuedChunk[] = [];
   private queuedBytes = 0;
   private committedBytes = 0;
@@ -56,6 +59,7 @@ export class SpoolWriter {
     this.lowWaterMarkBytes = Math.floor(options.maxQueueBytes / 2);
     this.onCommitted = options.onCommitted;
     this.onFailed = options.onFailed;
+    this.hotpathCounters = options.hotpathCounters;
     this.assertInvariants();
   }
 
@@ -172,6 +176,7 @@ export class SpoolWriter {
       const entry = this.queue.shift();
       if (!entry) return;
       try {
+        if (this.hotpathCounters) this.hotpathCounters.spoolWriteOperations++;
         await this.writeFully(entry.chunk, this.committedBytes);
         if (!this.failure) {
           this.committedBytes += entry.chunk.length;
@@ -193,12 +198,20 @@ export class SpoolWriter {
   private async writeFully(chunk: Buffer, position: number): Promise<void> {
     let offset = 0;
     while (offset < chunk.length) {
+      const requested = chunk.length - offset;
       const result = await this.file.handle.write(
         chunk,
         offset,
-        chunk.length - offset,
+        requested,
         position + offset
       );
+      if (this.hotpathCounters) {
+        this.hotpathCounters.spoolWriteSyscalls++;
+        this.hotpathCounters.spoolBytesWritten += result.bytesWritten;
+        if (result.bytesWritten < requested) {
+          this.hotpathCounters.spoolShortWrites++;
+        }
+      }
       if (
         !isPositiveSafeInteger(result.bytesWritten) ||
         result.bytesWritten > chunk.length - offset

@@ -29,6 +29,7 @@ import type {
 } from './types.js';
 import type { GrowingSpoolArtifact } from './growing-artifact.js';
 import type { UsenetResourceEventObserver } from '../pool/resource-events.js';
+import { SegmentSpoolingHotpathCounters } from '../pool/hotpath-counters.js';
 
 function testPlan(
   overrides: Partial<SegmentSpoolingPlan> = {}
@@ -56,6 +57,7 @@ interface TestManagerOptions {
   readonly scheduler?: SpoolScheduler;
   readonly maxArtifacts?: number;
   readonly onEvent?: UsenetResourceEventObserver;
+  readonly hotpathCounters?: SegmentSpoolingHotpathCounters;
 }
 
 async function testManager(
@@ -74,6 +76,7 @@ async function testManager(
     scheduler: options.scheduler,
     maxArtifacts: options.maxArtifacts,
     onEvent: options.onEvent,
+    hotpathCounters: options.hotpathCounters,
   };
   const manager = new SpoolManager(managerOptions);
   context.after(async () => {
@@ -455,7 +458,11 @@ test('does not expose a partially written chunk as committed', async (context) =
       };
     },
   };
-  const { manager } = await testManager(context, { fileSystem });
+  const hotpathCounters = new SegmentSpoolingHotpathCounters();
+  const { manager } = await testManager(context, {
+    fileSystem,
+    hotpathCounters,
+  });
   const memory = new ByteBudget(8);
   const artifact = await manager.createArtifact({
     sessionId: 'partial-write-session',
@@ -469,12 +476,18 @@ test('does not expose a partially written chunk as committed', async (context) =
   assert.equal(manager.stats().budget.actualBytes, 0);
   continueWrite.resolve();
   await artifact.complete();
+  const hotpath = hotpathCounters.snapshot();
+  assert.equal(hotpath.spoolWriteOperations, 1);
+  assert.equal(hotpath.spoolWriteSyscalls, 2);
+  assert.equal(hotpath.spoolShortWrites, 1);
+  assert.equal(hotpath.spoolBytesWritten, 4);
   assert.equal(artifact.committedBytes, 4);
   assert.equal(manager.stats().budget.actualBytes, 4);
   assert.equal(
     (await collect(artifact.createReadStream({ highWaterMark: 2 }))).toString(),
     'data'
   );
+  assert.equal(memory.stats().usedBytes, 0);
   await artifact.dispose();
 });
 

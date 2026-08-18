@@ -13,7 +13,9 @@ import type {
   UsenetResourceEventObserver,
   UsenetResourceLifecycleEvent,
 } from './resource-events.js';
+import { ResourceEventLogAggregator } from './resource-events.js';
 import { createLogger } from '../../logging/logger.js';
+import { SegmentSpoolingHotpathCounters } from './hotpath-counters.js';
 
 const logger = createLogger('usenet/resources');
 
@@ -26,6 +28,7 @@ export interface SegmentSpoolingRuntimeOptions {
   readonly spoolManager?: SpoolManager;
   readonly clock?: () => number;
   readonly onEvent?: UsenetResourceEventObserver;
+  readonly hotpathCounters?: SegmentSpoolingHotpathCounters;
 }
 
 /** Resource-owner snapshot used by the engine dashboard contract. */
@@ -69,10 +72,13 @@ export class SegmentSpoolingRuntime {
   readonly memoryBudget: ByteBudget;
   readonly spoolManager: SpoolManager;
   readonly artifactCache: SegmentArtifactCacheLookup | undefined;
+  readonly hotpathCounters: SegmentSpoolingHotpathCounters | undefined;
 
   /** Caps aggregate stream queues at half the global transient RAM budget. */
   private readonly streamAdmissionMaxBytes: number;
   private streamAdmissionUsedBytes = 0;
+  private activeStreamLeases = 0;
+  private activePromotions = 0;
   private readonly highDownloadWaiters: MemoryWaiter[] = [];
   private readonly highStreamWaiters: MemoryWaiter[] = [];
   private readonly lowDownloadWaiters: MemoryWaiter[] = [];
@@ -83,11 +89,31 @@ export class SegmentSpoolingRuntime {
   private closePromise: Promise<void> | undefined;
   private readonly clock: () => number;
   private readonly onEvent: UsenetResourceEventObserver | undefined;
+  private readonly resourceEventLogger: ResourceEventLogAggregator;
 
   constructor(options: SegmentSpoolingRuntimeOptions) {
     this.plan = options.plan;
     this.clock = options.clock ?? Date.now;
     this.onEvent = options.onEvent;
+    this.hotpathCounters = options.hotpathCounters;
+    this.resourceEventLogger = new ResourceEventLogAggregator(
+      {
+        debugEnabled: () => logger.isLevelEnabled('debug'),
+        debug: (fields, message) => logger.debug(fields, message),
+        warn: (fields, message) => logger.warn(fields, message),
+        emitted: () => {
+          if (this.hotpathCounters) {
+            this.hotpathCounters.resourceLogRecordsEmitted++;
+          }
+        },
+        suppressed: () => {
+          if (this.hotpathCounters) {
+            this.hotpathCounters.resourceLogRecordsSuppressed++;
+          }
+        },
+      },
+      this.clock
+    );
     this.memoryBudget =
       options.memoryBudget ?? new ByteBudget(options.plan.memoryBudgetBytes);
     this.streamAdmissionMaxBytes = Math.floor(
@@ -114,6 +140,7 @@ export class SegmentSpoolingRuntime {
         cacheRoot: options.cacheRoot,
         clock: this.clock,
         onEvent: (event) => this.observeEvent(event),
+        hotpathCounters: this.hotpathCounters,
       });
     this.artifactCache = options.artifactCache;
   }
@@ -228,6 +255,38 @@ export class SegmentSpoolingRuntime {
     };
   }
 
+  /**
+   * Synchronous, queue-free admission for best-effort persistent promotion.
+   * Foreground waiters always win; while a playback stream owns memory, at
+   * most one already admitted promotion may consume disk/CPU resources.
+   */
+  tryStartPromotion(
+    foregroundDownloadWaiting: boolean
+  ): (() => void) | undefined {
+    const spool = this.spoolManager.stats();
+    if (
+      this.closedError ||
+      foregroundDownloadWaiting ||
+      this.memoryWaitingCount > 0 ||
+      spool.budget.waiting > 0 ||
+      spool.files.waiting > 0 ||
+      (this.activeStreamLeases > 0 && this.activePromotions >= 1)
+    ) {
+      if (this.hotpathCounters) {
+        this.hotpathCounters.promotionsSkippedForForegroundPressure++;
+      }
+      return undefined;
+    }
+    this.activePromotions++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.activePromotions--;
+      assert(this.activePromotions >= 0);
+    };
+  }
+
   recordPromotion(outcome: 'success' | 'skipped' | 'failed'): void {
     this.observeEvent({ type: 'promotion_result', outcome });
   }
@@ -260,8 +319,16 @@ export class SegmentSpoolingRuntime {
     this.closedError = error;
     this.rejectMemoryWaiters(error);
     this.memoryBudget.close(error);
-    this.closePromise = this.spoolManager.close();
+    this.closePromise = this.closeOnce();
     return this.closePromise;
+  }
+
+  private async closeOnce(): Promise<void> {
+    try {
+      await this.spoolManager.close();
+    } finally {
+      this.resourceEventLogger.flush();
+    }
   }
 
   private acquireMemory(
@@ -354,7 +421,10 @@ export class SegmentSpoolingRuntime {
     }
     const globalLease = this.memoryBudget.tryAcquire(bytes);
     if (!globalLease) return undefined;
-    if (kind === 'stream') this.streamAdmissionUsedBytes += bytes;
+    if (kind === 'stream') {
+      this.streamAdmissionUsedBytes += bytes;
+      this.activeStreamLeases++;
+    }
     this.assertMemoryInvariants();
     let released = false;
     return {
@@ -362,7 +432,11 @@ export class SegmentSpoolingRuntime {
       release: () => {
         if (released) return;
         released = true;
-        if (kind === 'stream') this.streamAdmissionUsedBytes -= bytes;
+        if (kind === 'stream') {
+          this.streamAdmissionUsedBytes -= bytes;
+          this.activeStreamLeases--;
+          assert(this.activeStreamLeases >= 0);
+        }
         globalLease.release();
         this.assertMemoryInvariants();
         this.drainMemoryWaiters();
@@ -490,6 +564,10 @@ export class SegmentSpoolingRuntime {
     assert(Number.isSafeInteger(this.streamAdmissionUsedBytes));
     assert(this.streamAdmissionUsedBytes >= 0);
     assert(this.streamAdmissionUsedBytes <= this.streamAdmissionMaxBytes);
+    assert(Number.isSafeInteger(this.activeStreamLeases));
+    assert(this.activeStreamLeases >= 0);
+    assert(Number.isSafeInteger(this.activePromotions));
+    assert(this.activePromotions >= 0);
     assert(
       this.memoryBudget.stats().usedBytes <= this.memoryBudget.stats().maxBytes
     );
@@ -512,11 +590,12 @@ export class SegmentSpoolingRuntime {
   }
 
   private observeEvent(event: UsenetResourceLifecycleEvent): void {
+    if (this.hotpathCounters) this.hotpathCounters.resourceEventsObserved++;
     try {
       this.onEvent?.(event);
     } catch {
       // Observability is not part of the ownership path.
     }
-    logger.debug(event, `usenet resource event: ${event.type}`);
+    this.resourceEventLogger.observe(event);
   }
 }

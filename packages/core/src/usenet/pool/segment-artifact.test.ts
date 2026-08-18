@@ -15,6 +15,7 @@ import {
   ZeroSegmentArtifact,
 } from './segment-artifact.js';
 import type { DiskFileLease } from '../../utils/disk-backed-cache.js';
+import { SEGMENT_STREAM_MAX_CHUNK_BYTES } from '../stream-queue-budget.js';
 
 const KIBIBYTE_BYTES = 1024;
 const MEBIBYTE_BYTES = KIBIBYTE_BYTES * KIBIBYTE_BYTES;
@@ -191,7 +192,7 @@ test('ZeroSegmentArtifact emits a large logical hole through bounded chunks', as
   }
 
   assert.equal(bytes, length);
-  assert(maxChunkBytes <= 64 * KIBIBYTE_BYTES);
+  assert(maxChunkBytes <= SEGMENT_STREAM_MAX_CHUNK_BYTES);
   assert.equal(artifact.storage, 'zero');
   await artifact.release();
 });
@@ -329,7 +330,9 @@ test('SegmentArtifact reader highWaterMark has a safe cap compatible with the re
     chunks.reduce((sum, chunk) => sum + chunk.length, 0),
     64 * KIBIBYTE_BYTES
   );
-  assert(chunks.every((chunk) => chunk.length <= 64 * KIBIBYTE_BYTES));
+  assert(
+    chunks.every((chunk) => chunk.length <= SEGMENT_STREAM_MAX_CHUNK_BYTES)
+  );
   await accepted.release();
 
   assert.throws(

@@ -124,7 +124,7 @@ function isPositiveSafeInteger(value: number): boolean {
  * - output order is monotonically increasing by local segment index;
  * - one pre-dispatch stream-memory lease covers the hard capacities of the
  *   artifact reader and this stream (`2Q`), plus the optional FileStream relay
- *   (`3Q`); `Q = H + 64 KiB - 1`, so partial reads followed by a final
+ *   (`3Q`); `Q = H + 128 KiB - 1`, so partial reads followed by a final
  *   bounded push cannot exceed the lease. It remains held until producer
  *   resources are detached AND every owned output queue is drained/destroyed;
  * - satisfying a finite byte range stops further output immediately, but

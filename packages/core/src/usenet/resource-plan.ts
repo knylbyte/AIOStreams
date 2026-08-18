@@ -62,9 +62,10 @@ export interface SegmentSpoolingPlan {
   readonly writerQueueBytes: number;
   readonly readerHighWaterMarkBytes: number;
   /**
-   * Atomic on-wire admission: two decoder/sink chunks plus the lazily allocated
-   * but guaranteed NNTP TLS/onread carry window. Carry capacity counts exact
-   * retained allocation backings, not merely unread payload views.
+   * Atomic on-wire admission: one unpooled direct-decode/write batch sized to
+   * two decoder chunks, plus the lazily allocated but guaranteed NNTP TLS/onread
+   * carry window. Carry capacity counts exact retained allocation backings, not
+   * merely unread payload views.
    */
   readonly perDownloadBaseLeaseBytes: number;
   readonly maxOpenSpoolFiles: number;

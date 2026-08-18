@@ -125,7 +125,7 @@ test('16 MiB admits exactly ten production download windows', async () => {
     memoryBudgetBytes: 16 * MEBIBYTE_BYTES,
   });
 
-  assert.equal(result.configuration.streamMemoryBytes, 655_358);
+  assert.equal(result.configuration.streamMemoryBytes, 786_430);
   assert.equal(
     result.configuration.perDownloadBaseLeaseBytes,
     PRODUCTION_DOWNLOAD_BASE_BYTES
