@@ -15,6 +15,7 @@ import {
 } from './connection.js';
 import { NntpError } from './errors.js';
 import {
+  allocateNntpReadCarryBuffer,
   NNTP_READ_CARRY_MAX_BYTES,
   NNTP_READ_CARRY_MAX_CHUNKS,
   NNTP_READ_WINDOW_BYTES,
@@ -444,6 +445,7 @@ test('owns late read callbacks during local pause and drains them FIFO before re
   await consumer.waitForWrites(1);
   assert.deepEqual(connection.readCarryStats, {
     bytes: Buffer.byteLength('second-third\r\n.\r\n'),
+    readableBytes: Buffer.byteLength('second-third\r\n.\r\n'),
     chunks: 2,
     limitBytes: NNTP_READ_CARRY_MAX_BYTES,
   });
@@ -454,6 +456,7 @@ test('owns late read callbacks during local pause and drains them FIFO before re
   assert.equal(connection.isUsable, true);
   assert.deepEqual(connection.readCarryStats, {
     bytes: 0,
+    readableBytes: 0,
     chunks: 0,
     limitBytes: NNTP_READ_CARRY_MAX_BYTES,
   });
@@ -487,8 +490,20 @@ test('keeps the carry head ordered across repeated drain cycles', async (context
   await server.send('222 article\r\nfirst-');
 
   await consumer.waitForWrites(1);
+  assert.deepEqual(connection.readCarryStats, {
+    bytes: lateOne.length + lateTwo.length,
+    readableBytes: lateOne.length + lateTwo.length,
+    chunks: 2,
+    limitBytes: NNTP_READ_CARRY_MAX_BYTES,
+  });
   consumer.emitDrain();
   await consumer.waitForWrites(2);
+  assert.deepEqual(connection.readCarryStats, {
+    bytes: lateTwo.length,
+    readableBytes: lateTwo.length,
+    chunks: 1,
+    limitBytes: NNTP_READ_CARRY_MAX_BYTES,
+  });
   assert(
     Buffer.from('first-second-third')
       .subarray(0, consumer.body().length)
@@ -498,6 +513,8 @@ test('keeps the carry head ordered across repeated drain cycles', async (context
   consumer.emitDrain();
   await consumer.waitForWrites(3);
   assert.deepEqual(consumer.body(), Buffer.from('first-second-third'));
+  assert.equal(connection.readCarryStats.bytes, 0);
+  assert.equal(connection.readCarryStats.readableBytes, 0);
   consumer.emitDrain();
 
   assert.equal(await body, Buffer.byteLength('first-second-third'));
@@ -540,6 +557,57 @@ test('drains the current read remainder before later callbacks in a pipeline', a
   assert.equal(connection.isUsable, true);
 });
 
+test('owns tiny late callbacks with exact unpooled backing allocations', async (context) => {
+  const owners = new Set<ArrayBufferLike>();
+  let injected = false;
+  const { connection, server } = await connectTest(context, {
+    allocateReadCarryBuffer: (bytes) => {
+      const buffer = allocateNntpReadCarryBuffer(bytes);
+      owners.add(buffer.buffer);
+      return buffer;
+    },
+    onLocalPause: (deliverLateRead) => {
+      if (injected) return;
+      injected = true;
+      for (let index = 0; index < 200; index++) {
+        assert.equal(deliverLateRead(Buffer.from([index & 0xff])), false);
+      }
+    },
+  });
+  const consumer = new ControlledConsumer([false]);
+  const pending = connection.bodyToConsumer(
+    'tiny-carry-owners',
+    consumer,
+    undefined,
+    1000
+  );
+  const failed = rejection(pending);
+  assert.equal(await server.nextCommand(), 'BODY <tiny-carry-owners>');
+  await server.send('222 article\r\nfirst-window');
+  await consumer.waitForWrites(1);
+
+  assert.equal(owners.size, 200);
+  assert.equal(
+    [...owners].reduce((bytes, owner) => bytes + owner.byteLength, 0),
+    200
+  );
+  assert.deepEqual(connection.readCarryStats, {
+    bytes: 200,
+    readableBytes: 200,
+    chunks: 200,
+    limitBytes: NNTP_READ_CARRY_MAX_BYTES,
+  });
+
+  connection.destroy();
+  await failed;
+  assert.deepEqual(connection.readCarryStats, {
+    bytes: 0,
+    readableBytes: 0,
+    chunks: 0,
+    limitBytes: NNTP_READ_CARRY_MAX_BYTES,
+  });
+});
+
 test('bounds owned late callback bytes and reports a local backpressure fault', async (context) => {
   assert.equal(NNTP_READ_CARRY_MAX_CHUNKS, 256);
   assert.equal(NNTP_READ_CARRY_MAX_BYTES, 4 * NNTP_READ_WINDOW_BYTES);
@@ -548,9 +616,10 @@ test('bounds owned late callback bytes and reports a local backpressure fault', 
     onLocalPause: (deliverLateRead) => {
       if (injected) return;
       injected = true;
-      for (let index = 0; index < 5; index++) {
+      for (let index = 0; index < 4; index++) {
         deliverLateRead(Buffer.alloc(NNTP_READ_WINDOW_BYTES, index));
       }
+      deliverLateRead(Buffer.from([0xff]));
     },
   });
   const consumer = new ControlledConsumer([false]);
@@ -569,19 +638,28 @@ test('bounds owned late callback bytes and reports a local backpressure fault', 
   assert.equal(error.kind, 'local_backpressure');
   assert.equal(error.faultDomain, 'local');
   assert.equal(error.carryChunks, 5);
-  assert.equal(
-    error.carryBytes,
-    NNTP_READ_CARRY_MAX_BYTES + NNTP_READ_WINDOW_BYTES
-  );
+  assert.equal(error.carryBytes, NNTP_READ_CARRY_MAX_BYTES + 1);
   assert.equal(error.carryLimitBytes, NNTP_READ_CARRY_MAX_BYTES);
   assert.equal(consumer.failure, error);
   assert.equal(connection.isUsable, false);
   assert.equal(connection.inFlight, 0);
+  assert.deepEqual(connection.readCarryStats, {
+    bytes: 0,
+    readableBytes: 0,
+    chunks: 0,
+    limitBytes: NNTP_READ_CARRY_MAX_BYTES,
+  });
 });
 
 test('bounds the number of tiny late callbacks independently of their bytes', async (context) => {
+  const owners = new Set<ArrayBufferLike>();
   let injected = false;
   const { connection, server } = await connectTest(context, {
+    allocateReadCarryBuffer: (bytes) => {
+      const buffer = allocateNntpReadCarryBuffer(bytes);
+      owners.add(buffer.buffer);
+      return buffer;
+    },
     onLocalPause: (deliverLateRead) => {
       if (injected) return;
       injected = true;
@@ -606,12 +684,78 @@ test('bounds the number of tiny late callbacks independently of their bytes', as
   assert.equal(error.kind, 'local_backpressure');
   assert.equal(error.carryChunks, NNTP_READ_CARRY_MAX_CHUNKS + 1);
   assert.equal(error.carryBytes, NNTP_READ_CARRY_MAX_CHUNKS + 1);
+  assert.equal(owners.size, NNTP_READ_CARRY_MAX_CHUNKS);
+  assert.equal(
+    [...owners].reduce((bytes, owner) => bytes + owner.byteLength, 0),
+    NNTP_READ_CARRY_MAX_CHUNKS
+  );
   assert.equal(connection.isUsable, false);
 });
 
-test('accepts the exact four-window carry boundary', async (context) => {
+test('keeps a partially consumed carry allocation retained for capacity', async (context) => {
+  const endGate = Promise.withResolvers<void>();
+  let deliverLateRead: ((chunk: Buffer) => boolean) | undefined;
   let injected = false;
   const { connection, server } = await connectTest(context, {
+    onLocalPause: (deliver) => {
+      deliverLateRead = deliver;
+      if (injected) return;
+      injected = true;
+      for (let index = 0; index < 4; index++) {
+        const chunk = Buffer.alloc(NNTP_READ_WINDOW_BYTES, 0x61 + index);
+        if (index === 0) Buffer.from('\r\n.\r\n').copy(chunk);
+        assert.equal(deliver(chunk), false);
+      }
+    },
+  });
+  const consumer = new ControlledConsumer([false, true], endGate.promise);
+  const pending = connection.bodyToConsumer(
+    'partial-carry-owner',
+    consumer,
+    undefined,
+    1000
+  );
+  const failed = rejection(pending);
+  assert.equal(await server.nextCommand(), 'BODY <partial-carry-owner>');
+  await server.send('222 article\r\nfirst-window');
+  await consumer.waitForWrites(1);
+  assert.equal(connection.readCarryStats.bytes, NNTP_READ_CARRY_MAX_BYTES);
+
+  consumer.emitDrain();
+  await consumer.endStarted.promise;
+  assert.equal(
+    connection.readCarryStats.bytes,
+    NNTP_READ_CARRY_MAX_BYTES,
+    'the partially consumed head still retains its complete allocation'
+  );
+  assert(
+    connection.readCarryStats.readableBytes < connection.readCarryStats.bytes
+  );
+
+  assert(deliverLateRead);
+  assert.equal(deliverLateRead(Buffer.from([0x7a])), false);
+  const error = await failed;
+  endGate.resolve();
+  assert(error instanceof NntpError);
+  assert.equal(error.kind, 'local_backpressure');
+  assert.equal(error.carryBytes, NNTP_READ_CARRY_MAX_BYTES + 1);
+  assert.deepEqual(connection.readCarryStats, {
+    bytes: 0,
+    readableBytes: 0,
+    chunks: 0,
+    limitBytes: NNTP_READ_CARRY_MAX_BYTES,
+  });
+});
+
+test('accepts the exact four-window carry boundary', async (context) => {
+  let finalCarryBytes = 0;
+  let finalReadableBytes = 0;
+  let injected = false;
+  const { connection, server } = await connectTest(context, {
+    onLateRead: (stats) => {
+      finalCarryBytes = stats.bytes;
+      finalReadableBytes = stats.readableBytes;
+    },
     onLocalPause: (deliverLateRead) => {
       if (injected) return;
       injected = true;
@@ -638,6 +782,8 @@ test('accepts the exact four-window carry boundary', async (context) => {
   assert.equal(await server.nextCommand(), 'BODY <carry-boundary>');
   await server.send('222 article\r\nfirst-');
   await consumer.waitForWrites(1);
+  assert.equal(finalCarryBytes, NNTP_READ_CARRY_MAX_BYTES);
+  assert.equal(finalReadableBytes, NNTP_READ_CARRY_MAX_BYTES);
   consumer.emitDrain();
 
   assert.equal(
@@ -648,6 +794,8 @@ test('accepts the exact four-window carry boundary', async (context) => {
   );
   assert.equal(connection.isUsable, true);
   assert.equal(consumer.failure, undefined);
+  assert.equal(connection.readCarryStats.bytes, 0);
+  assert.equal(connection.readCarryStats.readableBytes, 0);
 });
 
 test('streams a complete fragmented TLS BODY through repeated local pauses and reuses the connection', async (context) => {
@@ -791,7 +939,14 @@ test('keeps FIFO aligned when a paused head shares a read with a pipelined BODY'
 });
 
 test('aborting a locally paused BODY fails consumer and connection consistently', async (context) => {
-  const { connection, server } = await connectTest(context);
+  let injected = false;
+  const { connection, server } = await connectTest(context, {
+    onLocalPause: (deliverLateRead) => {
+      if (injected) return;
+      injected = true;
+      deliverLateRead(Buffer.from('owned-after-pause'));
+    },
+  });
   const controller = new AbortController();
   const consumer = new ControlledConsumer([false]);
   const pending = connection.bodyToConsumer(
@@ -805,6 +960,7 @@ test('aborting a locally paused BODY fails consumer and connection consistently'
   await server.send('222 article\r\npartial-body-with-room');
   await consumer.waitForWrites(1);
   assert.equal(consumer.hasDrainListener, true);
+  assert(connection.readCarryStats.bytes > 0);
 
   controller.abort();
   const error = await failed;
@@ -815,6 +971,12 @@ test('aborting a locally paused BODY fails consumer and connection consistently'
   assert.equal(consumer.hasDrainListener, false);
   assert.equal(connection.isUsable, false);
   assert.equal(connection.inFlight, 0);
+  assert.deepEqual(connection.readCarryStats, {
+    bytes: 0,
+    readableBytes: 0,
+    chunks: 0,
+    limitBytes: NNTP_READ_CARRY_MAX_BYTES,
+  });
 });
 
 test('suspends provider-stall timing during local pressure but retains absolute timeout', async (context) => {
@@ -1252,6 +1414,40 @@ test('provider socket failure rejects the BODY and fails its consumer', async (c
   assert.equal(consumer.failure, error);
   assert.equal(connection.inFlight, 0);
   assert.equal(connection.isUsable, false);
+});
+
+test('connection destroy releases every retained late-read owner', async (context) => {
+  let injected = false;
+  const { connection, server } = await connectTest(context, {
+    onLocalPause: (deliverLateRead) => {
+      if (injected) return;
+      injected = true;
+      deliverLateRead(Buffer.from('owned-provider-tail'));
+    },
+  });
+  const consumer = new ControlledConsumer([false]);
+  const pending = connection.bodyToConsumer(
+    'socket-failure-with-carry',
+    consumer,
+    undefined,
+    1000
+  );
+  const failed = rejection(pending);
+  assert.equal(await server.nextCommand(), 'BODY <socket-failure-with-carry>');
+  await server.send('222 article\r\npartial-body');
+  await consumer.waitForWrites(1);
+  assert(connection.readCarryStats.bytes > 0);
+
+  connection.destroy();
+  const error = await failed;
+  assert(error instanceof NntpError);
+  assert.equal(error.kind, 'connection');
+  assert.deepEqual(connection.readCarryStats, {
+    bytes: 0,
+    readableBytes: 0,
+    chunks: 0,
+    limitBytes: NNTP_READ_CARRY_MAX_BYTES,
+  });
 });
 
 test('consumer write failure tears down request, listener and timer state', async (context) => {

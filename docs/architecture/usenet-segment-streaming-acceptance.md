@@ -20,6 +20,9 @@ canonical concept itself is unchanged.
 - [x] BODY decode is incremental; the raw article and decoded segment are not
       materialized as a required full-buffer intermediate.
 - [x] Memory and disk ownership use hard byte leases with peak/waiter stats.
+- [x] TLS late-read carry uses exact unpooled owners. Its byte cap and dashboard
+      value count physically retained backing allocations; partially consumed
+      owners retain their full accounting until removal.
 - [x] The first growing artifact is readable before producer completion, with
       EOF withheld until decoder/sink/length validation.
 - [x] Completed read-ahead waits in transient spool files and emits in order.
@@ -104,10 +107,14 @@ canonical concept itself is unchanged.
       correctness gates use internal byte budgets, never RSS. The benchmark
       drives the actual ordered `SpoolingSegmentsStream`, deterministic
       out-of-order completion, bounded concurrent producers and a yielding slow
-      consumer.
+      consumer. Every admitted producer owns the same decoder/sink/TLS-carry
+      base lease as production until its finalizer settles.
 
 The benchmark defaults to the concept's full 500 one-MiB segment run with a
-64-segment prefetch window and 60 concurrent producer slots:
+64-segment prefetch window, a 16 MiB memory budget and 60 configured producer
+slots. It reports the lower effective producer limit derived from the hard
+stream, per-download and writer-owner windows rather than claiming all 60 slots
+when that memory cannot be leased:
 
 ```bash
 pnpm -F core benchmark:segment-spooling
@@ -115,7 +122,8 @@ pnpm -F core benchmark:segment-spooling
 
 Short diagnostic runs remain selectable through `USENET_BENCHMARK_BYTES`,
 `USENET_BENCHMARK_SEGMENT_BYTES`, `USENET_BENCHMARK_PREFETCH_SEGMENTS` and
-`USENET_BENCHMARK_MAX_CONCURRENT_DOWNLOADS`.
+`USENET_BENCHMARK_MAX_CONCURRENT_DOWNLOADS`. A larger explicit
+`USENET_BENCHMARK_MEMORY_BYTES` can exercise the complete 60-producer ceiling.
 
 Latency, throughput, V8 memory and event-loop values are diagnostic because
 machine and filesystem variance makes fixed CI thresholds flaky. Internal

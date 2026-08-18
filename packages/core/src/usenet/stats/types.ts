@@ -79,7 +79,7 @@ export interface ResourceStats {
     maxBytes: number;
     peakBytes: number;
     waiting: number;
-    /** Actual owned TLS/onread late-callback payload within `usedBytes`. */
+    /** Exact retained TLS/onread carry allocations within `usedBytes`. */
     carryBytes: number;
     carryChunks: number;
     /** Aggregate hard carry capacity of currently open provider connections. */

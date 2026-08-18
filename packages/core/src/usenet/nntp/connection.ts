@@ -15,12 +15,22 @@ import {
   statusClass,
 } from './protocol.js';
 import {
+  allocateNntpReadCarryBuffer,
   NNTP_READ_CARRY_MAX_BYTES,
   NNTP_READ_CARRY_MAX_CHUNKS,
   NNTP_READ_WINDOW_BYTES,
 } from './read-carry.js';
 
 const logger = createLogger('usenet/connection');
+
+export interface NntpReadCarryStats {
+  /** Exact backing-allocation bytes retained by the carry FIFO. */
+  readonly bytes: number;
+  /** Payload bytes not yet consumed from those retained owners. */
+  readonly readableBytes: number;
+  readonly chunks: number;
+  readonly limitBytes: number;
+}
 
 export interface ConnectionOptions {
   dialTimeoutMs: number;
@@ -47,12 +57,13 @@ export interface ConnectionOptions {
    * Production leaves it unset.
    */
   onLocalPause?: (deliverLateRead: (chunk: Buffer) => boolean) => void;
+  /**
+   * Deterministic ownership seam for allocation tests. Returned Buffers must
+   * be exact, unpooled owners; production always uses the built-in allocator.
+   */
+  allocateReadCarryBuffer?: (bytes: number) => Buffer;
   /** Optional bounded telemetry seam; never receives payload bytes. */
-  onLateRead?: (stats: {
-    readonly bytes: number;
-    readonly chunks: number;
-    readonly limitBytes: number;
-  }) => void;
+  onLateRead?: (stats: NntpReadCarryStats) => void;
 }
 
 /**
@@ -130,14 +141,10 @@ interface ConnectionTimer {
 
 interface ReadCarryChunk {
   readonly buffer: Buffer;
+  /** Exact physical backing retained until this owner leaves the FIFO. */
+  readonly allocationBytes: number;
   start: number;
   readonly end: number;
-}
-
-export interface NntpReadCarryStats {
-  readonly bytes: number;
-  readonly chunks: number;
-  readonly limitBytes: number;
 }
 
 /**
@@ -172,7 +179,8 @@ export class NntpConnection {
    * retained beyond its callback.
    */
   private readonly readCarry: ReadCarryChunk[] = [];
-  private readCarryBytes = 0;
+  private readCarryRetainedBytes = 0;
+  private readCarryReadableBytes = 0;
   private socketLocallyPaused = false;
   /** Start of the current connection-wide local backpressure interval. */
   private localPauseStartedAt: number | undefined;
@@ -227,7 +235,8 @@ export class NntpConnection {
   /** Actual owned late-read memory; payload bytes are never exposed here. */
   get readCarryStats(): NntpReadCarryStats {
     return {
-      bytes: this.readCarryBytes,
+      bytes: this.readCarryRetainedBytes,
+      readableBytes: this.readCarryReadableBytes,
       chunks: this.readCarry.length,
       limitBytes: NNTP_READ_CARRY_MAX_BYTES,
     };
@@ -855,7 +864,7 @@ export class NntpConnection {
         faultDomain:
           timeoutSource === 'local_backpressure' ? 'local' : 'provider',
         timeoutSource,
-        carryBytes: this.readCarryBytes,
+        carryBytes: this.readCarryRetainedBytes,
         carryChunks: this.readCarry.length,
         carryLimitBytes: NNTP_READ_CARRY_MAX_BYTES,
         ...(timeoutSource === 'local_backpressure'
@@ -878,7 +887,7 @@ export class NntpConnection {
         timeoutSource,
         connId: this.id,
         localBackpressureMs,
-        carryBytes: this.readCarryBytes,
+        carryBytes: this.readCarryRetainedBytes,
         carryChunks: this.readCarry.length,
         carryLimitBytes: NNTP_READ_CARRY_MAX_BYTES,
       }
@@ -1168,18 +1177,27 @@ export class NntpConnection {
       }
       const consumed = Math.max(0, Math.min(head.end, off) - head.start);
       head.start += consumed;
-      this.readCarryBytes -= consumed;
-      if (head.start >= head.end) this.readCarry.shift();
+      this.readCarryReadableBytes -= consumed;
+      if (head.start >= head.end) {
+        this.readCarry.shift();
+        this.readCarryRetainedBytes -= head.allocationBytes;
+      }
       this.assertReadCarryInvariants();
       return;
     }
     if (off >= nread) return;
     const length = nread - off;
     this.assertReadCarryCapacity(length, 1);
-    const owned = Buffer.allocUnsafe(length);
+    const owned = this.allocateReadCarryBuffer(length);
     buf.copy(owned, 0, off, nread);
-    this.readCarry.unshift({ buffer: owned, start: 0, end: length });
-    this.readCarryBytes += length;
+    this.readCarry.unshift({
+      buffer: owned,
+      allocationBytes: owned.buffer.byteLength,
+      start: 0,
+      end: length,
+    });
+    this.readCarryRetainedBytes += owned.buffer.byteLength;
+    this.readCarryReadableBytes += length;
     this.assertReadCarryInvariants();
   }
 
@@ -1188,20 +1206,22 @@ export class NntpConnection {
     if (off >= nread) return;
     const length = nread - off;
     this.assertReadCarryCapacity(length, 1);
-    const owned = Buffer.allocUnsafe(length);
+    const owned = this.allocateReadCarryBuffer(length);
     buf.copy(owned, 0, off, nread);
-    this.readCarry.push({ buffer: owned, start: 0, end: length });
-    this.readCarryBytes += length;
-    this.assertReadCarryInvariants();
-    this.opts.onLateRead?.({
-      bytes: this.readCarryBytes,
-      chunks: this.readCarry.length,
-      limitBytes: NNTP_READ_CARRY_MAX_BYTES,
+    this.readCarry.push({
+      buffer: owned,
+      allocationBytes: owned.buffer.byteLength,
+      start: 0,
+      end: length,
     });
+    this.readCarryRetainedBytes += owned.buffer.byteLength;
+    this.readCarryReadableBytes += length;
+    this.assertReadCarryInvariants();
+    this.opts.onLateRead?.(this.readCarryStats);
   }
 
   private assertReadCarryCapacity(bytes: number, chunks: number): void {
-    const nextBytes = this.readCarryBytes + bytes;
+    const nextBytes = this.readCarryRetainedBytes + bytes;
     const nextChunks = this.readCarry.length + chunks;
     if (
       bytes <= 0 ||
@@ -1242,6 +1262,20 @@ export class NntpConnection {
     }
   }
 
+  private allocateReadCarryBuffer(bytes: number): Buffer {
+    const buffer =
+      this.opts.allocateReadCarryBuffer?.(bytes) ??
+      allocateNntpReadCarryBuffer(bytes);
+    if (
+      buffer.byteOffset !== 0 ||
+      buffer.byteLength !== bytes ||
+      buffer.buffer.byteLength !== bytes
+    ) {
+      throw new Error('NNTP read carry allocator returned an inexact owner');
+    }
+    return buffer;
+  }
+
   private ensureSocketLocallyPaused(now = this.now()): void {
     if (this.socketLocallyPaused) return;
     this.localPauseStartedAt = now;
@@ -1253,7 +1287,8 @@ export class NntpConnection {
         connId: this.id,
         inFlight: this.queue.length,
         faultDomain: 'local',
-        carryBytes: this.readCarryBytes,
+        carryBytes: this.readCarryRetainedBytes,
+        carryReadableBytes: this.readCarryReadableBytes,
         carryChunks: this.readCarry.length,
         carryLimitBytes: NNTP_READ_CARRY_MAX_BYTES,
       },
@@ -1306,7 +1341,8 @@ export class NntpConnection {
         return;
       }
       this.readCarry.shift();
-      this.readCarryBytes -= carry.end - carry.start;
+      this.readCarryReadableBytes -= carry.end - carry.start;
+      this.readCarryRetainedBytes -= carry.allocationBytes;
       this.assertReadCarryInvariants();
     }
     if (
@@ -1341,14 +1377,31 @@ export class NntpConnection {
   }
 
   private assertReadCarryInvariants(): void {
-    let actualBytes = 0;
+    let actualReadableBytes = 0;
+    let actualRetainedBytes = 0;
+    const owners = new Set<ArrayBufferLike>();
     for (const chunk of this.readCarry) {
-      actualBytes += chunk.end - chunk.start;
+      actualReadableBytes += chunk.end - chunk.start;
+      actualRetainedBytes += chunk.allocationBytes;
+      owners.add(chunk.buffer.buffer);
+      if (
+        chunk.start < 0 ||
+        chunk.start >= chunk.end ||
+        chunk.end !== chunk.buffer.byteLength ||
+        chunk.buffer.byteOffset !== 0 ||
+        chunk.allocationBytes !== chunk.buffer.buffer.byteLength ||
+        chunk.allocationBytes !== chunk.buffer.byteLength
+      ) {
+        throw new Error('NNTP read carry owner invariant violated');
+      }
     }
     if (
-      actualBytes !== this.readCarryBytes ||
-      this.readCarryBytes < 0 ||
-      this.readCarryBytes > NNTP_READ_CARRY_MAX_BYTES ||
+      actualReadableBytes !== this.readCarryReadableBytes ||
+      actualRetainedBytes !== this.readCarryRetainedBytes ||
+      owners.size !== this.readCarry.length ||
+      this.readCarryReadableBytes < 0 ||
+      this.readCarryReadableBytes > this.readCarryRetainedBytes ||
+      this.readCarryRetainedBytes > NNTP_READ_CARRY_MAX_BYTES ||
       this.readCarry.length > NNTP_READ_CARRY_MAX_CHUNKS
     ) {
       throw new Error('NNTP read carry invariant violated');
@@ -1459,7 +1512,8 @@ export class NntpConnection {
     this.queue = [];
     this.pausedHead = null;
     this.readCarry.splice(0, this.readCarry.length);
-    this.readCarryBytes = 0;
+    this.readCarryRetainedBytes = 0;
+    this.readCarryReadableBytes = 0;
     this.socketLocallyPaused = false;
     this.localPauseStartedAt = undefined;
     this.clearStallTimer();

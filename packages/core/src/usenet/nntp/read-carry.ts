@@ -20,3 +20,32 @@ export const NNTP_READ_CARRY_MAX_BYTES = 4 * NNTP_READ_WINDOW_BYTES;
  * metadata strictly bounded independently of payload bytes.
  */
 export const NNTP_READ_CARRY_MAX_CHUNKS = 256;
+
+/**
+ * Allocate one exact, unpooled carry owner.
+ *
+ * `Buffer.allocUnsafe()` may retain an entire shared 8 KiB slab for a tiny
+ * view. Carry capacity is a hard physical-memory contract, so each queued
+ * callback instead owns one allocation whose backing size is exactly the
+ * requested byte count.
+ */
+export function allocateNntpReadCarryBuffer(bytes: number): Buffer {
+  if (
+    !Number.isSafeInteger(bytes) ||
+    bytes <= 0 ||
+    bytes > NNTP_READ_WINDOW_BYTES
+  ) {
+    throw new RangeError(
+      'NNTP read carry allocation must fit one positive transport window'
+    );
+  }
+  const buffer = Buffer.allocUnsafeSlow(bytes);
+  if (
+    buffer.byteOffset !== 0 ||
+    buffer.byteLength !== bytes ||
+    buffer.buffer.byteLength !== bytes
+  ) {
+    throw new Error('NNTP read carry allocator returned an inexact owner');
+  }
+  return buffer;
+}
