@@ -17,7 +17,9 @@ class ControlledArtifact implements SpoolingSinkArtifact {
   committedBytes = 0;
   readonly writes: PendingWrite[] = [];
   completeCalls = 0;
+  growCalls = 0;
   failure: Error | undefined;
+  growHandler: ((bytes: number) => Promise<void>) | undefined;
 
   write(chunk: Buffer, lease: ByteLease): boolean {
     this.writes.push({ chunk, lease });
@@ -25,6 +27,8 @@ class ControlledArtifact implements SpoolingSinkArtifact {
   }
 
   grow(bytes: number): Promise<void> {
+    this.growCalls++;
+    if (this.growHandler) return this.growHandler(bytes);
     this.reservedBytes += bytes;
     return Promise.resolve();
   }
@@ -138,6 +142,51 @@ test('abort while a batch is writer-owned is idempotent and wakes drain', async 
   assert.equal(artifact.failure, failure);
   artifact.settle(0);
   await assert.rejects(sink.end(), failure);
+});
+
+test('writer settlement after failure does not restart growth or replace the root cause', async () => {
+  const artifact = new ControlledArtifact();
+  artifact.reservedBytes = 16;
+  const sink = new SpoolingSegmentSink(artifact, 32, 16);
+  const target = sink.acquireDecodeTarget(16);
+  target.fill(1);
+  assert.equal(sink.commitDecoded(16, true), false);
+  const original = new Error('original segment failure');
+  sink.fail(original);
+  const ending = sink.end();
+
+  artifact.settle(0);
+  await assert.rejects(ending, (error: unknown) => error === original);
+  assert.equal(artifact.growCalls, 0);
+  assert.equal(artifact.failure, original);
+});
+
+test('a secondary preparation failure is aggregated without obscuring the first error', async () => {
+  const artifact = new ControlledArtifact();
+  artifact.reservedBytes = 16;
+  const growth = Promise.withResolvers<void>();
+  artifact.growHandler = () => growth.promise;
+  const sink = new SpoolingSegmentSink(artifact, 32, 16);
+  const target = sink.acquireDecodeTarget(16);
+  target.fill(1);
+  assert.equal(sink.commitDecoded(16, true), false);
+  artifact.settle(0);
+  assert.equal(artifact.growCalls, 1);
+
+  const original = new Error('original segment failure');
+  sink.fail(original);
+  const secondary = Object.assign(new Error('growth cleanup failed'), {
+    code: 'EIO',
+  });
+  growth.reject(secondary);
+
+  await assert.rejects(sink.end(), (error: unknown) => {
+    assert(error instanceof AggregateError);
+    assert.equal(error.cause, original);
+    assert.deepEqual(error.errors, [original, secondary]);
+    return true;
+  });
+  assert.equal(artifact.failure, original);
 });
 
 test('abort discards empty and partially filled local batches without publishing them', async () => {

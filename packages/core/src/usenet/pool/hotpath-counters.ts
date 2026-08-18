@@ -31,6 +31,13 @@ export interface SegmentSpoolingHotpathSnapshot {
   readonly promotionBytesCopied: number;
   readonly activeDownloads: number;
   readonly activeDownloadsPeak: number;
+  readonly semaphoreOwnerCountPeak: number;
+  readonly semaphoreWaiterCountPeak: number;
+  readonly semaphoreGrants: number;
+  readonly semaphoreAborts: number;
+  readonly semaphoreCapacityRejects: number;
+  readonly semaphoreOwnerTurns: number;
+  readonly semaphoreGlobalScans: number;
   readonly perStreamDownloadAdmits: readonly SegmentSpoolingDownloadAdmitCount[];
   readonly downloadOwnerOverflowAdmits: number;
 }
@@ -70,6 +77,14 @@ export class SegmentSpoolingHotpathCounters {
   promotionBytesCopied = 0;
   activeDownloads = 0;
   activeDownloadsPeak = 0;
+  semaphoreOwnerCountPeak = 0;
+  semaphoreWaiterCountPeak = 0;
+  semaphoreGrants = 0;
+  semaphoreAborts = 0;
+  semaphoreCapacityRejects = 0;
+  semaphoreOwnerTurns = 0;
+  /** Intrusive owner queues never scan the global waiter population. */
+  readonly semaphoreGlobalScans = 0;
   private readonly downloadOwners: Array<DownloadOwnerSlot | undefined> =
     Array.from({ length: DOWNLOAD_OWNER_SLOTS });
   private downloadOwnerOverflowAdmitsValue = 0;
@@ -102,6 +117,33 @@ export class SegmentSpoolingHotpathCounters {
     }
   }
 
+  semaphoreQueued(ownerCount: number, waiterCount: number): void {
+    this.semaphoreOwnerCountPeak = Math.max(
+      this.semaphoreOwnerCountPeak,
+      ownerCount
+    );
+    this.semaphoreWaiterCountPeak = Math.max(
+      this.semaphoreWaiterCountPeak,
+      waiterCount
+    );
+  }
+
+  semaphoreGrant(): void {
+    this.semaphoreGrants++;
+  }
+
+  semaphoreAbort(): void {
+    this.semaphoreAborts++;
+  }
+
+  semaphoreCapacityReject(): void {
+    this.semaphoreCapacityRejects++;
+  }
+
+  semaphoreOwnerTurn(): void {
+    this.semaphoreOwnerTurns++;
+  }
+
   snapshot(): SegmentSpoolingHotpathSnapshot {
     return {
       rawReadCallbacks: this.rawReadCallbacks,
@@ -129,6 +171,13 @@ export class SegmentSpoolingHotpathCounters {
       promotionBytesCopied: this.promotionBytesCopied,
       activeDownloads: this.activeDownloads,
       activeDownloadsPeak: this.activeDownloadsPeak,
+      semaphoreOwnerCountPeak: this.semaphoreOwnerCountPeak,
+      semaphoreWaiterCountPeak: this.semaphoreWaiterCountPeak,
+      semaphoreGrants: this.semaphoreGrants,
+      semaphoreAborts: this.semaphoreAborts,
+      semaphoreCapacityRejects: this.semaphoreCapacityRejects,
+      semaphoreOwnerTurns: this.semaphoreOwnerTurns,
+      semaphoreGlobalScans: this.semaphoreGlobalScans,
       perStreamDownloadAdmits: this.downloadOwners
         .filter((entry): entry is DownloadOwnerSlot => entry !== undefined)
         .map((entry) => ({ ...entry })),

@@ -488,7 +488,8 @@ export class MultiProviderPool {
     // The per-stream priority reservation rides on this semaphore.
     this.globalDownloads = new PrioritySemaphore(
       Math.max(1, opts.maxConcurrentDownloads),
-      opts.streamingPriority
+      opts.streamingPriority,
+      { hotpathCounters: dependencies.spooling?.hotpathCounters }
     );
   }
 

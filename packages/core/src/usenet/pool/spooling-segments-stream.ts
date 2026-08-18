@@ -90,6 +90,7 @@ interface PlannedSegment {
   error?: unknown;
   done: boolean;
   releasing: boolean;
+  releaseSettlement?: Promise<void>;
 }
 
 interface ActiveArtifactReader {
@@ -99,8 +100,38 @@ interface ActiveArtifactReader {
   readonly onEnd: () => void;
   readonly onError: (error: Error) => void;
   readonly onClose: () => void;
+  readonly settlement: Promise<Error | undefined>;
+  readonly settle: (error: Error | undefined) => void;
   remainingBytes: number;
   terminal: boolean;
+  cleanupRequested: boolean;
+  closed: boolean;
+  observedError?: Error;
+}
+
+function errorCode(error: Error): unknown {
+  return 'code' in error ? error.code : undefined;
+}
+
+function isAbortLike(error: Error): boolean {
+  const code = errorCode(error);
+  return (
+    error.name === 'AbortError' ||
+    code === 'ABORT_ERR' ||
+    code === 'USENET_SPOOL_ABORTED'
+  );
+}
+
+function combineCleanupErrors(primary: Error, secondary: Error): Error {
+  if (primary === secondary) return primary;
+  if (secondary instanceof AggregateError && secondary.cause === primary) {
+    return secondary;
+  }
+  return new AggregateError(
+    [primary, secondary],
+    'Segment stream failed and cleanup also failed',
+    { cause: primary }
+  );
 }
 
 function isNonNegativeSafeInteger(value: number): boolean {
@@ -291,11 +322,12 @@ export class SpoolingSegmentsStream extends Readable {
     void this.cleanupProducer(error).then(
       () => this.finishDestroy(error, callback),
       (cleanupError: unknown) => {
+        const secondary =
+          cleanupError instanceof Error
+            ? cleanupError
+            : new Error(String(cleanupError));
         this.finishDestroy(
-          error ??
-            (cleanupError instanceof Error
-              ? cleanupError
-              : new Error(String(cleanupError))),
+          error ? combineCleanupErrors(error, secondary) : secondary,
           callback
         );
       }
@@ -644,11 +676,21 @@ export class SpoolingSegmentsStream extends Readable {
       this.destroy(error instanceof Error ? error : new Error(String(error)));
       return;
     }
+    const settlement = Promise.withResolvers<Error | undefined>();
+    let settled = false;
     const active: ActiveArtifactReader = {
       task,
       reader,
       remainingBytes: take,
       terminal: false,
+      cleanupRequested: false,
+      closed: false,
+      settlement: settlement.promise,
+      settle: (error) => {
+        if (settled) return;
+        settled = true;
+        settlement.resolve(error);
+      },
       onData: (chunk) => this.onArtifactData(active, chunk),
       onEnd: () => this.onArtifactEnd(active),
       onError: (error) => this.onArtifactError(active, error),
@@ -659,6 +701,7 @@ export class SpoolingSegmentsStream extends Readable {
     reader.once('end', active.onEnd);
     reader.once('error', active.onError);
     reader.once('close', active.onClose);
+    if (reader.closed) queueMicrotask(active.onClose);
   }
 
   private onArtifactData(active: ActiveArtifactReader, chunk: Buffer): void {
@@ -712,34 +755,76 @@ export class SpoolingSegmentsStream extends Readable {
   }
 
   private onArtifactError(active: ActiveArtifactReader, error: Error): void {
-    if (this.active !== active || active.terminal || this.ending) return;
+    active.observedError ??= error;
+    if (
+      this.active !== active ||
+      active.cleanupRequested ||
+      active.terminal ||
+      this.ending
+    ) {
+      return;
+    }
     active.terminal = true;
+    this.detachActiveReaderData(active);
     this.destroy(error);
   }
 
   private onArtifactClose(active: ActiveArtifactReader): void {
-    if (this.active !== active || active.terminal || this.ending) return;
-    active.terminal = true;
-    this.destroy(new Error('Segment artifact reader closed before end'));
+    if (active.closed) return;
+    active.closed = true;
+    const premature =
+      this.active === active &&
+      !active.terminal &&
+      !active.cleanupRequested &&
+      !this.ending;
+    if (premature) {
+      active.terminal = true;
+      active.observedError ??= new Error(
+        'Segment artifact reader closed before end'
+      );
+    }
+    this.detachActiveReaderFinal(active);
+    active.settle(active.observedError);
+    if (premature && active.observedError) this.destroy(active.observedError);
   }
 
-  private async releaseCurrent(
+  private releaseCurrent(
     task: PlannedSegment,
     finishAfterRelease = false
   ): Promise<void> {
-    if (task.releasing) return;
+    if (task.releaseSettlement) return task.releaseSettlement;
     task.releasing = true;
+    task.releaseSettlement = this.releaseCurrentOnce(task, finishAfterRelease);
+    return task.releaseSettlement;
+  }
+
+  private async releaseCurrentOnce(
+    task: PlannedSegment,
+    finishAfterRelease: boolean
+  ): Promise<void> {
     const active = this.active;
     if (active?.task === task) {
-      this.detachActiveReader(active);
-      this.active = undefined;
+      active.terminal = true;
+      active.cleanupRequested = true;
+      this.detachActiveReaderData(active);
+      if (!active.reader.destroyed) active.reader.destroy();
     }
+    let releaseError: Error | undefined;
     try {
       await task.artifact?.release();
     } catch (error) {
-      if (!this.ending && !this.destroyed) {
-        this.destroy(error instanceof Error ? error : new Error(String(error)));
-      }
+      releaseError = error instanceof Error ? error : new Error(String(error));
+    }
+    const readerError =
+      active?.task === task ? await active.settlement : undefined;
+    if (active?.task === task && this.active === active)
+      this.active = undefined;
+    const failure =
+      releaseError && readerError
+        ? combineCleanupErrors(readerError, releaseError)
+        : (releaseError ?? readerError);
+    if (failure) {
+      if (!this.ending && !this.destroyed) this.destroy(failure);
       return;
     }
     if (this.ending || this.destroyed) return;
@@ -795,34 +880,67 @@ export class SpoolingSegmentsStream extends Readable {
     if (this.producerCleanupPromise) return this.producerCleanupPromise;
     this.ending = true;
     this.removeExternalAbortListener();
-    if (!this.controller.signal.aborted) this.controller.abort(reason);
     const active = this.active;
     if (active) {
       active.terminal = true;
-      this.detachActiveReader(active);
-      this.active = undefined;
+      active.cleanupRequested = true;
+      this.detachActiveReaderData(active);
+    }
+    // The active reader's error/close settlement is installed before aborting
+    // the shared controller. GrowingFileReader may synchronously enter
+    // destroy(), but its final error is emitted only after asynchronous file
+    // close; the observer above therefore remains its owner until `close`.
+    if (!this.controller.signal.aborted) this.controller.abort(reason);
+    if (active) {
       this.discardReadableQueue(active.reader);
-      if (!active.reader.destroyed) active.reader.destroy();
+      if (!active.reader.destroyed) active.reader.destroy(reason ?? undefined);
     }
 
+    const tasks = [...this.planned.values()];
+    const initialArtifact = this.initialArtifact;
+    this.initialArtifact = undefined;
     this.producerCleanupPromise = (async () => {
       await Promise.allSettled(
         this.startPromise === undefined ? [] : [this.startPromise]
       );
-      const tasks = [...this.planned.values()];
       await Promise.allSettled(tasks.map((task) => task.settled));
-      const initialArtifact = this.initialArtifact;
-      this.initialArtifact = undefined;
+      const existingReleases = await Promise.allSettled(
+        tasks.flatMap((task) =>
+          task.releaseSettlement ? [task.releaseSettlement] : []
+        )
+      );
       const releases = await Promise.allSettled([
         ...tasks.map((task) => task.artifact?.release()),
         initialArtifact?.release(),
       ]);
+      const readerError = active ? await active.settlement : undefined;
+      if (active && this.active === active) this.active = undefined;
       this.planned.clear();
-      const failedRelease = releases.find(
+      const failedRelease = [...existingReleases, ...releases].find(
         (result): result is PromiseRejectedResult =>
           result.status === 'rejected'
       );
-      if (failedRelease) throw failedRelease.reason;
+      const releaseError = failedRelease
+        ? failedRelease.reason instanceof Error
+          ? failedRelease.reason
+          : new Error(String(failedRelease.reason))
+        : undefined;
+      const unexpectedReaderError =
+        readerError && readerError !== reason && !isAbortLike(readerError)
+          ? readerError
+          : undefined;
+      const unexpectedReleaseError =
+        releaseError && releaseError !== reason && !isAbortLike(releaseError)
+          ? releaseError
+          : undefined;
+      if (unexpectedReaderError && unexpectedReleaseError) {
+        throw combineCleanupErrors(
+          unexpectedReaderError,
+          unexpectedReleaseError
+        );
+      }
+      if (unexpectedReaderError) throw unexpectedReaderError;
+      if (unexpectedReleaseError) throw unexpectedReleaseError;
     })();
     return this.producerCleanupPromise;
   }
@@ -878,9 +996,13 @@ export class SpoolingSegmentsStream extends Readable {
     this.streamLease = undefined;
   }
 
-  private detachActiveReader(active: ActiveArtifactReader): void {
+  private detachActiveReaderData(active: ActiveArtifactReader): void {
     active.reader.removeListener('data', active.onData);
     active.reader.removeListener('end', active.onEnd);
+  }
+
+  private detachActiveReaderFinal(active: ActiveArtifactReader): void {
+    this.detachActiveReaderData(active);
     active.reader.removeListener('error', active.onError);
     active.reader.removeListener('close', active.onClose);
   }

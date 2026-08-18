@@ -7,6 +7,12 @@ import '../../config/index.js';
 import { ArticleNotFoundError } from '../nntp/errors.js';
 import type { HoleHooks, HoleInfo } from '../holes.js';
 import { UsenetSpoolError } from '../spool/errors.js';
+import { spoolAbortError } from '../spool/errors.js';
+import { GrowingFileReader } from '../spool/growing-readable.js';
+import type {
+  GrowingReadableSource,
+  ManagedSpoolFile,
+} from '../spool/types.js';
 import { StatsAccumulator } from '../stats/accumulator.js';
 import {
   CommandPriority,
@@ -391,6 +397,85 @@ class GatedRangeArtifact implements SegmentArtifact {
   }
 }
 
+class CountingGrowingFileReader extends GrowingFileReader {
+  destroyCalls = 0;
+
+  override destroy(error?: Error): this {
+    this.destroyCalls++;
+    return super.destroy(error);
+  }
+}
+
+class DelayedCloseGrowingArtifact implements SegmentArtifact {
+  readonly metadata = { size: 4 };
+  readonly length = 4;
+  readonly storage: 'spool' = 'spool';
+  readonly readerReady = Promise.withResolvers<CountingGrowingFileReader>();
+  readonly fileOpened = Promise.withResolvers<void>();
+  readonly closeStarted = Promise.withResolvers<void>();
+  readonly closeGate = Promise.withResolvers<void>();
+  releaseCalls = 0;
+  onClosedCalls = 0;
+  closeFailure: Error | undefined;
+  reader: CountingGrowingFileReader | undefined;
+
+  private released = false;
+
+  createReadStream(options: SegmentArtifactReadOptions = {}): Readable {
+    assert.equal(this.reader, undefined);
+    const source: GrowingReadableSource = {
+      snapshot: () => ({ state: 'writing', committedBytes: 0 }),
+      waitForChange: (_position, signal) =>
+        new Promise<void>((_resolve, reject) => {
+          const onAbort = (): void => {
+            signal.removeEventListener('abort', onAbort);
+            reject(spoolAbortError(signal.reason));
+          };
+          signal.addEventListener('abort', onAbort, { once: true });
+        }),
+      openReadableFile: () => {
+        this.fileOpened.resolve();
+        const managed: ManagedSpoolFile = {
+          handle: {
+            read: () => Promise.resolve({ bytesRead: 0 }),
+            write: () =>
+              Promise.reject(new Error('reader fixture cannot write')),
+            close: () => Promise.resolve(),
+          },
+          close: async () => {
+            this.closeStarted.resolve();
+            await this.closeGate.promise;
+            if (this.closeFailure) throw this.closeFailure;
+          },
+        };
+        return Promise.resolve(managed);
+      },
+    };
+    const reader = new CountingGrowingFileReader({
+      source,
+      start: options.start ?? 0,
+      endExclusive: options.endExclusive,
+      highWaterMark: options.highWaterMark ?? 4,
+      signal: options.signal,
+      onClosed: () => {
+        this.onClosedCalls++;
+      },
+    });
+    this.reader = reader;
+    this.readerReady.resolve(reader);
+    return reader;
+  }
+
+  async release(): Promise<void> {
+    if (this.released) return;
+    this.released = true;
+    this.releaseCalls++;
+    const reader = this.reader;
+    if (reader && !reader.destroyed) reader.destroy();
+    if (reader && !reader.closed) await once(reader, 'close');
+  }
+}
+
 class BudgetedArtifactSource extends TestArtifactSource {
   constructor(
     handler: FetchHandler,
@@ -549,6 +634,16 @@ function abortablePromise<T>(
 
 function immediate(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
+}
+
+function nestedErrors(error: Error): Error[] {
+  if (!(error instanceof AggregateError)) return [error];
+  return [
+    error,
+    ...error.errors.flatMap((entry: unknown) =>
+      entry instanceof Error ? nestedErrors(entry) : []
+    ),
+  ];
 }
 
 async function closeEvent(stream: Readable): Promise<void> {
@@ -2702,6 +2797,84 @@ test('client destruction aborts every planned fetch and leaves no lease', async 
   );
   assert.equal(source.activeStreamLeases, 0);
   assert.deepEqual(source.cleanupCauses, ['client_close']);
+});
+
+test('external abort keeps the growing reader error owner until async close settles', async () => {
+  const artifact = new DelayedCloseGrowingArtifact();
+  const source = new TestArtifactSource(() => Promise.resolve(artifact));
+  const controller = new AbortController();
+  const stream = new SpoolingSegmentsStream(
+    streamOptions(source, 1, { signal: controller.signal })
+  );
+  const streamError = Promise.withResolvers<Error>();
+  stream.once('error', streamError.resolve);
+  stream.resume();
+  const reader = await artifact.readerReady.promise;
+  await artifact.fileOpened.promise;
+
+  controller.abort('client range closed');
+  await artifact.closeStarted.promise;
+  await immediate();
+  assert.equal(stream.closed, false);
+  assert.equal(source.activeStreamLeases, 1);
+  assert(getEventListeners(reader, 'error').length >= 1);
+  stream.destroy(new Error('duplicate terminal path'));
+
+  artifact.closeGate.resolve();
+  const observedStreamError = await streamError.promise;
+  assert.equal(observedStreamError.message, 'aborted');
+  await closeEvent(stream);
+
+  assert.equal(artifact.releaseCalls, 1);
+  assert.equal(artifact.onClosedCalls, 1);
+  assert.equal(reader.destroyCalls, 1);
+  assert.equal(source.activeStreamLeases, 0);
+  assert.equal(source.streamLeaseReleases, 1);
+  assert.equal(getEventListeners(reader, 'error').length, 0);
+  assert.equal(getEventListeners(reader, 'close').length, 0);
+});
+
+test('a real growing-reader close failure is observed once during abort cleanup', async () => {
+  const artifact = new DelayedCloseGrowingArtifact();
+  const closeFailure = Object.assign(
+    new Error('synthetic file close failure'),
+    {
+      code: 'EIO',
+    }
+  );
+  artifact.closeFailure = closeFailure;
+  const source = new TestArtifactSource(() => Promise.resolve(artifact));
+  const controller = new AbortController();
+  const stream = new SpoolingSegmentsStream(
+    streamOptions(source, 1, { signal: controller.signal })
+  );
+  const errors: Error[] = [];
+  stream.on('error', (error: Error) => errors.push(error));
+  stream.resume();
+  const reader = await artifact.readerReady.promise;
+  await artifact.fileOpened.promise;
+
+  controller.abort('client range closed');
+  await artifact.closeStarted.promise;
+  artifact.closeGate.resolve();
+  await closeEvent(stream);
+
+  assert.equal(errors.length, 1);
+  const allErrors = nestedErrors(errors[0]);
+  assert(
+    allErrors.some(
+      (error) =>
+        error instanceof UsenetSpoolError &&
+        error.code === 'USENET_SPOOL_IO' &&
+        error.cause === closeFailure
+    )
+  );
+  assert.equal(artifact.releaseCalls, 1);
+  assert.equal(artifact.onClosedCalls, 1);
+  assert.equal(source.activeStreamLeases, 0);
+  assert.equal(source.streamLeaseReleases, 1);
+  assert.equal(getEventListeners(reader, 'error').length, 0);
+  assert.equal(getEventListeners(reader, 'close').length, 0);
 });
 
 test('the idle reaper destroys a pending spooling stream and drains its resources', async () => {

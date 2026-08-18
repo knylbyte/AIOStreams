@@ -252,8 +252,18 @@ export class GrowingFileReader extends Readable {
       const file = this.file ?? (await this.openPromise);
       await file?.close();
     } catch (error) {
+      const classified = classifySpoolFileError(
+        error,
+        'closing a spool reader'
+      );
       if (!closeError) {
-        closeError = classifySpoolFileError(error, 'closing a spool reader');
+        closeError = classified;
+      } else if (error !== closeError && classified.cause !== closeError) {
+        closeError = new AggregateError(
+          [closeError, classified],
+          'Growing spool reader failed and file cleanup also failed',
+          { cause: closeError }
+        );
       }
     } finally {
       this.file = undefined;

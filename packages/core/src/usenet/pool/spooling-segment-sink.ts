@@ -48,6 +48,7 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
   private readyForNextWrite = true;
   private preparing: Promise<void> = Promise.resolve();
   private writeSettlement: PromiseWithResolvers<void> | undefined;
+  private secondaryFailure: Error | undefined;
 
   constructor(
     private readonly artifact: SpoolingSinkArtifact,
@@ -154,8 +155,10 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
         this.hotpathCounters.sinkDrainCycles++;
       }
     } catch (error) {
+      const failure = asError(error);
+      this.fail(failure);
       lease.release();
-      throw error;
+      throw failure;
     }
     this.assertInvariants();
     // One retained chunk is the hard local high-water mark. The connection
@@ -188,7 +191,7 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
     const settlement = this.writeSettlement;
     if (settlement) await settlement.promise;
     await this.preparing;
-    if (this.failure) throw this.failure;
+    if (this.failure) throw this.terminalFailure();
     if (this.retainedBytes !== 0) {
       throw new UsenetSpoolError(
         'USENET_MEMORY_BUDGET',
@@ -218,7 +221,17 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
         released = true;
         this.retainedBytes -= bytes;
         this.batchBytes = 0;
-        this.startPreparingNextWrite();
+        if (this.failure) {
+          // A writer-owned child may settle after the producer has already
+          // failed. Growth belongs only to a live next-write admission; do not
+          // resurrect it after terminal failure. Settlement still wakes every
+          // drain/end owner exactly once.
+          this.writeSettlement?.resolve();
+          this.writeSettlement = undefined;
+          this.emitDrain();
+        } else {
+          this.startPreparingNextWrite();
+        }
         this.assertInvariants();
       },
     };
@@ -235,8 +248,12 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
       },
       (error: unknown) => {
         const failure = asError(error);
-        this.failure = failure;
-        this.artifact.fail(failure);
+        if (this.failure) {
+          if (failure !== this.failure) this.secondaryFailure ??= failure;
+        } else {
+          this.failure = failure;
+          this.artifact.fail(failure);
+        }
         this.writeSettlement?.resolve();
         this.writeSettlement = undefined;
         this.emitDrain();
@@ -261,7 +278,7 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
   }
 
   private assertWritable(): void {
-    if (this.failure) throw this.failure;
+    if (this.failure) throw this.terminalFailure();
     if (!this.readyForNextWrite || this.retainedBytes !== 0) {
       throw new UsenetSpoolError(
         'USENET_MEMORY_BUDGET',
@@ -314,10 +331,24 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
         this.hotpathCounters.sinkDrainCycles++;
       }
     } catch (error) {
+      const failure = asError(error);
+      this.fail(failure);
       lease.release();
-      throw error;
+      throw failure;
     }
     this.assertInvariants();
     return false;
+  }
+
+  private terminalFailure(): Error {
+    const failure = this.failure;
+    assert(failure);
+    const secondary = this.secondaryFailure;
+    if (!secondary) return failure;
+    return new AggregateError(
+      [failure, secondary],
+      'Segment spool sink failed and cleanup also failed',
+      { cause: failure }
+    );
   }
 }

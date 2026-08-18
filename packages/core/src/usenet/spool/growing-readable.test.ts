@@ -315,3 +315,74 @@ test('GrowingFileReader aborts between short reads without pushing a partial chu
   assert.equal(readCalls, 1);
   assert.equal(closeCalls, 1);
 });
+
+test('GrowingFileReader preserves an abort root cause when asynchronous file close also fails', async () => {
+  const controller = new AbortController();
+  const opened = Promise.withResolvers<void>();
+  const closeStarted = Promise.withResolvers<void>();
+  const closeGate = Promise.withResolvers<void>();
+  const closeFailure = Object.assign(new Error('synthetic close failure'), {
+    code: 'EIO',
+  });
+  let onClosedCalls = 0;
+  const source: GrowingReadableSource = {
+    snapshot: () => ({ state: 'writing', committedBytes: 0 }),
+    waitForChange: (_position, signal) =>
+      new Promise<void>((_resolve, reject) => {
+        const onAbort = (): void => {
+          signal.removeEventListener('abort', onAbort);
+          reject(signal.reason);
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+      }),
+    openReadableFile: () => {
+      opened.resolve();
+      return Promise.resolve({
+        handle: {
+          read: () => Promise.resolve({ bytesRead: 0 }),
+          write: () => Promise.reject(new Error('reader fixture cannot write')),
+          close: () => Promise.resolve(),
+        },
+        close: async () => {
+          closeStarted.resolve();
+          await closeGate.promise;
+          throw closeFailure;
+        },
+      });
+    },
+  };
+  const reader = new GrowingFileReader({
+    source,
+    start: 0,
+    highWaterMark: 8,
+    signal: controller.signal,
+    onClosed: () => {
+      onClosedCalls++;
+    },
+  });
+  const failure = Promise.withResolvers<Error>();
+  const closed = new Promise<void>((resolve) => reader.once('close', resolve));
+  reader.once('error', failure.resolve);
+  reader.resume();
+  await opened.promise;
+
+  controller.abort('client range closed');
+  await closeStarted.promise;
+  assert.equal(reader.closed, false);
+  closeGate.resolve();
+  const error = await failure.promise;
+  await closed;
+
+  assert(error instanceof AggregateError);
+  assert(error.cause instanceof UsenetSpoolError);
+  assert.equal(error.cause.code, 'USENET_SPOOL_ABORTED');
+  assert(
+    error.errors.some(
+      (entry: unknown) =>
+        entry instanceof UsenetSpoolError &&
+        entry.code === 'USENET_SPOOL_IO' &&
+        entry.cause === closeFailure
+    )
+  );
+  assert.equal(onClosedCalls, 1);
+});
