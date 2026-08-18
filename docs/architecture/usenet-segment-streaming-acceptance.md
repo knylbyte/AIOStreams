@@ -107,22 +107,29 @@ canonical concept itself is unchanged.
       correctness gates use internal byte budgets, never RSS. The benchmark
       drives the actual ordered `SpoolingSegmentsStream`, deterministic
       out-of-order completion, bounded concurrent producers and a yielding slow
-      consumer. Every admitted producer owns the same decoder/sink/TLS-carry
-      base lease as production until its finalizer settles.
+      consumer. Production and benchmark obtain the 256 KiB decoder chunk and
+      1,572,864-byte decoder/sink/TLS-carry base lease from the same resource-
+      plan helper. Each Writer chunk is an exact logical child inside that
+      global base lease and is not acquired from the global budget twice.
 
 The benchmark defaults to the concept's full 500 one-MiB segment run with a
 64-segment prefetch window, a 16 MiB memory budget and 60 configured producer
 slots. It reports the lower effective producer limit derived from the hard
-stream, per-download and writer-owner windows rather than claiming all 60 slots
-when that memory cannot be leased:
+stream and productive per-download windows rather than claiming all 60 slots
+when that memory cannot be leased. With the current 655,358-byte stream window,
+the 16 MiB default admits ten downloads. The regression suite uses 96 MiB to
+prove the complete 60-download ceiling; 80 MiB is explicitly insufficient:
 
 ```bash
 pnpm -F core benchmark:segment-spooling
 ```
 
 Short diagnostic runs remain selectable through `USENET_BENCHMARK_BYTES`,
-`USENET_BENCHMARK_SEGMENT_BYTES`, `USENET_BENCHMARK_PREFETCH_SEGMENTS` and
-`USENET_BENCHMARK_MAX_CONCURRENT_DOWNLOADS`. A larger explicit
+`USENET_BENCHMARK_SEGMENT_BYTES`, `USENET_BENCHMARK_CHUNK_BYTES`,
+`USENET_BENCHMARK_PREFETCH_SEGMENTS` and
+`USENET_BENCHMARK_MAX_CONCURRENT_DOWNLOADS`. The chunk setting controls only
+the benchmark Writer/output chunks; it never changes the productive decoder or
+base-lease window. A larger explicit
 `USENET_BENCHMARK_MEMORY_BYTES` can exercise the complete 60-producer ceiling.
 
 Latency, throughput, V8 memory and event-loop values are diagnostic because

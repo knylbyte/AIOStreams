@@ -71,6 +71,13 @@ export interface SegmentSpoolingPlan {
   readonly orphanTtlMs: number;
 }
 
+/** Production constants that form one atomic on-wire download admission. */
+export interface SegmentSpoolingDownloadMemoryPlan {
+  readonly decoderChunkBytes: number;
+  readonly carryBytes: number;
+  readonly perDownloadBaseLeaseBytes: number;
+}
+
 /** Derived estimates and queue sizes for one segment-spooling stream. */
 export interface StreamResourcePlan {
   readonly prefetchSegments: number;
@@ -257,6 +264,20 @@ export function resolveSegmentSpoolingMaxOpenFiles(
   return clamp(maxConcurrentDownloads * 2, 32, 256);
 }
 
+/**
+ * Resolve the production decoder/sink/carry window acquired before BODY goes
+ * on wire. Benchmarks use this helper as well, so output chunk sizes cannot
+ * silently change the admission contract they are intended to verify.
+ */
+export function resolveSegmentSpoolingDownloadMemoryPlan(): SegmentSpoolingDownloadMemoryPlan {
+  return {
+    decoderChunkBytes: DECODER_CHUNK_BYTES,
+    carryBytes: NNTP_READ_CARRY_MAX_BYTES,
+    perDownloadBaseLeaseBytes:
+      2 * DECODER_CHUNK_BYTES + NNTP_READ_CARRY_MAX_BYTES,
+  };
+}
+
 function validateSegmentSpoolingOptions(
   options: EngineResourcePlanOptions
 ): void {
@@ -343,12 +364,13 @@ export function resolveSegmentSpoolingPlan(
   options: EngineResourcePlanOptions
 ): SegmentSpoolingPlan {
   validateSegmentSpoolingOptions(options);
+  const downloadMemory = resolveSegmentSpoolingDownloadMemoryPlan();
   return {
     memoryBudgetBytes: options.segmentSpoolingMemoryBudgetBytes,
     perStreamBufferBytes: options.segmentSpoolingStreamBufferBytes,
     spoolBytes: options.segmentSpoolingSpoolBytes,
     minFreeDiskBytes: options.segmentSpoolingMinFreeDiskBytes,
-    decoderChunkBytes: DECODER_CHUNK_BYTES,
+    decoderChunkBytes: downloadMemory.decoderChunkBytes,
     writerQueueBytes: resolveSegmentSpoolingWriterQueueBytes(
       options.segmentSpoolingStreamBufferBytes
     ),
@@ -357,8 +379,7 @@ export function resolveSegmentSpoolingPlan(
     ),
     // One atomic admission avoids an on-wire download ever waiting for carry
     // headroom after the rest of the memory budget has already been consumed.
-    perDownloadBaseLeaseBytes:
-      2 * DECODER_CHUNK_BYTES + NNTP_READ_CARRY_MAX_BYTES,
+    perDownloadBaseLeaseBytes: downloadMemory.perDownloadBaseLeaseBytes,
     maxOpenSpoolFiles: resolveSegmentSpoolingMaxOpenFiles(
       options.maxConcurrentDownloads
     ),

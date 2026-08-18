@@ -6,6 +6,7 @@ import {
   resolveSegmentArenaBytes,
   resolveSegmentBufferingArenaBytes,
   resolveSegmentSpoolingArenaBytes,
+  resolveSegmentSpoolingDownloadMemoryPlan,
   resolveSegmentSpoolingMaxOpenFiles,
   resolveSegmentSpoolingReaderHighWaterMarkBytes,
   resolveSegmentSpoolingWriterQueueBytes,
@@ -192,6 +193,22 @@ test('download admission reserves decoder, sink and bounded TLS carry atomically
     plan.perDownloadBaseLeaseBytes <=
       plan.memoryBudgetBytes - plan.perStreamBufferBytes,
     'the 16 MiB minimum must admit one download beside one stream window'
+  );
+});
+
+test('download memory helper is the single production admission source', () => {
+  const downloadMemory = resolveSegmentSpoolingDownloadMemoryPlan();
+  const plan = resolveEngineResourcePlan(resourceOptions()).segmentSpooling;
+  assert.ok(plan);
+  assert.deepEqual(downloadMemory, {
+    decoderChunkBytes: 256 * KIBIBYTE_BYTES,
+    carryBytes: 1 * MEBIBYTE_BYTES,
+    perDownloadBaseLeaseBytes: 1_572_864,
+  });
+  assert.equal(plan.decoderChunkBytes, downloadMemory.decoderChunkBytes);
+  assert.equal(
+    plan.perDownloadBaseLeaseBytes,
+    downloadMemory.perDownloadBaseLeaseBytes
   );
 });
 

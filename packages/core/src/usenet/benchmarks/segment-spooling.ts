@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -5,8 +6,10 @@ import path from 'node:path';
 import { monitorEventLoopDelay, performance } from 'node:perf_hooks';
 import { pathToFileURL } from 'node:url';
 import '../../config/index.js';
-import type { SegmentSpoolingPlan } from '../resource-plan.js';
-import { NNTP_READ_CARRY_MAX_BYTES } from '../nntp/read-carry.js';
+import {
+  resolveSegmentSpoolingDownloadMemoryPlan,
+  type SegmentSpoolingPlan,
+} from '../resource-plan.js';
 import { resolveSegmentStreamMemoryBytes } from '../stream-queue-budget.js';
 import { GrowingSpoolArtifactAdapter } from '../pool/segment-artifact.js';
 import type {
@@ -38,12 +41,46 @@ export interface SegmentSpoolingBenchmarkOptions {
   readonly prefetchSegments?: number;
   readonly maxConcurrentDownloads?: number;
   readonly memoryBudgetBytes?: number;
+  readonly signal?: AbortSignal;
+  /** Deterministic failure/ownership seams used only by benchmark tests. */
+  readonly testHooks?: SegmentSpoolingBenchmarkTestHooks;
+}
+
+export type SegmentSpoolingBenchmarkStage =
+  | 'artifact-create'
+  | 'first-writer-chunk'
+  | 'later-writer-chunk'
+  | 'writer-child-acquired'
+  | 'artifact-complete';
+
+export interface SegmentSpoolingBenchmarkOwnershipSnapshot {
+  readonly activeDownloads: number;
+  readonly downloadBaseLeases: number;
+  readonly writerChildLeases: number;
+  readonly writerChildBytes: number;
+  readonly memoryUsedBytes: number;
+  readonly artifacts: number;
+  readonly openFiles: number;
+  readonly spoolReservedBytes: number;
+  readonly spoolActualBytes: number;
+}
+
+export interface SegmentSpoolingBenchmarkTestHooks {
+  readonly failAt?: SegmentSpoolingBenchmarkStage;
+  readonly onStage?: (
+    stage: SegmentSpoolingBenchmarkStage,
+    details: { readonly segmentIndex: number; readonly chunkIndex?: number }
+  ) => void;
+  readonly onSettled?: (
+    snapshot: SegmentSpoolingBenchmarkOwnershipSnapshot
+  ) => void;
 }
 
 export interface SegmentSpoolingBenchmarkResult {
   readonly configuration: {
     readonly segmentBytes: number;
-    readonly chunkBytes: number;
+    readonly decoderChunkBytes: number;
+    readonly writerChunkBytes: number;
     readonly prefetchSegments: number;
     readonly maxConcurrentDownloads: number;
     readonly memoryBudgetBytes: number;
@@ -72,6 +109,11 @@ export interface SegmentSpoolingBenchmarkResult {
     readonly activeDownloadsPeak: number;
     readonly downloadMemoryLeasesPeak: number;
     readonly downloadMemoryLeasesFinal: number;
+    readonly writerChildLeasesPeak: number;
+    readonly writerChildLeasesFinal: number;
+    readonly writerChildBytesPeak: number;
+    readonly writerChildBytesFinal: number;
+    readonly writerChildReleasedWhileBaseLeaseHeld: boolean;
     readonly completedReadAheadPeak: number;
     readonly slowConsumerYields: number;
     readonly completionWasOutOfOrder: boolean;
@@ -210,12 +252,13 @@ class DeterministicCompletionWaves {
 function benchmarkPlan(
   totalBytes: number,
   segmentBytes: number,
-  chunkBytes: number,
+  writerChunkBytes: number,
   prefetchSegments: number,
   maxConcurrentDownloads: number,
   memoryBudgetBytes: number
 ): SegmentSpoolingPlan {
-  const writerQueueBytes = Math.max(4 * chunkBytes, 256 * KIBIBYTE_BYTES);
+  const downloadMemory = resolveSegmentSpoolingDownloadMemoryPlan();
+  const writerQueueBytes = Math.max(4 * writerChunkBytes, 256 * KIBIBYTE_BYTES);
   const readAheadBytes = Math.min(totalBytes, prefetchSegments * segmentBytes);
   const spoolBytes = Math.max(
     64 * MEBIBYTE_BYTES,
@@ -229,10 +272,10 @@ function benchmarkPlan(
     perStreamBufferBytes: 2 * MEBIBYTE_BYTES,
     spoolBytes,
     minFreeDiskBytes: 0,
-    decoderChunkBytes: chunkBytes,
+    decoderChunkBytes: downloadMemory.decoderChunkBytes,
     writerQueueBytes,
     readerHighWaterMarkBytes: 256 * KIBIBYTE_BYTES,
-    perDownloadBaseLeaseBytes: 2 * chunkBytes + NNTP_READ_CARRY_MAX_BYTES,
+    perDownloadBaseLeaseBytes: downloadMemory.perDownloadBaseLeaseBytes,
     maxOpenSpoolFiles: Math.max(64, maxConcurrentDownloads + 4),
     orphanTtlMs: 60_000,
   };
@@ -241,21 +284,22 @@ function benchmarkPlan(
 /**
  * Derive a deadlock-free producer ceiling from every hard owner that may exist
  * while one simulated BODY is active. The real stream lease is acquired as one
- * window; each admitted producer additionally owns its production-equivalent
- * decoder/sink/carry lease and may have one writer chunk in flight.
+ * window; each admitted producer additionally owns its production decoder,
+ * sink and TLS-carry base lease. Writer chunks are logical children inside
+ * that already reserved base window and therefore are not subtracted again.
  */
 function resolveBenchmarkDownloadLimit(
   plan: SegmentSpoolingPlan,
-  chunkBytes: number,
   maxConcurrentDownloads: number,
   segmentCount: number
 ): { readonly streamMemoryBytes: number; readonly downloads: number } {
   const streamMemoryBytes = resolveSegmentStreamMemoryBytes(
     plan.readerHighWaterMarkBytes
   );
-  const perDownloadBytes = plan.perDownloadBaseLeaseBytes + chunkBytes;
   const availableBytes = plan.memoryBudgetBytes - streamMemoryBytes;
-  const memoryLimited = Math.floor(availableBytes / perDownloadBytes);
+  const memoryLimited = Math.floor(
+    availableBytes / plan.perDownloadBaseLeaseBytes
+  );
   const downloads = Math.min(
     maxConcurrentDownloads,
     segmentCount,
@@ -282,32 +326,127 @@ function fillChunk(
   index: number,
   offset: number,
   bytes: number,
-  chunkBytes: number
+  writerChunkBytes: number
 ): Buffer {
-  return Buffer.alloc(bytes, (index + Math.floor(offset / chunkBytes)) % 251);
+  return Buffer.alloc(
+    bytes,
+    (index + Math.floor(offset / writerChunkBytes)) % 251
+  );
 }
 
 function expectedChecksum(
   segmentCount: number,
   totalBytes: number,
   segmentBytes: number,
-  chunkBytes: number
+  writerChunkBytes: number
 ): string {
   const hash = createHash('sha256');
   for (let index = 0; index < segmentCount; index++) {
     const length = segmentLength(index, segmentCount, totalBytes, segmentBytes);
-    for (let offset = 0; offset < length; offset += chunkBytes) {
+    for (let offset = 0; offset < length; offset += writerChunkBytes) {
       hash.update(
         fillChunk(
           index,
           offset,
-          Math.min(chunkBytes, length - offset),
-          chunkBytes
+          Math.min(writerChunkBytes, length - offset),
+          writerChunkBytes
         )
       );
     }
   }
   return hash.digest('hex');
+}
+
+interface BenchmarkWriterChildLease {
+  readonly lease: ByteLease;
+  readonly released: Promise<void>;
+}
+
+/**
+ * One globally leased production download window with exactly one possible
+ * writer child. The child is accounting-only: its bytes are already covered
+ * by `baseLease` and must never acquire the global ByteBudget a second time.
+ */
+class BenchmarkDownloadMemoryWindow {
+  private writerChildBytes = 0;
+  private writerChildLeases = 0;
+  private activeChild: PromiseWithResolvers<void> | undefined;
+  private closing = false;
+  private released = false;
+  private closePromise: Promise<void> | undefined;
+
+  constructor(
+    private readonly baseLease: ByteLease,
+    private readonly maxWriterChildBytes: number,
+    private readonly onChildAcquired: (bytes: number) => void,
+    private readonly onChildReleased: (bytes: number) => void
+  ) {
+    assert(Number.isSafeInteger(maxWriterChildBytes));
+    assert(maxWriterChildBytes > 0);
+    assert(baseLease.bytes >= maxWriterChildBytes);
+    this.assertInvariants();
+  }
+
+  acquireWriterChild(bytes: number): BenchmarkWriterChildLease {
+    assert(!this.closing);
+    assert(!this.released);
+    assert.equal(this.writerChildLeases, 0);
+    assert(Number.isSafeInteger(bytes));
+    assert(bytes > 0);
+    assert(bytes <= this.maxWriterChildBytes);
+
+    const settled = Promise.withResolvers<void>();
+    this.activeChild = settled;
+    this.writerChildLeases = 1;
+    this.writerChildBytes = bytes;
+    this.onChildAcquired(bytes);
+    this.assertInvariants();
+
+    let childReleased = false;
+    return {
+      lease: {
+        bytes,
+        release: () => {
+          if (childReleased) return;
+          childReleased = true;
+          this.writerChildLeases = 0;
+          this.writerChildBytes = 0;
+          this.onChildReleased(bytes);
+          this.assertInvariants();
+          settled.resolve();
+        },
+      },
+      released: settled.promise,
+    };
+  }
+
+  close(): Promise<void> {
+    if (!this.closePromise) this.closePromise = this.closeOnce();
+    return this.closePromise;
+  }
+
+  private async closeOnce(): Promise<void> {
+    this.closing = true;
+    await this.activeChild?.promise;
+    this.assertInvariants();
+    assert.equal(this.writerChildLeases, 0);
+    assert.equal(this.writerChildBytes, 0);
+    this.released = true;
+    this.baseLease.release();
+    this.assertInvariants();
+  }
+
+  private assertInvariants(): void {
+    assert(Number.isSafeInteger(this.writerChildBytes));
+    assert(this.writerChildBytes >= 0);
+    assert(this.writerChildBytes <= this.maxWriterChildBytes);
+    assert(this.writerChildLeases === 0 || this.writerChildLeases === 1);
+    assert.equal(this.writerChildBytes === 0, this.writerChildLeases === 0);
+    if (this.released) {
+      assert.equal(this.writerChildBytes, 0);
+      assert.equal(this.writerChildLeases, 0);
+    }
+  }
 }
 
 /** Bounded producer used by the real ordered spooling Readable. */
@@ -317,11 +456,16 @@ class BenchmarkArtifactSource implements SpoolingSegmentArtifactSource {
   private readonly tasks = new Set<Promise<void>>();
   private activeDownloads = 0;
   private downloadMemoryLeases = 0;
+  private writerChildLeases = 0;
+  private writerChildBytes = 0;
   private completedOwned = 0;
   private cleanupCause: SegmentStreamCleanupCause | undefined;
   readonly completionOrder: number[] = [];
   activeDownloadsPeak = 0;
   downloadMemoryLeasesPeak = 0;
+  writerChildLeasesPeak = 0;
+  writerChildBytesPeak = 0;
+  writerChildReleasedWhileBaseLeaseHeld = false;
   completedReadAheadPeak = 0;
 
   constructor(
@@ -329,11 +473,13 @@ class BenchmarkArtifactSource implements SpoolingSegmentArtifactSource {
     private readonly memory: ByteBudget,
     private readonly totalBytes: number,
     private readonly segmentBytes: number,
-    private readonly chunkBytes: number,
+    private readonly writerChunkBytes: number,
+    private readonly decoderChunkBytes: number,
     private readonly perDownloadBaseLeaseBytes: number,
     private readonly segmentCount: number,
     effectiveDownloadLimit: number,
-    private readonly sampleMemory: () => void
+    private readonly sampleMemory: () => void,
+    private readonly testHooks: SegmentSpoolingBenchmarkTestHooks | undefined
   ) {
     this.downloads = new PrioritySemaphore(effectiveDownloadLimit);
     this.waves = new DeterministicCompletionWaves(
@@ -382,6 +528,12 @@ class BenchmarkArtifactSource implements SpoolingSegmentArtifactSource {
       releaseDownload();
       throw error;
     }
+    const downloadMemoryWindow = new BenchmarkDownloadMemoryWindow(
+      downloadMemoryLease,
+      this.decoderChunkBytes,
+      (bytes) => this.writerChildAcquired(bytes),
+      (bytes) => this.writerChildReleased(bytes)
+    );
     this.downloadMemoryLeases++;
     this.downloadMemoryLeasesPeak = Math.max(
       this.downloadMemoryLeasesPeak,
@@ -392,8 +544,21 @@ class BenchmarkArtifactSource implements SpoolingSegmentArtifactSource {
       this.activeDownloadsPeak,
       this.activeDownloads
     );
+    let downloadOwnershipReleased = false;
+    const releaseDownloadOwnership = async (): Promise<void> => {
+      if (downloadOwnershipReleased) return;
+      downloadOwnershipReleased = true;
+      try {
+        await downloadMemoryWindow.close();
+      } finally {
+        this.activeDownloads--;
+        this.downloadMemoryLeases--;
+        releaseDownload();
+      }
+    };
     let artifact;
     try {
+      this.reachStage('artifact-create', index, signal);
       artifact = await this.manager.createArtifact({
         sessionId: 'benchmark-session',
         segmentId: segment.messageId,
@@ -402,10 +567,7 @@ class BenchmarkArtifactSource implements SpoolingSegmentArtifactSource {
         priority,
       });
     } catch (error) {
-      this.activeDownloads--;
-      this.downloadMemoryLeases--;
-      downloadMemoryLease.release();
-      releaseDownload();
+      await releaseDownloadOwnership();
       throw error;
     }
     const completion = Promise.withResolvers<typeof metadata>();
@@ -430,14 +592,22 @@ class BenchmarkArtifactSource implements SpoolingSegmentArtifactSource {
       ownership,
       completion,
       signal,
-      priority
-    ).finally(() => {
-      this.activeDownloads--;
-      this.downloadMemoryLeases--;
-      downloadMemoryLease.release();
-      releaseDownload();
-    });
-    const settled = producer.then(
+      downloadMemoryWindow
+    );
+    const delivery = options.allowGrowing
+      ? producer.finally(releaseDownloadOwnership).then(() => adapter)
+      : (async () => {
+          try {
+            await producer;
+            return adapter;
+          } catch (error) {
+            await adapter.release();
+            throw error;
+          } finally {
+            await releaseDownloadOwnership();
+          }
+        })();
+    const settled = delivery.then(
       () => undefined,
       () => undefined
     );
@@ -445,16 +615,10 @@ class BenchmarkArtifactSource implements SpoolingSegmentArtifactSource {
     void settled.finally(() => this.tasks.delete(settled));
 
     if (options.allowGrowing) {
-      void producer.catch(() => undefined);
+      void delivery.catch(() => undefined);
       return adapter;
     }
-    try {
-      await producer;
-      return adapter;
-    } catch (error) {
-      await adapter.release();
-      throw error;
-    }
+    return await delivery;
   }
 
   acquireSegmentStreamMemory(
@@ -479,13 +643,91 @@ class BenchmarkArtifactSource implements SpoolingSegmentArtifactSource {
     if (this.cleanupCause !== 'eof') {
       throw new Error(`benchmark stream cleanup was ${this.cleanupCause}`);
     }
-    if (this.activeDownloads !== 0 || this.downloadMemoryLeases !== 0) {
+    if (
+      this.activeDownloads !== 0 ||
+      this.downloadMemoryLeases !== 0 ||
+      this.writerChildLeases !== 0 ||
+      this.writerChildBytes !== 0
+    ) {
       throw new Error('benchmark download ownership did not settle to zero');
     }
   }
 
   get downloadMemoryLeasesFinal(): number {
     return this.downloadMemoryLeases;
+  }
+
+  get writerChildLeasesFinal(): number {
+    return this.writerChildLeases;
+  }
+
+  get writerChildBytesFinal(): number {
+    return this.writerChildBytes;
+  }
+
+  ownershipSnapshot(
+    memoryUsedBytes: number,
+    manager: ReturnType<SpoolManager['stats']>
+  ): SegmentSpoolingBenchmarkOwnershipSnapshot {
+    return {
+      activeDownloads: this.activeDownloads,
+      downloadBaseLeases: this.downloadMemoryLeases,
+      writerChildLeases: this.writerChildLeases,
+      writerChildBytes: this.writerChildBytes,
+      memoryUsedBytes,
+      artifacts: manager.artifacts,
+      openFiles: manager.files.openFiles,
+      spoolReservedBytes: manager.budget.reservedBytes,
+      spoolActualBytes: manager.budget.actualBytes,
+    };
+  }
+
+  private writerChildAcquired(bytes: number): void {
+    assert(this.downloadMemoryLeases > 0);
+    this.writerChildLeases++;
+    this.writerChildBytes += bytes;
+    this.writerChildLeasesPeak = Math.max(
+      this.writerChildLeasesPeak,
+      this.writerChildLeases
+    );
+    this.writerChildBytesPeak = Math.max(
+      this.writerChildBytesPeak,
+      this.writerChildBytes
+    );
+    this.assertWriterChildInvariants();
+  }
+
+  private writerChildReleased(bytes: number): void {
+    assert(this.downloadMemoryLeases > 0);
+    this.writerChildReleasedWhileBaseLeaseHeld = true;
+    this.writerChildLeases--;
+    this.writerChildBytes -= bytes;
+    this.assertWriterChildInvariants();
+  }
+
+  private assertWriterChildInvariants(): void {
+    assert(Number.isSafeInteger(this.writerChildLeases));
+    assert(Number.isSafeInteger(this.writerChildBytes));
+    assert(this.writerChildLeases >= 0);
+    assert(this.writerChildLeases <= this.activeDownloads);
+    assert(this.writerChildBytes >= 0);
+    assert(
+      this.writerChildBytes <= this.writerChildLeases * this.decoderChunkBytes
+    );
+    assert.equal(this.writerChildBytes === 0, this.writerChildLeases === 0);
+  }
+
+  private reachStage(
+    stage: SegmentSpoolingBenchmarkStage,
+    segmentIndex: number,
+    signal: AbortSignal | undefined,
+    chunkIndex?: number
+  ): void {
+    this.testHooks?.onStage?.(stage, { segmentIndex, chunkIndex });
+    if (signal?.aborted) throw abortError(signal);
+    if (segmentIndex === 0 && this.testHooks?.failAt === stage) {
+      throw new Error(`Injected benchmark failure at ${stage}`);
+    }
   }
 
   private async produce(
@@ -501,7 +743,7 @@ class BenchmarkArtifactSource implements SpoolingSegmentArtifactSource {
       readonly size: number;
     }>,
     signal: AbortSignal | undefined,
-    priority: CommandPriority
+    downloadMemoryWindow: BenchmarkDownloadMemoryWindow
   ): Promise<void> {
     const wave = this.waves.arrive(index);
     let offset = 0;
@@ -515,7 +757,7 @@ class BenchmarkArtifactSource implements SpoolingSegmentArtifactSource {
           offset,
           length,
           signal,
-          priority
+          downloadMemoryWindow
         );
       }
       await awaitAbortable(wave.proceed, signal);
@@ -526,9 +768,10 @@ class BenchmarkArtifactSource implements SpoolingSegmentArtifactSource {
           offset,
           length,
           signal,
-          priority
+          downloadMemoryWindow
         );
       }
+      this.reachStage('artifact-complete', index, signal);
       await artifact.complete();
       ownership.completed = true;
       this.completedOwned++;
@@ -564,17 +807,25 @@ class BenchmarkArtifactSource implements SpoolingSegmentArtifactSource {
     offset: number,
     length: number,
     signal: AbortSignal | undefined,
-    priority: CommandPriority
+    downloadMemoryWindow: BenchmarkDownloadMemoryWindow
   ): Promise<number> {
-    const bytes = Math.min(this.chunkBytes, length - offset);
-    const lease = await this.memory.acquire(bytes, { signal, priority });
-    const chunk = fillChunk(index, offset, bytes, this.chunkBytes);
+    const bytes = Math.min(this.writerChunkBytes, length - offset);
+    const chunkIndex = Math.floor(offset / this.writerChunkBytes);
+    this.reachStage(
+      offset === 0 ? 'first-writer-chunk' : 'later-writer-chunk',
+      index,
+      signal,
+      chunkIndex
+    );
+    const child = downloadMemoryWindow.acquireWriterChild(bytes);
     try {
-      if (!artifact.write(chunk, lease)) {
-        await new Promise<void>((resolve) => artifact.onceDrain(resolve));
-      }
+      this.reachStage('writer-child-acquired', index, signal, chunkIndex);
+      const chunk = fillChunk(index, offset, bytes, this.writerChunkBytes);
+      artifact.write(chunk, child.lease);
+      await child.released;
     } catch (error) {
-      lease.release();
+      child.lease.release();
+      await child.released;
       throw error;
     }
     this.sampleMemory();
@@ -598,7 +849,7 @@ export async function runSegmentSpoolingBenchmark(
     options.totalBytes ?? DEFAULT_SEGMENTS * segmentBytes,
     'totalBytes'
   );
-  const chunkBytes = positiveInteger(
+  const writerChunkBytes = positiveInteger(
     options.chunkBytes ?? DEFAULT_CHUNK_BYTES,
     'chunkBytes'
   );
@@ -614,21 +865,22 @@ export async function runSegmentSpoolingBenchmark(
     options.memoryBudgetBytes ?? 16 * MEBIBYTE_BYTES,
     'memoryBudgetBytes'
   );
-  if (chunkBytes > Math.min(segmentBytes, DEFAULT_CHUNK_BYTES)) {
-    throw new Error('chunkBytes cannot exceed the segment size or 64 KiB');
-  }
   const segmentCount = Math.ceil(totalBytes / segmentBytes);
   const plan = benchmarkPlan(
     totalBytes,
     segmentBytes,
-    chunkBytes,
+    writerChunkBytes,
     prefetchSegments,
     maxConcurrentDownloads,
     memoryBudgetBytes
   );
+  if (writerChunkBytes > Math.min(segmentBytes, plan.decoderChunkBytes)) {
+    throw new Error(
+      'chunkBytes cannot exceed the segment size or production decoder chunk'
+    );
+  }
   const admission = resolveBenchmarkDownloadLimit(
     plan,
-    chunkBytes,
     maxConcurrentDownloads,
     segmentCount
   );
@@ -646,7 +898,7 @@ export async function runSegmentSpoolingBenchmark(
     segmentCount,
     totalBytes,
     segmentBytes,
-    chunkBytes
+    writerChunkBytes
   );
   const before = process.memoryUsage();
   const eventLoopDelay = monitorEventLoopDelay({ resolution: 10 });
@@ -668,11 +920,13 @@ export async function runSegmentSpoolingBenchmark(
     memory,
     totalBytes,
     segmentBytes,
-    chunkBytes,
+    writerChunkBytes,
+    plan.decoderChunkBytes,
     plan.perDownloadBaseLeaseBytes,
     segmentCount,
     admission.downloads,
-    sampleMemory
+    sampleMemory,
+    options.testHooks
   );
   const segments: NzbSegmentRef[] = Array.from(
     { length: segmentCount },
@@ -691,6 +945,7 @@ export async function runSegmentSpoolingBenchmark(
     fileEndByte: totalBytes,
     layoutHint: 'global-range',
     priority: CommandPriority.High,
+    signal: options.signal,
     sizeForSegment: (index) =>
       segmentLength(index, segmentCount, totalBytes, segmentBytes),
     byteRangeForSegment: (index) => {
@@ -727,6 +982,13 @@ export async function runSegmentSpoolingBenchmark(
     await manager.close().catch((error: unknown) => {
       benchmarkError ??= error;
     });
+    try {
+      options.testHooks?.onSettled?.(
+        source.ownershipSnapshot(memory.stats().usedBytes, manager.stats())
+      );
+    } catch (error) {
+      benchmarkError ??= error;
+    }
     memory.close();
     await fs.rm(cacheRoot, { recursive: true, force: true });
   }
@@ -753,7 +1015,11 @@ export async function runSegmentSpoolingBenchmark(
   if (
     source.activeDownloadsPeak > admission.downloads ||
     source.downloadMemoryLeasesPeak > admission.downloads ||
-    source.downloadMemoryLeasesFinal !== 0
+    source.downloadMemoryLeasesFinal !== 0 ||
+    source.writerChildLeasesPeak > admission.downloads ||
+    source.writerChildLeasesFinal !== 0 ||
+    source.writerChildBytesFinal !== 0 ||
+    !source.writerChildReleasedWhileBaseLeaseHeld
   ) {
     throw new Error('benchmark download memory admission invariant failed');
   }
@@ -776,7 +1042,8 @@ export async function runSegmentSpoolingBenchmark(
   return {
     configuration: {
       segmentBytes,
-      chunkBytes,
+      decoderChunkBytes: plan.decoderChunkBytes,
+      writerChunkBytes,
       prefetchSegments,
       maxConcurrentDownloads,
       memoryBudgetBytes,
@@ -812,6 +1079,12 @@ export async function runSegmentSpoolingBenchmark(
       activeDownloadsPeak: source.activeDownloadsPeak,
       downloadMemoryLeasesPeak: source.downloadMemoryLeasesPeak,
       downloadMemoryLeasesFinal: source.downloadMemoryLeasesFinal,
+      writerChildLeasesPeak: source.writerChildLeasesPeak,
+      writerChildLeasesFinal: source.writerChildLeasesFinal,
+      writerChildBytesPeak: source.writerChildBytesPeak,
+      writerChildBytesFinal: source.writerChildBytesFinal,
+      writerChildReleasedWhileBaseLeaseHeld:
+        source.writerChildReleasedWhileBaseLeaseHeld,
       completedReadAheadPeak: source.completedReadAheadPeak,
       slowConsumerYields,
       completionWasOutOfOrder,
