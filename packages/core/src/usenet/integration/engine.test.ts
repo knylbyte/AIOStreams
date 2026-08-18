@@ -6,7 +6,11 @@ import {
   type UsenetEngineRuntimeSettings,
 } from './engine.js';
 import { UsenetResourcePlanConfigError } from '../resource-plan.js';
-import { DEFAULT_ENGINE_OPTIONS, type ProviderConfig } from '../types.js';
+import {
+  DEFAULT_ENGINE_OPTIONS,
+  providerSetFingerprint,
+  type ProviderConfig,
+} from '../types.js';
 import { usenetSchema } from '../../config/schema/usenet.js';
 import type { SeekableStream } from '../pool/file-stream.js';
 import type { Nzb } from '../nzb/model.js';
@@ -28,6 +32,20 @@ const providers: ProviderConfig[] = [
     priority: 0,
   },
 ];
+
+test('provider fingerprint reports and normalizes the effective default pipeline depth', () => {
+  const withoutDepth: ProviderConfig = {
+    ...providers[0],
+    pipelineDepth: undefined,
+  };
+  const explicitOne: ProviderConfig = { ...withoutDepth, pipelineDepth: 1 };
+  const implicitFingerprint = providerSetFingerprint([withoutDepth], 'secret');
+  assert.equal(
+    implicitFingerprint,
+    providerSetFingerprint([explicitOne], 'secret')
+  );
+  assert.match(implicitFingerprint, /"pipelineDepth":1/);
+});
 
 class BarrierReader extends Readable {
   readonly destroyEntered = Promise.withResolvers<void>();
@@ -276,6 +294,9 @@ test('engine live stats expose the effective buffering resource plan', async () 
     maxBytes: 0,
     peakBytes: 0,
     waiting: 0,
+    carryBytes: 0,
+    carryChunks: 0,
+    carryLimitBytes: 0,
   });
   assert.equal(
     snapshot.resources.arena.budgetBytes,

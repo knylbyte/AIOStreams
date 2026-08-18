@@ -6,6 +6,7 @@ import { monitorEventLoopDelay, performance } from 'node:perf_hooks';
 import { pathToFileURL } from 'node:url';
 import '../../config/index.js';
 import type { SegmentSpoolingPlan } from '../resource-plan.js';
+import { NNTP_READ_CARRY_MAX_BYTES } from '../nntp/read-carry.js';
 import { GrowingSpoolArtifactAdapter } from '../pool/segment-artifact.js';
 import type {
   SegmentArtifact,
@@ -217,7 +218,7 @@ function benchmarkPlan(
     decoderChunkBytes: chunkBytes,
     writerQueueBytes,
     readerHighWaterMarkBytes: 256 * KIBIBYTE_BYTES,
-    perDownloadBaseLeaseBytes: writerQueueBytes,
+    perDownloadBaseLeaseBytes: 2 * chunkBytes + NNTP_READ_CARRY_MAX_BYTES,
     maxOpenSpoolFiles: Math.max(64, maxConcurrentDownloads + 4),
     orphanTtlMs: 60_000,
   };

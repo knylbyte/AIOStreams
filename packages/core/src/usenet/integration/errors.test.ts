@@ -3,7 +3,11 @@ import test from 'node:test';
 import { UsenetSpoolError } from '../spool/errors.js';
 import { NntpError } from '../nntp/errors.js';
 import { YencDecodeError, YencMetadataError } from '../pool/yenc.js';
-import { friendlyUsenetError, toDebridError } from './errors.js';
+import {
+  describeUsenetError,
+  friendlyUsenetError,
+  toDebridError,
+} from './errors.js';
 
 test('maps spool disk exhaustion to a clear stable user error', () => {
   const error = new UsenetSpoolError(
@@ -73,6 +77,10 @@ test('maps decode, seek-metadata and local-backpressure failures distinctly', ()
       }),
       code: 'USENET_STREAMING_BACKPRESSURE_TIMEOUT',
     },
+    {
+      error: new NntpError('local_backpressure', 'internal'),
+      code: 'USENET_STREAMING_LOCAL_BACKPRESSURE',
+    },
   ];
   for (const item of errors) {
     assert.equal(friendlyUsenetError(item.error).code, item.code);
@@ -80,4 +88,29 @@ test('maps decode, seek-metadata and local-backpressure failures distinctly', ()
     assert.equal(mapped.statusCode, 502);
     assert.deepEqual(mapped.body, { usenetCode: item.code });
   }
+});
+
+test('extracts safe root-cause fields through the public error wrapper', () => {
+  const root = new NntpError('local_backpressure', 'sensitive internal text', {
+    provider: 'provider-label',
+    connId: 17,
+    carryBytes: 786_432,
+    carryChunks: 3,
+    carryLimitBytes: 1_048_576,
+    localBackpressureMs: 42,
+  });
+  const wrapped = toDebridError(root);
+  assert.deepEqual(describeUsenetError(wrapped), {
+    rootErrorName: 'NntpError',
+    rootCode: undefined,
+    nntpKind: 'local_backpressure',
+    timeoutSource: undefined,
+    faultDomain: 'local',
+    providerLabel: 'provider-label',
+    connId: 17,
+    localBackpressureMs: 42,
+    carryBytes: 786_432,
+    carryChunks: 3,
+    carryLimitBytes: 1_048_576,
+  });
 });

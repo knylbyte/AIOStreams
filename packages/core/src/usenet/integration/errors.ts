@@ -190,13 +190,18 @@ export function friendlyUsenetError(err: unknown): {
   }
   if (
     err instanceof NntpError &&
-    err.kind === 'timeout' &&
-    err.timeoutSource === 'local_backpressure'
+    (err.kind === 'local_backpressure' ||
+      (err.kind === 'timeout' && err.timeoutSource === 'local_backpressure'))
   ) {
     return {
       reason:
-        'The Usenet segment exceeded its total time limit while local disk or player backpressure was active.',
-      code: 'USENET_STREAMING_BACKPRESSURE_TIMEOUT',
+        err.kind === 'local_backpressure'
+          ? 'The local Usenet transport exceeded its bounded backpressure window.'
+          : 'The Usenet segment exceeded its total time limit while local disk or player backpressure was active.',
+      code:
+        err.kind === 'local_backpressure'
+          ? 'USENET_STREAMING_LOCAL_BACKPRESSURE'
+          : 'USENET_STREAMING_BACKPRESSURE_TIMEOUT',
     };
   }
   return {
@@ -263,8 +268,8 @@ export function toDebridError(err: unknown): DebridError {
     err instanceof YencDecodeError ||
     err instanceof YencMetadataError ||
     (err instanceof NntpError &&
-      err.kind === 'timeout' &&
-      err.timeoutSource === 'local_backpressure')
+      (err.kind === 'local_backpressure' ||
+        (err.kind === 'timeout' && err.timeoutSource === 'local_backpressure')))
   ) {
     const friendly = friendlyUsenetError(err);
     return new DebridError(friendly.reason, {
@@ -289,4 +294,58 @@ export function toDebridError(err: unknown): DebridError {
       cause: err,
     }
   );
+}
+
+export interface UsenetErrorLogDetails {
+  readonly rootErrorName: string;
+  readonly rootCode?: string | number;
+  readonly nntpKind?: NntpError['kind'];
+  readonly timeoutSource?: NntpError['timeoutSource'];
+  readonly faultDomain?: NntpError['faultDomain'];
+  readonly providerLabel?: string;
+  readonly connId?: number;
+  readonly localBackpressureMs?: number;
+  readonly carryBytes?: number;
+  readonly carryChunks?: number;
+  readonly carryLimitBytes?: number;
+}
+
+function stableErrorCode(error: Error): string | number | undefined {
+  if (!('code' in error)) return undefined;
+  const code = error.code;
+  return typeof code === 'string' || typeof code === 'number'
+    ? code
+    : undefined;
+}
+
+/**
+ * Extract a bounded, credential-free cause-chain summary for server logs.
+ * Message text is deliberately omitted because upstream errors may contain a
+ * command, URL or path. Cycles and exotic `cause` values terminate the walk.
+ */
+export function describeUsenetError(error: unknown): UsenetErrorLogDetails {
+  let current = error instanceof Error ? error : new Error('Unknown error');
+  let root = current;
+  let nntp: NntpError | undefined;
+  const seen = new Set<Error>();
+  for (let depth = 0; depth < 8 && !seen.has(current); depth++) {
+    seen.add(current);
+    root = current;
+    if (!nntp && current instanceof NntpError) nntp = current;
+    if (!('cause' in current) || !(current.cause instanceof Error)) break;
+    current = current.cause;
+  }
+  return {
+    rootErrorName: root.name,
+    rootCode: stableErrorCode(root),
+    nntpKind: nntp?.kind,
+    timeoutSource: nntp?.timeoutSource,
+    faultDomain: nntp?.faultDomain,
+    providerLabel: nntp?.provider,
+    connId: nntp?.connId,
+    localBackpressureMs: nntp?.localBackpressureMs,
+    carryBytes: nntp?.carryBytes,
+    carryChunks: nntp?.carryChunks,
+    carryLimitBytes: nntp?.carryLimitBytes,
+  };
 }

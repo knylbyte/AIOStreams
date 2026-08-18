@@ -994,8 +994,8 @@ test('a decoder failure after expected payload bytes cannot become successful EO
   });
   await allBytes.promise;
   const expectedFailure = assert.rejects(readerResult, (error: unknown) => {
-    assert(error instanceof UsenetSpoolError);
-    assert.equal(error.code, 'USENET_SPOOL_IO');
+    assert(error instanceof YencDecodeError);
+    assert.equal(error.code, 'no_end_found');
     return true;
   });
   failGate.resolve();
@@ -1075,7 +1075,7 @@ test('a published growing attempt fails without mixing backup-provider bytes', a
     reader.once('error', reject);
   });
   await firstData.promise;
-  const expectedFailure = assert.rejects(readerResult, UsenetSpoolError);
+  const expectedFailure = assert.rejects(readerResult, NntpError);
   fetcher.failFirstAttempt.resolve();
   await fetcher.completed.promise;
   await expectedFailure;
@@ -1118,10 +1118,7 @@ test('a non-growing prefetched waiter retains complete provider failover', async
     currentReader.once('error', reject);
     currentReader.resume();
   });
-  const expectedCurrentFailure = assert.rejects(
-    currentResult,
-    UsenetSpoolError
-  );
+  const expectedCurrentFailure = assert.rejects(currentResult, NntpError);
   fetcher.failFirstAttempt.resolve();
   const future = await futurePromise;
 

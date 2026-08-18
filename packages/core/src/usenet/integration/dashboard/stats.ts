@@ -190,6 +190,9 @@ function emptyResources(options: Partial<EngineOptions>): ResourceStats {
       maxBytes: plan.segmentSpooling?.memoryBudgetBytes ?? 0,
       peakBytes: 0,
       waiting: 0,
+      carryBytes: 0,
+      carryChunks: 0,
+      carryLimitBytes: 0,
     },
     spool: {
       reservedBytes: 0,

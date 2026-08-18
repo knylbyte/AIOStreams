@@ -84,6 +84,9 @@ export interface ResourceStats {
     maxBytes: number;
     peakBytes: number;
     waiting: number;
+    carryBytes: number;
+    carryChunks: number;
+    carryLimitBytes: number;
   };
   spool: {
     reservedBytes: number;

@@ -1,6 +1,6 @@
 import { createLogger } from '../../logging/logger.js';
 import { ConnectionOptions, NntpConnection } from './connection.js';
-import { NntpError } from './errors.js';
+import { NntpError, classifyNntpFailure } from './errors.js';
 import { YencDecodeError, YencMetadataError } from '../pool/yenc.js';
 import { UsenetSpoolError } from '../spool/errors.js';
 import {
@@ -823,6 +823,19 @@ export class ProviderWorkerPool {
       this.dispatch();
       return;
     }
+    // Local transport capacity/deadline failures and caller cancellation can
+    // make this one connection unusable, but say nothing about provider
+    // health. Keep that distinction centralized in the NNTP error contract.
+    if (
+      err instanceof NntpError &&
+      !classifyNntpFailure(err).countsTowardCircuitBreaker &&
+      err.kind !== 'connection_limit'
+    ) {
+      if (slot.conn && !slot.conn.isUsable) slot.conn = null;
+      req.reject(err);
+      this.dispatch();
+      return;
+    }
     // A caller abort before command enqueue is local cancellation for direct
     // and prepared work alike. It leaves a usable provider connection healthy.
     if (
@@ -997,9 +1010,18 @@ export class ProviderWorkerPool {
   info(): ProviderPoolInfo {
     let total = 0;
     let acquired = 0;
+    let readCarryBytes = 0;
+    let readCarryChunks = 0;
+    let readCarryLimitBytes = 0;
     for (const s of this.slots) {
       if (s.conn || s.connecting) total++;
       if (this.slotOccupancy(s) > 0) acquired++;
+      if (s.conn) {
+        const carry = s.conn.readCarryStats;
+        readCarryBytes += carry.bytes;
+        readCarryChunks += carry.chunks;
+        readCarryLimitBytes += carry.limitBytes;
+      }
     }
     return {
       id: this.config.id,
@@ -1016,6 +1038,9 @@ export class ProviderWorkerPool {
       freeSlots: this.freeSlots,
       throughput: Math.round(this.throughputEwma * this.depth * 1000),
       queued: this.prioQ.length + this.normalQ.length,
+      readCarryBytes,
+      readCarryChunks,
+      readCarryLimitBytes,
       lastDialOkAt: this.lastDialOkAt || undefined,
       lastDialError: this.lastDialError,
     };

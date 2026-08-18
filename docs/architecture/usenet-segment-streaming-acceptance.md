@@ -93,11 +93,12 @@ canonical concept itself is unchanged.
 - [x] Startup orphan cleanup is heartbeat/fence protected and emits a structured
       completion record.
 - [x] Stable spool failures map to actionable user and HTTP/debrid errors.
-- [x] Local fake-NNTP E2E coverage includes fragmentation, local backpressure,
-      pipelining, out-of-order completion, ranges, parallel clients, 430
-      failover, injected slow disk, ENOSPC/EACCES, client-only abort cleanup and
-      engine-close cleanup. The parallel-client case starts both readers before
-      the shared BODY completes and aborts one without affecting the other.
+- [x] Local fake-NNTP E2E coverage includes real TLS, 1×1 admission,
+      fragmentation, local backpressure, pipelining, out-of-order completion,
+      ranges, parallel clients, 430 failover, injected slow disk, ENOSPC/EACCES,
+      client-only abort cleanup and engine-close cleanup. The parallel-client
+      case starts both readers before the shared BODY completes and aborts one
+      without affecting the other.
 - [x] `benchmark:segment-spooling` reports `arrayBuffers`, `external`, first
       byte, throughput, event-loop lag and spool/internal-budget peaks. Its
       correctness gates use internal byte budgets, never RSS. The benchmark
@@ -119,6 +120,31 @@ Short diagnostic runs remain selectable through `USENET_BENCHMARK_BYTES`,
 Latency, throughput, V8 memory and event-loop values are diagnostic because
 machine and filesystem variance makes fixed CI thresholds flaky. Internal
 memory/spool ceilings and final-zero ownership remain hard assertions.
+
+## Production TLS smoke test
+
+Use an existing deployment secret/provider configuration; do not put
+credentials in commands, screenshots or logs. Select `segment_spooling`, then
+restart the service before each gate so the effective settings are explicit.
+
+1. **Minimal 1×1:** set provider connections, effective pipeline depth and
+   concurrent downloads to `1`. Continuously read several hundred MiB from a
+   known-good release. Require sustained byte progress, a healthy provider,
+   and no protocol-desync, circuit-breaker or `USENET_SPOOL_IO` event.
+2. **Slow client:** rate-limit the same client, pause it for at least 30 seconds,
+   then resume. Memory and spool values in the Usenet resource dashboard must
+   stay at or below their configured maxima and the resumed bytes must match an
+   unrestricted download.
+3. **Abort/reuse:** abort a paused request and immediately open the same release
+   again. The old request must reach zero memory, spool, artifact, open-file and
+   waiter ownership; the new request must succeed without a local-backpressure
+   circuit penalty.
+4. **Target concurrency:** restore the normal connection, pipeline, download
+   and prefetch values one setting at a time. Repeat the progress, boundedness
+   and byte-identity checks; correctness must not depend on the 1×1 settings.
+
+For diagnosis, capture only the structured Usenet resource and failure fields.
+Redact URLs, tokens, message IDs, provider credentials and spool/cache paths.
 
 ## Intentional boundary / deviation
 

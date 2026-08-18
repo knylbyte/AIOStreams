@@ -20,6 +20,8 @@ export type NntpErrorKind =
   | 'connection_limit'
   /** Connection/socket/timeout problem: transient, retryable. */
   | 'connection'
+  /** Local consumer/backpressure capacity failure; never a provider fault. */
+  | 'local_backpressure'
   /** Command/timeout while reading a response: transient, retryable. */
   | 'timeout'
   /** Group selection failed (411): usually content-level. */
@@ -35,6 +37,14 @@ export type NntpTimeoutSource =
   | 'absolute'
   | 'local_backpressure';
 
+/** Stable ownership domain used by retry, circuit and HTTP observability. */
+export type NntpFaultDomain = 'provider' | 'local' | 'client' | 'content';
+
+export interface NntpFailureClassification {
+  readonly faultDomain: NntpFaultDomain;
+  readonly countsTowardCircuitBreaker: boolean;
+}
+
 export class NntpError extends Error {
   readonly kind: NntpErrorKind;
   /** NNTP numeric status code, when one was received. */
@@ -43,6 +53,12 @@ export class NntpError extends Error {
   readonly provider?: string;
   /** Present only when {@link kind} is `timeout`. */
   readonly timeoutSource?: NntpTimeoutSource;
+  readonly faultDomain: NntpFaultDomain;
+  readonly connId?: number;
+  readonly localBackpressureMs?: number;
+  readonly carryBytes?: number;
+  readonly carryChunks?: number;
+  readonly carryLimitBytes?: number;
   cause?: unknown;
 
   constructor(
@@ -52,6 +68,12 @@ export class NntpError extends Error {
       code?: number;
       provider?: string;
       timeoutSource?: NntpTimeoutSource;
+      faultDomain?: NntpFaultDomain;
+      connId?: number;
+      localBackpressureMs?: number;
+      carryBytes?: number;
+      carryChunks?: number;
+      carryLimitBytes?: number;
       cause?: unknown;
     } = {}
   ) {
@@ -61,9 +83,52 @@ export class NntpError extends Error {
     this.code = opts.code;
     this.provider = opts.provider;
     this.timeoutSource = opts.timeoutSource;
+    this.faultDomain =
+      opts.faultDomain ??
+      inferNntpFaultDomain(kind, message, opts.timeoutSource);
+    this.connId = opts.connId;
+    this.localBackpressureMs = opts.localBackpressureMs;
+    this.carryBytes = opts.carryBytes;
+    this.carryChunks = opts.carryChunks;
+    this.carryLimitBytes = opts.carryLimitBytes;
     if (opts.cause !== undefined) this.cause = opts.cause;
     if (Error.captureStackTrace) Error.captureStackTrace(this, NntpError);
   }
+}
+
+function inferNntpFaultDomain(
+  kind: NntpErrorKind,
+  message: string,
+  timeoutSource: NntpTimeoutSource | undefined
+): NntpFaultDomain {
+  if (kind === 'article_not_found' || kind === 'no_such_group') {
+    return 'content';
+  }
+  if (kind === 'local_backpressure' || timeoutSource === 'local_backpressure') {
+    return 'local';
+  }
+  if (kind === 'connection' && message === 'aborted') return 'client';
+  if (kind === 'no_providers') return 'local';
+  return 'provider';
+}
+
+/**
+ * Central NNTP circuit-breaker classification. Content outcomes, caller
+ * cancellation, account-capacity throttling and all local backpressure paths
+ * never make a provider unhealthy.
+ */
+export function classifyNntpFailure(
+  error: NntpError
+): NntpFailureClassification {
+  const countsTowardCircuitBreaker =
+    error.faultDomain === 'provider' &&
+    error.kind !== 'article_not_found' &&
+    error.kind !== 'connection_limit' &&
+    error.kind !== 'no_providers';
+  return {
+    faultDomain: error.faultDomain,
+    countsTowardCircuitBreaker,
+  };
 }
 
 /**
@@ -107,7 +172,7 @@ export function definitiveLossKind(err: unknown): HoleKind | undefined {
  * limit). A connection-limit hit is transient backpressure: the same request
  * succeeds once the pool stops dialing past the account ceiling.
  */
-export function isTransientNntpError(err: unknown): boolean {
+export function isTransientNntpError(err: unknown): err is NntpError {
   if (err instanceof NntpError) {
     return (
       err.kind === 'connection' ||
@@ -125,13 +190,14 @@ export function isTransientNntpError(err: unknown): boolean {
  * *retryably* instead of mislabeling articles as missing or poisoning the entry.
  */
 export function isProviderUnavailableError(err: unknown): boolean {
+  if (!(err instanceof NntpError)) return false;
+  if (err.faultDomain === 'client' || err.faultDomain === 'local') return false;
   return (
-    err instanceof NntpError &&
-    (err.kind === 'connection_limit' ||
-      err.kind === 'auth_failed' ||
-      err.kind === 'no_providers' ||
-      err.kind === 'connection' ||
-      err.kind === 'timeout')
+    err.kind === 'connection_limit' ||
+    err.kind === 'auth_failed' ||
+    err.kind === 'no_providers' ||
+    err.kind === 'connection' ||
+    err.kind === 'timeout'
   );
 }
 

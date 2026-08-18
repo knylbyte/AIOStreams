@@ -79,6 +79,11 @@ export interface ResourceStats {
     maxBytes: number;
     peakBytes: number;
     waiting: number;
+    /** Actual owned TLS/onread late-callback payload within `usedBytes`. */
+    carryBytes: number;
+    carryChunks: number;
+    /** Aggregate hard carry capacity of currently open provider connections. */
+    carryLimitBytes: number;
   };
   /** Transient spool disk/file ownership. Zero outside spooling. */
   spool: {

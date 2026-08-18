@@ -1014,7 +1014,7 @@ export class MultiProviderPool {
           });
           const sink = new SpoolingSegmentSink(
             artifact,
-            downloadMemoryLease.bytes,
+            2 * runtime.plan.decoderChunkBytes,
             runtime.plan.decoderChunkBytes
           );
           const prepareGrowingOwner = (

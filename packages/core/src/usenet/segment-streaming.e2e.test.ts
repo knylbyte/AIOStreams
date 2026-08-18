@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
+import tls from 'node:tls';
 import test, { type TestContext } from 'node:test';
 import yencode from 'yencode';
 import '../config/index.js';
@@ -14,6 +16,8 @@ import { StatsAccumulator } from './stats/accumulator.js';
 import { SpoolManager } from './spool/manager.js';
 import type { SpoolFileHandle, SpoolFileSystem } from './spool/types.js';
 import type { SegmentSpoolingPlan } from './resource-plan.js';
+import { NNTP_READ_CARRY_MAX_BYTES } from './nntp/read-carry.js';
+import type { UsenetResourceEventObserver } from './pool/resource-events.js';
 import type { Nzb } from './nzb/model.js';
 import {
   DEFAULT_ENGINE_OPTIONS,
@@ -39,17 +43,22 @@ type FakeArticleResolver = (
 ) => FakeArticleReply;
 
 class FakeNntpServer {
-  private readonly server = net.createServer();
+  private readonly server: net.Server;
   private readonly clients = new Set<net.Socket>();
   private readonly commandWaiters: Array<{
     readonly count: number;
     readonly resolve: () => void;
   }> = [];
   private occurrences = new Map<string, number>();
+  private acceptedConnectionsValue = 0;
   readonly bodyCommands: string[] = [];
 
-  private constructor(private readonly resolveArticle: FakeArticleResolver) {
-    this.server.on('connection', (socket) => {
+  private constructor(
+    private readonly resolveArticle: FakeArticleResolver,
+    tlsCredentials?: { readonly key: Buffer; readonly cert: Buffer }
+  ) {
+    const accept = (socket: net.Socket): void => {
+      this.acceptedConnectionsValue++;
       this.clients.add(socket);
       socket.on('error', () => undefined);
       socket.on('close', () => this.clients.delete(socket));
@@ -85,7 +94,10 @@ class FakeNntpServer {
           }
         }
       });
-    });
+    };
+    this.server = tlsCredentials
+      ? tls.createServer(tlsCredentials, accept)
+      : net.createServer(accept);
   }
 
   static async create(
@@ -104,10 +116,38 @@ class FakeNntpServer {
     return fake;
   }
 
+  static async createTls(
+    context: TestContext,
+    resolver: FakeArticleResolver
+  ): Promise<FakeNntpServer> {
+    const [key, cert] = await Promise.all([
+      readFile(
+        new URL('../../test/fixtures/nntp-test-key.pem', import.meta.url)
+      ),
+      readFile(
+        new URL('../../test/fixtures/nntp-test-cert.pem', import.meta.url)
+      ),
+    ]);
+    const fake = new FakeNntpServer(resolver, { key, cert });
+    await new Promise<void>((resolve, reject) => {
+      fake.server.once('error', reject);
+      fake.server.listen(0, '127.0.0.1', () => {
+        fake.server.removeListener('error', reject);
+        resolve();
+      });
+    });
+    context.after(() => fake.close());
+    return fake;
+  }
+
   get port(): number {
     const address = this.server.address();
     assert(address && typeof address !== 'string');
     return address.port;
+  }
+
+  get acceptedConnections(): number {
+    return this.acceptedConnectionsValue;
   }
 
   waitForBodyCount(count: number): Promise<void> {
@@ -194,14 +234,14 @@ function testPlan(
   overrides: Partial<SegmentSpoolingPlan> = {}
 ): SegmentSpoolingPlan {
   return {
-    memoryBudgetBytes: 2 * MEBIBYTE_BYTES,
+    memoryBudgetBytes: 4 * MEBIBYTE_BYTES,
     perStreamBufferBytes: 512 * KIBIBYTE_BYTES,
     spoolBytes: 16 * MEBIBYTE_BYTES,
     minFreeDiskBytes: 0,
     decoderChunkBytes: 64 * KIBIBYTE_BYTES,
     writerQueueBytes: 128 * KIBIBYTE_BYTES,
     readerHighWaterMarkBytes: 64 * KIBIBYTE_BYTES,
-    perDownloadBaseLeaseBytes: 128 * KIBIBYTE_BYTES,
+    perDownloadBaseLeaseBytes: 128 * KIBIBYTE_BYTES + NNTP_READ_CARRY_MAX_BYTES,
     maxOpenSpoolFiles: 16,
     orphanTtlMs: 60_000,
     ...overrides,
@@ -259,6 +299,8 @@ async function createHarness(
   options: {
     readonly plan?: SegmentSpoolingPlan;
     readonly fileSystem?: Partial<SpoolFileSystem>;
+    readonly engineOptions?: Partial<EngineOptions>;
+    readonly onResourceEvent?: UsenetResourceEventObserver;
   } = {}
 ): Promise<E2eHarness> {
   const cacheRoot = await fs.mkdtemp(path.join(tmpdir(), 'spooling-e2e-'));
@@ -270,6 +312,8 @@ async function createHarness(
     segmentDiskCacheBytes: 0,
     segmentTimeoutMs: 10_000,
     segmentStallTimeoutMs: 2_000,
+    ...options.engineOptions,
+    streamingMode: mode,
   };
   const cache = new SegmentCache({ arenaBytes: 4 * MEBIBYTE_BYTES });
   const idle = new PoolIdleBarrier();
@@ -286,6 +330,7 @@ async function createHarness(
           engineId: 'block-9-e2e',
           cacheRoot,
           fileSystem: options.fileSystem,
+          onEvent: options.onResourceEvent,
         }),
       })
     : undefined;
@@ -463,6 +508,171 @@ test('fragmented pipelined yEnc streams preserve range, slow-player and bufferin
   const bufferingFile = fileStream(buffering, bodies);
   await bufferingFile.open();
   assert.deepEqual(await collect(bufferingFile.createReadStream()), expected);
+});
+
+test('1x1 TLS segment spooling survives a paused player and reuses its provider connection', async (context) => {
+  const bodies = [
+    Buffer.alloc(96 * KIBIBYTE_BYTES, 0x31),
+    Buffer.alloc(96 * KIBIBYTE_BYTES, 0x32),
+    Buffer.alloc(80 * KIBIBYTE_BYTES, 0x33),
+  ];
+  const expected = Buffer.concat(bodies);
+  let begin = 0;
+  const responses = new Map(
+    bodies.map((body, index) => {
+      const response = articleResponse(
+        body,
+        index + 1,
+        bodies.length,
+        begin,
+        expected.length
+      );
+      begin += body.length;
+      return [`segment-${index}`, response] as const;
+    })
+  );
+  const server = await FakeNntpServer.createTls(context, (messageId) => ({
+    response: responses.get(messageId),
+    fragmentBytes: 4 * KIBIBYTE_BYTES,
+  }));
+  const harness = await createHarness(
+    context,
+    [
+      provider('tls-one-by-one', server.port, {
+        tls: true,
+        tlsSkipVerify: true,
+        maxConnections: 1,
+        pipelineDepth: 1,
+      }),
+    ],
+    'segment_spooling',
+    {
+      engineOptions: {
+        maxConcurrentDownloads: 1,
+        prefetchSegments: 2,
+        circuitBreakerThreshold: 1,
+      },
+    }
+  );
+  const file = fileStream(harness, bodies);
+  await file.open();
+  const player = collectWithControlledPlayerPause(file.createReadStream());
+
+  await player.paused;
+  assert(harness.runtime);
+  const pausedStats = harness.runtime.stats();
+  assert(pausedStats.memory.usedBytes > 0, 'paused queues remain memory-owned');
+  assert(
+    pausedStats.memory.usedBytes <= pausedStats.memory.maxBytes,
+    'slow-player RAM remains within the hard budget'
+  );
+  assert(
+    pausedStats.spool.budget.reservedBytes <= pausedStats.spool.budget.maxBytes,
+    'slow-player spool remains within the hard budget'
+  );
+
+  player.resume();
+  assert.deepEqual(await player.result, expected);
+  await harness.waitForPoolIdle();
+  assert.equal(server.acceptedConnections, 1, 'the TLS connection is reusable');
+  assert.deepEqual(new Set(server.bodyCommands), new Set(responses.keys()));
+  assert(harness.pool.poolInfo().providers.every((entry) => !entry.tripped));
+
+  const finalStats = harness.runtime.stats();
+  assert.equal(finalStats.memory.usedBytes, 0);
+  assert.equal(finalStats.memory.waiting, 0);
+  assert.equal(finalStats.spool.budget.reservedBytes, 0);
+  assert.equal(finalStats.spool.budget.actualBytes, 0);
+  assert.equal(finalStats.spool.files.openFiles, 0);
+  assert.equal(finalStats.spool.artifacts, 0);
+});
+
+test('a paused TLS player fills the bounded spool window before future BODY commands go on wire', async (context) => {
+  const bodies = Array.from({ length: 3 }, (_, index) =>
+    Buffer.alloc(512 * KIBIBYTE_BYTES, 0x41 + index)
+  );
+  const expected = Buffer.concat(bodies);
+  let begin = 0;
+  const responses = new Map(
+    bodies.map((body, index) => {
+      const response = articleResponse(
+        body,
+        index + 1,
+        bodies.length,
+        begin,
+        expected.length
+      );
+      begin += body.length;
+      return [`segment-${index}`, response] as const;
+    })
+  );
+  const server = await FakeNntpServer.createTls(context, (messageId) => ({
+    response: responses.get(messageId),
+    fragmentBytes: 16 * KIBIBYTE_BYTES,
+  }));
+  const spoolWaitStarted = Promise.withResolvers<void>();
+  let spoolReservationStarts = 0;
+  const harness = await createHarness(
+    context,
+    [
+      provider('tls-spool-window', server.port, {
+        tls: true,
+        tlsSkipVerify: true,
+        maxConnections: 1,
+        pipelineDepth: 1,
+      }),
+    ],
+    'segment_spooling',
+    {
+      plan: testPlan({ spoolBytes: 2 * MEBIBYTE_BYTES }),
+      engineOptions: {
+        maxConcurrentDownloads: 3,
+        prefetchSegments: 3,
+        circuitBreakerThreshold: 1,
+      },
+      onResourceEvent: (event) => {
+        if (
+          event.type === 'spool_wait_start' &&
+          ++spoolReservationStarts === bodies.length
+        ) {
+          spoolWaitStarted.resolve();
+        }
+      },
+    }
+  );
+  const file = fileStream(harness, bodies);
+  await file.open();
+  const player = collectWithControlledPlayerPause(file.createReadStream());
+
+  await player.paused;
+  await spoolWaitStarted.promise;
+  assert(harness.runtime);
+  assert(
+    server.bodyCommands.length > 0 &&
+      server.bodyCommands.length < bodies.length,
+    'at least one future BODY must remain pre-wire while spool capacity is held'
+  );
+  assert.equal(harness.runtime.stats().spool.budget.waiting, 1);
+  assert.equal(
+    harness.runtime.stats().spool.budget.reservedBytes,
+    2 * MEBIBYTE_BYTES
+  );
+  assert(harness.pool.poolInfo().providers.every((entry) => !entry.tripped));
+
+  player.resume();
+  assert.deepEqual(await player.result, expected);
+  await harness.waitForPoolIdle();
+  assert.equal(server.bodyCommands.length, bodies.length);
+  assert.equal(server.acceptedConnections, 1);
+  assert(harness.pool.poolInfo().providers.every((entry) => !entry.tripped));
+  const final = harness.runtime.stats();
+  assert.equal(final.memory.usedBytes, 0);
+  assert.equal(final.memory.waiting, 0);
+  assert.equal(final.spool.budget.reservedBytes, 0);
+  assert.equal(final.spool.budget.actualBytes, 0);
+  assert.equal(final.spool.budget.waiting, 0);
+  assert.equal(final.spool.files.openFiles, 0);
+  assert.equal(final.spool.artifacts, 0);
 });
 
 test('two active clients share one flight while one aborts independently', async (context) => {
@@ -683,6 +893,16 @@ test('slow disk, ENOSPC, EACCES and client abort leave no spool ownership', asyn
   const slowResult = collect(slowFile.createReadStream());
   await writeStarted.promise;
   assert(slowDisk.runtime);
+  assert(slowDisk.plan);
+  assert.equal(
+    slowDisk.plan.perDownloadBaseLeaseBytes,
+    2 * slowDisk.plan.decoderChunkBytes + NNTP_READ_CARRY_MAX_BYTES
+  );
+  assert(
+    slowDisk.runtime.stats().memory.usedBytes >=
+      slowDisk.plan.perDownloadBaseLeaseBytes,
+    'the on-wire memory owner includes its pre-admitted NNTP carry headroom'
+  );
   assert(slowDisk.runtime.stats().spool.budget.reservedBytes > 0);
   allowWrite.resolve();
   assert.deepEqual(await slowResult, body);

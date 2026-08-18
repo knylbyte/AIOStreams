@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { getEventListeners } from 'node:events';
+import { readFile } from 'node:fs/promises';
 import net from 'node:net';
+import tls from 'node:tls';
 import test, { type TestContext } from 'node:test';
 // The production entry point initializes config before constructing module
 // loggers. Preserve that ordering in this isolated connection test as well.
@@ -12,6 +14,11 @@ import {
   type ConnectionOptions,
 } from './connection.js';
 import { NntpError } from './errors.js';
+import {
+  NNTP_READ_CARRY_MAX_BYTES,
+  NNTP_READ_CARRY_MAX_CHUNKS,
+  NNTP_READ_WINDOW_BYTES,
+} from './read-carry.js';
 
 class ScriptedNntpServer {
   private readonly server = net.createServer();
@@ -105,6 +112,107 @@ class ScriptedNntpServer {
   }
 }
 
+class TlsScriptedNntpServer {
+  private readonly clientReady = Promise.withResolvers<tls.TLSSocket>();
+  private readonly clients = new Set<tls.TLSSocket>();
+  private readonly commands: string[] = [];
+  private commandWaiter: PromiseWithResolvers<string> | undefined;
+  private closed = false;
+
+  private constructor(private readonly server: tls.Server) {
+    server.on('secureConnection', (socket) => {
+      this.clients.add(socket);
+      socket.setMaxSendFragment(16 * 1024);
+      socket.on('error', () => undefined);
+      socket.on('close', () => this.clients.delete(socket));
+      let carry = '';
+      socket.on('data', (chunk: Buffer) => {
+        carry += chunk.toString('latin1');
+        for (;;) {
+          const end = carry.indexOf('\r\n');
+          if (end < 0) return;
+          const command = carry.slice(0, end);
+          carry = carry.slice(end + 2);
+          const waiter = this.commandWaiter;
+          if (waiter) {
+            this.commandWaiter = undefined;
+            waiter.resolve(command);
+          } else {
+            this.commands.push(command);
+          }
+        }
+      });
+      this.clientReady.resolve(socket);
+      socket.write('200 tls test server ready\r\n');
+    });
+  }
+
+  static async create(context: TestContext): Promise<TlsScriptedNntpServer> {
+    const [key, cert] = await Promise.all([
+      readFile(
+        new URL('../../../test/fixtures/nntp-test-key.pem', import.meta.url)
+      ),
+      readFile(
+        new URL('../../../test/fixtures/nntp-test-cert.pem', import.meta.url)
+      ),
+    ]);
+    const instance = new TlsScriptedNntpServer(tls.createServer({ key, cert }));
+    await new Promise<void>((resolve, reject) => {
+      instance.server.once('error', reject);
+      instance.server.listen(0, '127.0.0.1', () => {
+        instance.server.removeListener('error', reject);
+        resolve();
+      });
+    });
+    context.after(() => instance.close());
+    return instance;
+  }
+
+  get port(): number {
+    const address = this.server.address();
+    assert(address && typeof address !== 'string');
+    return address.port;
+  }
+
+  nextCommand(): Promise<string> {
+    const command = this.commands.shift();
+    if (command !== undefined) return Promise.resolve(command);
+    assert.equal(this.commandWaiter, undefined);
+    this.commandWaiter = Promise.withResolvers<string>();
+    return this.commandWaiter.promise;
+  }
+
+  async send(value: Buffer): Promise<void> {
+    const socket = await this.clientReady.promise;
+    await new Promise<void>((resolve, reject) => {
+      socket.write(value, (error) => (error ? reject(error) : resolve()));
+    });
+  }
+
+  async sendRecords(values: readonly Buffer[]): Promise<void> {
+    const socket = await this.clientReady.promise;
+    await new Promise<void>((resolve, reject) => {
+      for (let index = 0; index < values.length; index++) {
+        socket.write(values[index], (error) => {
+          if (error) reject(error);
+          else if (index === values.length - 1) resolve();
+        });
+      }
+    });
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    this.commandWaiter?.reject(new Error('tls test server closed'));
+    this.commandWaiter = undefined;
+    for (const socket of this.clients) socket.destroy();
+    await new Promise<void>((resolve, reject) => {
+      this.server.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
+}
+
 class ControlledConsumer implements BackpressuredBodyConsumer {
   readonly chunks: Buffer[] = [];
   readonly endStarted = Promise.withResolvers<void>();
@@ -161,6 +269,32 @@ class ControlledConsumer implements BackpressuredBodyConsumer {
       this.writesChanged.add(changed.resolve);
       await changed.promise;
     }
+  }
+
+  body(): Buffer {
+    return Buffer.concat(this.chunks);
+  }
+}
+
+class AutoDrainingConsumer implements BackpressuredBodyConsumer {
+  readonly chunks: Buffer[] = [];
+  failure: Error | undefined;
+
+  write(chunk: Buffer): boolean {
+    this.chunks.push(Buffer.from(chunk));
+    return false;
+  }
+
+  onceDrain(listener: () => void): void {
+    queueMicrotask(listener);
+  }
+
+  end(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  fail(error: Error): void {
+    this.failure ??= error;
   }
 
   body(): Buffer {
@@ -282,6 +416,345 @@ test('pauses the whole socket for multiple consumer drain cycles', async (contex
   assert.equal(consumer.endCalls, 1);
   assert.equal(consumer.hasDrainListener, false);
   assert.equal(consumer.failure, undefined);
+});
+
+test('owns late read callbacks during local pause and drains them FIFO before resume', async (context) => {
+  const firstLate = Buffer.from('second-');
+  const secondLate = Buffer.from('third\r\n.\r\n');
+  let injected = false;
+  const { connection, server } = await connectTest(context, {
+    onLocalPause: (deliverLateRead) => {
+      if (injected) return;
+      injected = true;
+      assert.equal(deliverLateRead(firstLate), false);
+      assert.equal(deliverLateRead(secondLate), false);
+      firstLate.fill(0x78);
+      secondLate.fill(0x79);
+    },
+  });
+  const consumer = new ControlledConsumer([false, true, true]);
+  const body = connection.bodyToConsumer(
+    'late-reads',
+    consumer,
+    undefined,
+    1000
+  );
+  assert.equal(await server.nextCommand(), 'BODY <late-reads>');
+  await server.send('222 article\r\nfirst-');
+  await consumer.waitForWrites(1);
+  assert.deepEqual(connection.readCarryStats, {
+    bytes: Buffer.byteLength('second-third\r\n.\r\n'),
+    chunks: 2,
+    limitBytes: NNTP_READ_CARRY_MAX_BYTES,
+  });
+  consumer.emitDrain();
+
+  assert.equal(await body, Buffer.byteLength('first-second-third'));
+  assert.deepEqual(consumer.body(), Buffer.from('first-second-third'));
+  assert.equal(connection.isUsable, true);
+  assert.deepEqual(connection.readCarryStats, {
+    bytes: 0,
+    chunks: 0,
+    limitBytes: NNTP_READ_CARRY_MAX_BYTES,
+  });
+
+  const next = connection.stat('next-command', undefined, 1000);
+  assert.equal(await server.nextCommand(), 'STAT <next-command>');
+  await server.send('223 1 article exists\r\n');
+  assert.equal(await next, true);
+});
+
+test('keeps the carry head ordered across repeated drain cycles', async (context) => {
+  const lateOne = Buffer.from('second-');
+  const lateTwo = Buffer.from('third\r\n.\r\n');
+  let injected = false;
+  const { connection, server } = await connectTest(context, {
+    onLocalPause: (deliverLateRead) => {
+      if (injected) return;
+      injected = true;
+      assert.equal(deliverLateRead(lateOne), false);
+      assert.equal(deliverLateRead(lateTwo), false);
+    },
+  });
+  const consumer = new ControlledConsumer([false, false, false]);
+  const body = connection.bodyToConsumer(
+    'carry-drain-cycles',
+    consumer,
+    undefined,
+    1000
+  );
+  assert.equal(await server.nextCommand(), 'BODY <carry-drain-cycles>');
+  await server.send('222 article\r\nfirst-');
+
+  await consumer.waitForWrites(1);
+  consumer.emitDrain();
+  await consumer.waitForWrites(2);
+  assert(
+    Buffer.from('first-second-third')
+      .subarray(0, consumer.body().length)
+      .equals(consumer.body()),
+    'a parser-safe terminator tail may split one carry window, but not reorder it'
+  );
+  consumer.emitDrain();
+  await consumer.waitForWrites(3);
+  assert.deepEqual(consumer.body(), Buffer.from('first-second-third'));
+  consumer.emitDrain();
+
+  assert.equal(await body, Buffer.byteLength('first-second-third'));
+  assert.equal(consumer.hasDrainListener, false);
+  assert.equal(connection.isUsable, true);
+});
+
+test('drains the current read remainder before later callbacks in a pipeline', async (context) => {
+  const lateOne = Buffer.from('second-');
+  const lateTwo = Buffer.from('tail\r\n.\r\n');
+  let injected = false;
+  const { connection, server } = await connectTest(context, {
+    onLocalPause: (deliverLateRead) => {
+      if (injected) return;
+      injected = true;
+      deliverLateRead(lateOne);
+      deliverLateRead(lateTwo);
+    },
+  });
+  const consumer = new ControlledConsumer([false]);
+  const first = connection.bodyToConsumer(
+    'first-fifo',
+    consumer,
+    undefined,
+    1000
+  );
+  const second = connection.body('second-fifo', undefined, 1000);
+  assert.equal(await server.nextCommand(), 'BODY <first-fifo>');
+  assert.equal(await server.nextCommand(), 'BODY <second-fifo>');
+  await server.send('222 first\r\nfirst-body\r\n.\r\n222 second\r\ncurrent-');
+  await consumer.waitForWrites(1);
+  consumer.emitDrain();
+
+  assert.equal(await first, Buffer.byteLength('first-body'));
+  assert.deepEqual(
+    await second,
+    Buffer.from('current-second-tail'),
+    'the in-window remainder must stay ahead of both late callbacks'
+  );
+  assert.equal(connection.isUsable, true);
+});
+
+test('bounds owned late callback bytes and reports a local backpressure fault', async (context) => {
+  assert.equal(NNTP_READ_CARRY_MAX_CHUNKS, 256);
+  assert.equal(NNTP_READ_CARRY_MAX_BYTES, 4 * NNTP_READ_WINDOW_BYTES);
+  let injected = false;
+  const { connection, server } = await connectTest(context, {
+    onLocalPause: (deliverLateRead) => {
+      if (injected) return;
+      injected = true;
+      for (let index = 0; index < 5; index++) {
+        deliverLateRead(Buffer.alloc(NNTP_READ_WINDOW_BYTES, index));
+      }
+    },
+  });
+  const consumer = new ControlledConsumer([false]);
+  const pending = connection.bodyToConsumer(
+    'carry-overflow',
+    consumer,
+    undefined,
+    1000
+  );
+  const failed = rejection(pending);
+  assert.equal(await server.nextCommand(), 'BODY <carry-overflow>');
+  await server.send('222 article\r\nfirst-window');
+
+  const error = await failed;
+  assert(error instanceof NntpError);
+  assert.equal(error.kind, 'local_backpressure');
+  assert.equal(error.faultDomain, 'local');
+  assert.equal(error.carryChunks, 5);
+  assert.equal(
+    error.carryBytes,
+    NNTP_READ_CARRY_MAX_BYTES + NNTP_READ_WINDOW_BYTES
+  );
+  assert.equal(error.carryLimitBytes, NNTP_READ_CARRY_MAX_BYTES);
+  assert.equal(consumer.failure, error);
+  assert.equal(connection.isUsable, false);
+  assert.equal(connection.inFlight, 0);
+});
+
+test('bounds the number of tiny late callbacks independently of their bytes', async (context) => {
+  let injected = false;
+  const { connection, server } = await connectTest(context, {
+    onLocalPause: (deliverLateRead) => {
+      if (injected) return;
+      injected = true;
+      for (let index = 0; index < NNTP_READ_CARRY_MAX_CHUNKS + 1; index++) {
+        deliverLateRead(Buffer.from([index & 0xff]));
+      }
+    },
+  });
+  const consumer = new ControlledConsumer([false]);
+  const pending = connection.bodyToConsumer(
+    'carry-chunk-overflow',
+    consumer,
+    undefined,
+    1000
+  );
+  const failed = rejection(pending);
+  assert.equal(await server.nextCommand(), 'BODY <carry-chunk-overflow>');
+  await server.send('222 article\r\nfirst-window');
+
+  const error = await failed;
+  assert(error instanceof NntpError);
+  assert.equal(error.kind, 'local_backpressure');
+  assert.equal(error.carryChunks, NNTP_READ_CARRY_MAX_CHUNKS + 1);
+  assert.equal(error.carryBytes, NNTP_READ_CARRY_MAX_CHUNKS + 1);
+  assert.equal(connection.isUsable, false);
+});
+
+test('accepts the exact four-window carry boundary', async (context) => {
+  let injected = false;
+  const { connection, server } = await connectTest(context, {
+    onLocalPause: (deliverLateRead) => {
+      if (injected) return;
+      injected = true;
+      const fullWindows = NNTP_READ_CARRY_MAX_BYTES / NNTP_READ_WINDOW_BYTES;
+      for (let index = 0; index < fullWindows; index++) {
+        const chunk = Buffer.alloc(NNTP_READ_WINDOW_BYTES, 0x61 + index);
+        if (index === fullWindows - 1) {
+          Buffer.from('\r\n.\r\n').copy(
+            chunk,
+            chunk.length - Buffer.byteLength('\r\n.\r\n')
+          );
+        }
+        assert.equal(deliverLateRead(chunk), false);
+      }
+    },
+  });
+  const consumer = new ControlledConsumer([false]);
+  const pending = connection.bodyToConsumer(
+    'carry-boundary',
+    consumer,
+    undefined,
+    1000
+  );
+  assert.equal(await server.nextCommand(), 'BODY <carry-boundary>');
+  await server.send('222 article\r\nfirst-');
+  await consumer.waitForWrites(1);
+  consumer.emitDrain();
+
+  assert.equal(
+    await pending,
+    Buffer.byteLength('first-') +
+      NNTP_READ_CARRY_MAX_BYTES -
+      Buffer.byteLength('\r\n.\r\n')
+  );
+  assert.equal(connection.isUsable, true);
+  assert.equal(consumer.failure, undefined);
+});
+
+test('streams a complete fragmented TLS BODY through repeated local pauses and reuses the connection', async (context) => {
+  const server = await TlsScriptedNntpServer.create(context);
+  const payload = Buffer.alloc(3 * NNTP_READ_WINDOW_BYTES, 0x5a);
+  const config = {
+    ...provider(server.port),
+    tls: true,
+    tlsSkipVerify: true,
+  };
+  const connection = await NntpConnection.connect(config, {
+    dialTimeoutMs: 1000,
+    idleConnectionMs: 60_000,
+  });
+  context.after(() => connection.destroy());
+  const consumer = new AutoDrainingConsumer();
+  const body = connection.bodyToConsumer(
+    'tls-late-read',
+    consumer,
+    undefined,
+    5000
+  );
+  assert.equal(await server.nextCommand(), 'BODY <tls-late-read>');
+  await server.sendRecords([
+    Buffer.from('222 article follows\r\n'),
+    payload.subarray(0, NNTP_READ_WINDOW_BYTES),
+    payload.subarray(NNTP_READ_WINDOW_BYTES, 2 * NNTP_READ_WINDOW_BYTES),
+    payload.subarray(2 * NNTP_READ_WINDOW_BYTES),
+    Buffer.from('\r\n.\r\n'),
+  ]);
+
+  assert.equal(await body, payload.length);
+  assert.deepEqual(consumer.body(), payload);
+  assert.equal(consumer.failure, undefined);
+  assert.equal(connection.isUsable, true);
+
+  const next = connection.stat('tls-next', undefined, 1000);
+  assert.equal(await server.nextCommand(), 'STAT <tls-next>');
+  await server.send(Buffer.from('223 1 article exists\r\n'));
+  assert.equal(await next, true);
+});
+
+test('owns deterministic already-decrypted callbacks on a real TLS connection', async (context) => {
+  const server = await TlsScriptedNntpServer.create(context);
+  const payload = Buffer.alloc(3 * NNTP_READ_WINDOW_BYTES, 0x4c);
+  const wirePrefixBytes = 8 * 1024;
+  const alreadyDecrypted = Buffer.concat([
+    payload.subarray(wirePrefixBytes),
+    Buffer.from('\r\n.\r\n'),
+  ]);
+  let injected = false;
+  let lateReadCallbacks = 0;
+  const connection = await NntpConnection.connect(
+    {
+      ...provider(server.port),
+      tls: true,
+      tlsSkipVerify: true,
+    },
+    {
+      dialTimeoutMs: 1000,
+      idleConnectionMs: 60_000,
+      onLateRead: () => {
+        lateReadCallbacks++;
+      },
+      // Native TLS callback batching is platform-dependent. This seam models
+      // callbacks that TLS has already decrypted at the pause linearization
+      // point; the preceding bytes and connection lifecycle remain real TLS.
+      onLocalPause: (deliverLateRead) => {
+        if (injected) return;
+        injected = true;
+        for (
+          let offset = 0;
+          offset < alreadyDecrypted.length;
+          offset += NNTP_READ_WINDOW_BYTES
+        ) {
+          assert.equal(
+            deliverLateRead(
+              alreadyDecrypted.subarray(offset, offset + NNTP_READ_WINDOW_BYTES)
+            ),
+            false
+          );
+        }
+      },
+    }
+  );
+  context.after(() => connection.destroy());
+  const consumer = new AutoDrainingConsumer();
+  const body = connection.bodyToConsumer(
+    'tls-deterministic-late-read',
+    consumer,
+    undefined,
+    5000
+  );
+  assert.equal(
+    await server.nextCommand(),
+    'BODY <tls-deterministic-late-read>'
+  );
+  await server.sendRecords([
+    Buffer.from('222 article follows\r\n'),
+    payload.subarray(0, wirePrefixBytes),
+  ]);
+
+  assert.equal(await body, payload.length);
+  assert.deepEqual(consumer.body(), payload);
+  assert(lateReadCallbacks > 0);
+  assert.equal(consumer.failure, undefined);
+  assert.equal(connection.isUsable, true);
 });
 
 test('keeps FIFO aligned when a paused head shares a read with a pipelined BODY', async (context) => {

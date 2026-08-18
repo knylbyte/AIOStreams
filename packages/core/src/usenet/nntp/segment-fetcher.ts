@@ -7,6 +7,7 @@ import {
 import {
   ArticleNotFoundError,
   NntpError,
+  classifyNntpFailure,
   isTransientNntpError,
 } from './errors.js';
 import {
@@ -778,8 +779,13 @@ export class LocalSegmentFetcher implements SegmentFetcher {
           continue;
         }
         if (isTransientNntpError(err)) {
-          lastTransient = err as NntpError;
-          this.stats.record({ type: 'connection_error', providerId: pool.id });
+          lastTransient = err;
+          if (classifyNntpFailure(lastTransient).countsTowardCircuitBreaker) {
+            this.stats.record({
+              type: 'connection_error',
+              providerId: pool.id,
+            });
+          }
           continue;
         }
         throw err;

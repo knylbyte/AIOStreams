@@ -16,6 +16,11 @@ import {
   type UsenetResourcePlanConfigIssueCode,
 } from './resource-plan.js';
 import { DEFAULT_ENGINE_OPTIONS } from './types.js';
+import {
+  NNTP_READ_CARRY_MAX_BYTES,
+  NNTP_READ_CARRY_MAX_CHUNKS,
+  NNTP_READ_WINDOW_BYTES,
+} from './nntp/read-carry.js';
 
 const KIBIBYTE_BYTES = 1024;
 const MEBIBYTE_BYTES = KIBIBYTE_BYTES * KIBIBYTE_BYTES;
@@ -162,10 +167,32 @@ test('default engine options resolve to the specified effective plans', () => {
     decoderChunkBytes: 256 * KIBIBYTE_BYTES,
     writerQueueBytes: 4_000_000,
     readerHighWaterMarkBytes: 2_000_000,
-    perDownloadBaseLeaseBytes: 512 * KIBIBYTE_BYTES,
+    perDownloadBaseLeaseBytes: 512 * KIBIBYTE_BYTES + NNTP_READ_CARRY_MAX_BYTES,
     maxOpenSpoolFiles: 120,
     orphanTtlMs: 24 * 60 * 60_000,
   });
+});
+
+test('download admission reserves decoder, sink and bounded TLS carry atomically', () => {
+  const plan = resolveEngineResourcePlan(
+    resourceOptions({
+      segmentSpoolingMemoryBudgetBytes: 16 * MEBIBYTE_BYTES,
+      segmentSpoolingStreamBufferBytes: 2 * MEBIBYTE_BYTES,
+    })
+  ).segmentSpooling;
+  assert.ok(plan);
+  assert.equal(NNTP_READ_WINDOW_BYTES, 256 * KIBIBYTE_BYTES);
+  assert.equal(NNTP_READ_CARRY_MAX_CHUNKS, 256);
+  assert.equal(NNTP_READ_CARRY_MAX_BYTES, 1 * MEBIBYTE_BYTES);
+  assert.equal(
+    plan.perDownloadBaseLeaseBytes,
+    2 * plan.decoderChunkBytes + NNTP_READ_CARRY_MAX_BYTES
+  );
+  assert(
+    plan.perDownloadBaseLeaseBytes <=
+      plan.memoryBudgetBytes - plan.perStreamBufferBytes,
+    'the 16 MiB minimum must admit one download beside one stream window'
+  );
 });
 
 test('segment-spooling validation accepts every exact boundary', () => {

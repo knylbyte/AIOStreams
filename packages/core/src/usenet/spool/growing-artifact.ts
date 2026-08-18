@@ -196,9 +196,11 @@ export class GrowingSpoolArtifact implements GrowingReadableSource {
     ) {
       return;
     }
-    const classified = classifySpoolFileError(error, 'writing a spool file');
-    this.transitionFailed(classified);
-    this.writer.fail(classified);
+    // Writer and filesystem paths classify their own failures before reaching
+    // this boundary. Transport, decoder and metadata failures must retain their
+    // original type/cause instead of being relabelled as spool I/O.
+    this.transitionFailed(error);
+    this.writer.fail(error);
   }
 
   /** Create a separately counted range reader over the growing file. */

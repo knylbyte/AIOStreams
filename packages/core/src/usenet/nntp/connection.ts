@@ -14,6 +14,11 @@ import {
   parseStatusLine,
   statusClass,
 } from './protocol.js';
+import {
+  NNTP_READ_CARRY_MAX_BYTES,
+  NNTP_READ_CARRY_MAX_CHUNKS,
+  NNTP_READ_WINDOW_BYTES,
+} from './read-carry.js';
 
 const logger = createLogger('usenet/connection');
 
@@ -36,6 +41,18 @@ export interface ConnectionOptions {
     cancel(): void;
     unref?(): void;
   };
+  /**
+   * Deterministic transport seam for tests: invoked after the local pause is
+   * published and may synchronously deliver callbacks already queued by TLS.
+   * Production leaves it unset.
+   */
+  onLocalPause?: (deliverLateRead: (chunk: Buffer) => boolean) => void;
+  /** Optional bounded telemetry seam; never receives payload bytes. */
+  onLateRead?: (stats: {
+    readonly bytes: number;
+    readonly chunks: number;
+    readonly limitBytes: number;
+  }) => void;
 }
 
 /**
@@ -104,11 +121,23 @@ let CONNECTION_SEQ = 0;
 const RAW_POOL_CAP = 1 << 20;
 
 /** Per-connection reused socket-read buffer for the `onread` path (Node fills it, consumed synchronously). */
-const READ_BUF_SIZE = 256 * 1024;
+const READ_BUF_SIZE = NNTP_READ_WINDOW_BYTES;
 
 interface ConnectionTimer {
   cancel(): void;
   unref?(): void;
+}
+
+interface ReadCarryChunk {
+  readonly buffer: Buffer;
+  start: number;
+  readonly end: number;
+}
+
+export interface NntpReadCarryStats {
+  readonly bytes: number;
+  readonly chunks: number;
+  readonly limitBytes: number;
 }
 
 /**
@@ -137,13 +166,13 @@ export class NntpConnection {
   /** Current head paused by its local consumer; at most one can exist. */
   private pausedHead: PipelineRequest | null = null;
   /**
-   * Lazy, bounded owned carry for bytes following a paused response in one
-   * onread callback. Buffering-only connections never allocate it, and
-   * socket-buffer views are never retained after their callback.
+   * Lazy FIFO of owned transport windows delivered after local pause. Both its
+   * bytes and elements are hard-bounded by the download lease reserved before
+   * the BODY command goes on wire. No view of Node's reused onread buffer is
+   * retained beyond its callback.
    */
-  private deferredRead: Buffer | undefined;
-  private deferredReadStart = 0;
-  private deferredReadEnd = 0;
+  private readonly readCarry: ReadCarryChunk[] = [];
+  private readCarryBytes = 0;
   private socketLocallyPaused = false;
   /** Start of the current connection-wide local backpressure interval. */
   private localPauseStartedAt: number | undefined;
@@ -195,6 +224,15 @@ export class NntpConnection {
     return this.queue.length;
   }
 
+  /** Actual owned late-read memory; payload bytes are never exposed here. */
+  get readCarryStats(): NntpReadCarryStats {
+    return {
+      bytes: this.readCarryBytes,
+      chunks: this.readCarry.length,
+      limitBytes: NNTP_READ_CARRY_MAX_BYTES,
+    };
+  }
+
   /**
    * Whether another request can be pipelined onto this connection right now: it
    * must be usable and have fewer than `depth` requests already in flight.
@@ -203,6 +241,10 @@ export class NntpConnection {
     return (
       this.isUsable &&
       this.pausedHead === null &&
+      !this.socketLocallyPaused &&
+      !this.processing &&
+      !this.continuationScheduled &&
+      this.readCarry.length === 0 &&
       this.queue.length < Math.max(1, depth)
     );
   }
@@ -216,6 +258,7 @@ export class NntpConnection {
           ? err
           : new NntpError('connection', err.message, {
               provider: this.label,
+              connId: this.id,
               cause: err,
             });
       this.rejectAll(this.fatalError);
@@ -227,6 +270,7 @@ export class NntpConnection {
         fail(
           new NntpError('connection', 'socket closed by peer', {
             provider: this.label,
+            connId: this.id,
           })
         );
       }
@@ -281,7 +325,7 @@ export class NntpConnection {
             host: config.host,
             port: config.port,
             rejectUnauthorized: !config.tlsSkipVerify,
-            servername: config.host,
+            servername: net.isIP(config.host) ? undefined : config.host,
             ...onreadOpt,
           });
           s.once('secureConnect', onConnect);
@@ -323,7 +367,11 @@ export class NntpConnection {
         limited
           ? `connection limit at greeting: ${greeting}`
           : `unexpected greeting: ${greeting}`,
-        { code: status.code, provider: config.name ?? config.id }
+        {
+          code: status.code,
+          provider: config.name ?? config.id,
+          connId: conn.id,
+        }
       );
     }
 
@@ -364,7 +412,7 @@ export class NntpConnection {
       throw new NntpError(
         limited ? 'connection_limit' : 'auth_failed',
         `auth user rejected: ${userResp}`,
-        { code: userStatus.code, provider: this.label }
+        { code: userStatus.code, provider: this.label, connId: this.id }
       );
     }
     const passResp = await this.command(
@@ -389,7 +437,7 @@ export class NntpConnection {
         limited
           ? `connection limit reached: ${passResp}`
           : `auth pass rejected: ${passStatus.code}`,
-        { code: passStatus.code, provider: this.label }
+        { code: passStatus.code, provider: this.label, connId: this.id }
       );
     }
   }
@@ -409,6 +457,7 @@ export class NntpConnection {
         {
           code: status.code,
           provider: this.label,
+          connId: this.id,
         }
       );
     }
@@ -506,6 +555,7 @@ export class NntpConnection {
       {
         code: status.code,
         provider: this.label,
+        connId: this.id,
       }
     );
   }
@@ -518,6 +568,7 @@ export class NntpConnection {
       throw new NntpError('protocol', `DATE failed: ${resp}`, {
         code: status.code,
         provider: this.label,
+        connId: this.id,
       });
     }
   }
@@ -543,6 +594,7 @@ export class NntpConnection {
         this.fatalError ??
           new NntpError('connection', 'connection destroyed', {
             provider: this.label,
+            connId: this.id,
           })
       );
     }
@@ -599,6 +651,7 @@ export class NntpConnection {
         this.fatalError ??
         new NntpError('connection', 'connection not usable', {
           provider: this.label,
+          connId: this.id,
         });
       this.notifyConsumerFailure(bodyConsumer, error);
       return Promise.reject(error);
@@ -606,6 +659,7 @@ export class NntpConnection {
     if (signal?.aborted) {
       const error = new NntpError('connection', 'aborted', {
         provider: this.label,
+        connId: this.id,
       });
       this.notifyConsumerFailure(bodyConsumer, error);
       this.fatalError = error;
@@ -617,6 +671,7 @@ export class NntpConnection {
     } catch (cause) {
       const error = new NntpError('connection', 'command write failed', {
         provider: this.label,
+        connId: this.id,
         cause,
       });
       this.notifyConsumerFailure(bodyConsumer, error);
@@ -682,6 +737,7 @@ export class NntpConnection {
         req.onAbort = () => {
           this.fatalError = new NntpError('connection', 'aborted', {
             provider: this.label,
+            connId: this.id,
           });
           this.destroy();
         };
@@ -695,7 +751,7 @@ export class NntpConnection {
         this.fatalError = new NntpError(
           'connection',
           'command enqueue observer failed',
-          { provider: this.label, cause }
+          { provider: this.label, connId: this.id, cause }
         );
         this.destroy();
       }
@@ -786,18 +842,25 @@ export class NntpConnection {
     const timeoutSource = this.socketLocallyPaused
       ? 'local_backpressure'
       : 'absolute';
+    const localBackpressureMs =
+      timeoutSource === 'local_backpressure'
+        ? Math.max(0, now - (this.localPauseStartedAt ?? now))
+        : undefined;
     logger.warn(
       {
         provider: this.label,
         connId: this.id,
         inFlight: this.queue.length,
         totalTimeoutMs: expired.totalTimeoutMs,
+        faultDomain:
+          timeoutSource === 'local_backpressure' ? 'local' : 'provider',
+        timeoutSource,
+        carryBytes: this.readCarryBytes,
+        carryChunks: this.readCarry.length,
+        carryLimitBytes: NNTP_READ_CARRY_MAX_BYTES,
         ...(timeoutSource === 'local_backpressure'
           ? {
-              localBackpressureMs: Math.max(
-                0,
-                now - (this.localPauseStartedAt ?? now)
-              ),
+              localBackpressureMs,
             }
           : {}),
       },
@@ -810,7 +873,15 @@ export class NntpConnection {
       timeoutSource === 'local_backpressure'
         ? `segment exceeded total budget of ${expired.totalTimeoutMs}ms during local backpressure`
         : `segment exceeded total budget of ${expired.totalTimeoutMs}ms`,
-      { provider: this.label, timeoutSource }
+      {
+        provider: this.label,
+        timeoutSource,
+        connId: this.id,
+        localBackpressureMs,
+        carryBytes: this.readCarryBytes,
+        carryChunks: this.readCarry.length,
+        carryLimitBytes: NNTP_READ_CARRY_MAX_BYTES,
+      }
     );
     this.destroy();
     return true;
@@ -829,7 +900,11 @@ export class NntpConnection {
     this.fatalError = new NntpError(
       'timeout',
       `no response progress for ${head.stallTimeoutMs}ms`,
-      { provider: this.label, timeoutSource: 'provider_stall' }
+      {
+        provider: this.label,
+        timeoutSource: 'provider_stall',
+        connId: this.id,
+      }
     );
     this.destroy();
   }
@@ -873,21 +948,45 @@ export class NntpConnection {
     if (!parser || this.destroyed) return false;
     if (nread <= 0) return true;
     if (this.failExpiredPipelineDeadline()) return false;
-    if (this.processing || this.pausedHead) {
-      this.onDesync('socket delivered data during local backpressure');
+
+    // `socket.pause()` is not a TLS delivery fence: data already decrypted or
+    // queued for JS may arrive in later callbacks. Own those bytes immediately
+    // because Node reuses `buf` as soon as this callback returns.
+    if (
+      this.processing ||
+      this.pausedHead ||
+      this.socketLocallyPaused ||
+      this.readCarry.length > 0 ||
+      this.continuationScheduled
+    ) {
+      try {
+        this.enqueueLateRead(buf, 0, nread);
+        this.ensureSocketLocallyPaused();
+        if (!this.pausedHead && !this.processing) {
+          this.scheduleReadContinuation();
+        }
+      } catch (error) {
+        this.failFromConsumer(error);
+      }
       return false;
     }
     // Any byte from the peer is progress; push the rolling stall deadline out.
     this.armStallTimer();
     this.processing = true;
+    let keepReading = false;
     try {
-      return this.processReadWindow(buf, 0, nread, false);
+      keepReading = this.processReadWindow(buf, 0, nread, false);
     } catch (error) {
       this.failFromConsumer(error);
-      return false;
     } finally {
       this.processing = false;
     }
+    if (!this.destroyed && !this.pausedHead && this.readCarry.length > 0) {
+      this.ensureSocketLocallyPaused();
+      this.scheduleReadContinuation();
+      return false;
+    }
+    return keepReading && !this.socketLocallyPaused;
   }
 
   private processReadWindow(
@@ -958,7 +1057,7 @@ export class NntpConnection {
       throw new NntpError(
         'protocol',
         'non-backpressured BODY consumer requested a pause',
-        { provider: this.label }
+        { provider: this.label, connId: this.id }
       );
     }
     head.payloadEnded = payloadEnded;
@@ -1032,25 +1131,14 @@ export class NntpConnection {
     if (this.pausedHead && this.pausedHead !== head) {
       throw new NntpError('protocol', 'multiple local BODY pauses detected', {
         provider: this.label,
+        connId: this.id,
       });
     }
-    this.storeDeferredRead(buf, off, nread, ownedWindow);
+    this.retainCurrentReadRemainder(buf, off, nread, ownedWindow);
     this.pausedHead = head;
     const now = this.now();
     head.localPauseStartedAt ??= now;
-    if (!this.socketLocallyPaused) {
-      this.localPauseStartedAt = now;
-      this.socket.pause();
-      this.socketLocallyPaused = true;
-      logger.trace(
-        {
-          provider: this.label,
-          connId: this.id,
-          inFlight: this.queue.length,
-        },
-        'nntp socket paused for local consumer backpressure'
-      );
-    }
+    this.ensureSocketLocallyPaused(now);
     this.armStallTimer();
   }
 
@@ -1062,38 +1150,117 @@ export class NntpConnection {
     this.armStallTimer();
   }
 
-  private storeDeferredRead(
+  /** Keep the unconsumed current window ahead of all later callbacks. */
+  private retainCurrentReadRemainder(
     buf: Buffer,
     off: number,
     nread: number,
     ownedWindow: boolean
   ): void {
-    if (off >= nread) {
-      this.deferredRead = undefined;
-      this.deferredReadStart = 0;
-      this.deferredReadEnd = 0;
+    if (ownedWindow) {
+      const head = this.readCarry[0];
+      if (!head || head.buffer !== buf || head.end !== nread) {
+        throw new NntpError(
+          'protocol',
+          'owned NNTP carry head changed during processing',
+          { provider: this.label, connId: this.id }
+        );
+      }
+      const consumed = Math.max(0, Math.min(head.end, off) - head.start);
+      head.start += consumed;
+      this.readCarryBytes -= consumed;
+      if (head.start >= head.end) this.readCarry.shift();
+      this.assertReadCarryInvariants();
       return;
     }
-    if (ownedWindow && this.deferredRead === buf) {
-      this.deferredReadStart = off;
-      this.deferredReadEnd = nread;
-      return;
-    }
+    if (off >= nread) return;
     const length = nread - off;
-    if (length > READ_BUF_SIZE) {
-      throw new NntpError(
-        'protocol',
-        'deferred NNTP read exceeds fixed carry',
+    this.assertReadCarryCapacity(length, 1);
+    const owned = Buffer.allocUnsafe(length);
+    buf.copy(owned, 0, off, nread);
+    this.readCarry.unshift({ buffer: owned, start: 0, end: length });
+    this.readCarryBytes += length;
+    this.assertReadCarryInvariants();
+  }
+
+  /** Append one late callback after all already-owned bytes. */
+  private enqueueLateRead(buf: Buffer, off: number, nread: number): void {
+    if (off >= nread) return;
+    const length = nread - off;
+    this.assertReadCarryCapacity(length, 1);
+    const owned = Buffer.allocUnsafe(length);
+    buf.copy(owned, 0, off, nread);
+    this.readCarry.push({ buffer: owned, start: 0, end: length });
+    this.readCarryBytes += length;
+    this.assertReadCarryInvariants();
+    this.opts.onLateRead?.({
+      bytes: this.readCarryBytes,
+      chunks: this.readCarry.length,
+      limitBytes: NNTP_READ_CARRY_MAX_BYTES,
+    });
+  }
+
+  private assertReadCarryCapacity(bytes: number, chunks: number): void {
+    const nextBytes = this.readCarryBytes + bytes;
+    const nextChunks = this.readCarry.length + chunks;
+    if (
+      bytes <= 0 ||
+      bytes > READ_BUF_SIZE ||
+      nextBytes > NNTP_READ_CARRY_MAX_BYTES ||
+      nextChunks > NNTP_READ_CARRY_MAX_CHUNKS
+    ) {
+      const now = this.now();
+      const localBackpressureMs = Math.max(
+        0,
+        now - (this.localPauseStartedAt ?? now)
+      );
+      logger.warn(
         {
           provider: this.label,
+          connId: this.id,
+          faultDomain: 'local',
+          carryBytes: nextBytes,
+          carryChunks: nextChunks,
+          carryLimitBytes: NNTP_READ_CARRY_MAX_BYTES,
+          localBackpressureMs,
+        },
+        'bounded nntp read carry capacity exceeded; destroying connection'
+      );
+      throw new NntpError(
+        'local_backpressure',
+        'bounded NNTP read carry capacity exceeded',
+        {
+          provider: this.label,
+          connId: this.id,
+          faultDomain: 'local',
+          localBackpressureMs,
+          carryBytes: nextBytes,
+          carryChunks: nextChunks,
+          carryLimitBytes: NNTP_READ_CARRY_MAX_BYTES,
         }
       );
     }
-    const deferredRead = Buffer.allocUnsafe(length);
-    buf.copy(deferredRead, 0, off, nread);
-    this.deferredRead = deferredRead;
-    this.deferredReadStart = 0;
-    this.deferredReadEnd = length;
+  }
+
+  private ensureSocketLocallyPaused(now = this.now()): void {
+    if (this.socketLocallyPaused) return;
+    this.localPauseStartedAt = now;
+    this.socket.pause();
+    this.socketLocallyPaused = true;
+    logger.trace(
+      {
+        provider: this.label,
+        connId: this.id,
+        inFlight: this.queue.length,
+        faultDomain: 'local',
+        carryBytes: this.readCarryBytes,
+        carryChunks: this.readCarry.length,
+        carryLimitBytes: NNTP_READ_CARRY_MAX_BYTES,
+      },
+      'nntp socket paused for local consumer backpressure'
+    );
+    this.armStallTimer();
+    this.opts.onLocalPause?.((chunk) => this.onRead(chunk.length, chunk));
   }
 
   private scheduleReadContinuation(): void {
@@ -1110,32 +1277,45 @@ export class NntpConnection {
   }
 
   private continueAfterLocalPause(): void {
-    if (this.destroyed || this.pausedHead || this.processing) return;
+    if (this.destroyed || this.pausedHead) return;
+    if (this.processing) {
+      this.scheduleReadContinuation();
+      return;
+    }
     if (this.failExpiredPipelineDeadline()) return;
-    if (this.deferredReadStart < this.deferredReadEnd) {
-      const deferredRead = this.deferredRead;
-      if (!deferredRead) {
-        this.onDesync('missing owned NNTP carry after local backpressure');
-        return;
-      }
-      const start = this.deferredReadStart;
-      const end = this.deferredReadEnd;
-      this.deferredReadStart = 0;
-      this.deferredReadEnd = 0;
+    while (this.readCarry.length > 0) {
+      const carry = this.readCarry[0];
       this.processing = true;
+      let consumed = false;
       try {
-        if (!this.processReadWindow(deferredRead, start, end, true)) {
-          return;
-        }
+        consumed = this.processReadWindow(
+          carry.buffer,
+          carry.start,
+          carry.end,
+          true
+        );
       } catch (error) {
         this.failFromConsumer(error);
         return;
       } finally {
         this.processing = false;
       }
+      if (!consumed || this.destroyed || this.pausedHead) return;
+      if (this.readCarry[0] !== carry) {
+        this.onDesync('owned NNTP carry head changed without backpressure');
+        return;
+      }
+      this.readCarry.shift();
+      this.readCarryBytes -= carry.end - carry.start;
+      this.assertReadCarryInvariants();
     }
-    this.deferredRead = undefined;
-    if (!this.destroyed && !this.pausedHead && this.socketLocallyPaused) {
+    if (
+      !this.destroyed &&
+      !this.pausedHead &&
+      !this.processing &&
+      this.readCarry.length === 0 &&
+      this.socketLocallyPaused
+    ) {
       const resumedAt = this.now();
       const localBackpressureMs = Math.max(
         0,
@@ -1150,10 +1330,28 @@ export class NntpConnection {
           connId: this.id,
           inFlight: this.queue.length,
           localBackpressureMs,
+          carryBytes: 0,
+          carryChunks: 0,
+          carryLimitBytes: NNTP_READ_CARRY_MAX_BYTES,
         },
         'nntp socket resumed after local consumer backpressure'
       );
       this.armStallTimer();
+    }
+  }
+
+  private assertReadCarryInvariants(): void {
+    let actualBytes = 0;
+    for (const chunk of this.readCarry) {
+      actualBytes += chunk.end - chunk.start;
+    }
+    if (
+      actualBytes !== this.readCarryBytes ||
+      this.readCarryBytes < 0 ||
+      this.readCarryBytes > NNTP_READ_CARRY_MAX_BYTES ||
+      this.readCarry.length > NNTP_READ_CARRY_MAX_CHUNKS
+    ) {
+      throw new Error('NNTP read carry invariant violated');
     }
   }
 
@@ -1164,6 +1362,7 @@ export class NntpConnection {
         ? error
         : new NntpError('protocol', 'BODY consumer failed', {
             provider: this.label,
+            connId: this.id,
             cause: error,
           });
     this.destroy();
@@ -1190,7 +1389,7 @@ export class NntpConnection {
       const err = new NntpError(
         classifyNntpStatus(status.code),
         `command failed: ${status.code} ${status.message}`,
-        { code: status.code, provider: this.label }
+        { code: status.code, provider: this.label, connId: this.id }
       );
       this.failBodyConsumer(head, err);
       return this.finishHead(() => head.reject(err), false);
@@ -1214,6 +1413,7 @@ export class NntpConnection {
     this.pipeliningUnsafe = true;
     this.fatalError = new NntpError('protocol', `protocol desync: ${line}`, {
       provider: this.label,
+      connId: this.id,
     });
     this.destroy();
   }
@@ -1258,9 +1458,8 @@ export class NntpConnection {
     const pending = this.queue;
     this.queue = [];
     this.pausedHead = null;
-    this.deferredRead = undefined;
-    this.deferredReadStart = 0;
-    this.deferredReadEnd = 0;
+    this.readCarry.splice(0, this.readCarry.length);
+    this.readCarryBytes = 0;
     this.socketLocallyPaused = false;
     this.localPauseStartedAt = undefined;
     this.clearStallTimer();

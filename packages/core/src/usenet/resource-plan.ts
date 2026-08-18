@@ -1,4 +1,5 @@
 import type { EngineOptions, UsenetStreamingMode } from './types.js';
+import { NNTP_READ_CARRY_MAX_BYTES } from './nntp/read-carry.js';
 
 const KIBIBYTE_BYTES = 1024;
 const MEBIBYTE_BYTES = KIBIBYTE_BYTES * KIBIBYTE_BYTES;
@@ -60,6 +61,10 @@ export interface SegmentSpoolingPlan {
   readonly decoderChunkBytes: number;
   readonly writerQueueBytes: number;
   readonly readerHighWaterMarkBytes: number;
+  /**
+   * Atomic on-wire admission: two decoder/sink chunks plus the lazily allocated
+   * but guaranteed NNTP TLS/onread carry window.
+   */
   readonly perDownloadBaseLeaseBytes: number;
   readonly maxOpenSpoolFiles: number;
   readonly orphanTtlMs: number;
@@ -349,7 +354,10 @@ export function resolveSegmentSpoolingPlan(
     readerHighWaterMarkBytes: resolveSegmentSpoolingReaderHighWaterMarkBytes(
       options.segmentSpoolingStreamBufferBytes
     ),
-    perDownloadBaseLeaseBytes: 2 * DECODER_CHUNK_BYTES,
+    // One atomic admission avoids an on-wire download ever waiting for carry
+    // headroom after the rest of the memory budget has already been consumed.
+    perDownloadBaseLeaseBytes:
+      2 * DECODER_CHUNK_BYTES + NNTP_READ_CARRY_MAX_BYTES,
     maxOpenSpoolFiles: resolveSegmentSpoolingMaxOpenFiles(
       options.maxConcurrentDownloads
     ),

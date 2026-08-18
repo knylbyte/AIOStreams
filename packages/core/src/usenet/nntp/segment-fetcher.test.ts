@@ -15,7 +15,11 @@ import {
 } from '../types.js';
 import type { StatsEvent } from '../stats/types.js';
 import { UsenetSpoolError } from '../spool/errors.js';
-import { NntpError } from './errors.js';
+import {
+  NntpError,
+  classifyNntpFailure,
+  isProviderUnavailableError,
+} from './errors.js';
 import { YencDecodeError, YencMetadataError } from '../pool/yenc.js';
 import {
   ProviderWorkerPool,
@@ -313,6 +317,56 @@ function collectingAttempt(disposals: {
     },
   };
 }
+
+test('classifies local, client, content and provider NNTP faults for the circuit breaker', () => {
+  const cases: readonly [NntpError, boolean][] = [
+    [new NntpError('local_backpressure', 'carry full'), false],
+    [
+      new NntpError('timeout', 'local deadline', {
+        timeoutSource: 'local_backpressure',
+      }),
+      false,
+    ],
+    [new NntpError('connection', 'aborted'), false],
+    [new NntpError('article_not_found', 'missing', { code: 430 }), false],
+    [new NntpError('connection_limit', 'account capacity'), false],
+    [
+      new NntpError('timeout', 'provider silent', {
+        timeoutSource: 'provider_stall',
+      }),
+      true,
+    ],
+    [new NntpError('protocol', 'invalid framing'), true],
+    [new NntpError('connection', 'socket closed by peer'), true],
+  ];
+  for (const [error, expected] of cases) {
+    assert.equal(
+      classifyNntpFailure(error).countsTowardCircuitBreaker,
+      expected,
+      `${error.kind}/${error.timeoutSource ?? 'none'}`
+    );
+  }
+  assert.equal(
+    isProviderUnavailableError(
+      new NntpError('timeout', 'local deadline', {
+        timeoutSource: 'local_backpressure',
+      })
+    ),
+    false
+  );
+  assert.equal(
+    isProviderUnavailableError(new NntpError('connection', 'aborted')),
+    false
+  );
+  assert.equal(
+    isProviderUnavailableError(
+      new NntpError('timeout', 'provider silent', {
+        timeoutSource: 'provider_stall',
+      })
+    ),
+    true
+  );
+});
 
 test('depth-one keepalive reserves the only logical pipeline slot', async (context) => {
   const server = await AutomaticNntpServer.create(context);
@@ -725,6 +779,49 @@ test('a local spool failure does not trip the provider circuit', async (context)
     'BODY <local-spool-failure>',
     'BODY <after-local-spool-failure>',
   ]);
+});
+
+test('provider worker circuit excludes local backpressure and client cancellation', async (context) => {
+  const server = await AutomaticNntpServer.create(context);
+  const pool = new ProviderWorkerPool(provider('matrix', server.port, 0), {
+    ...workerPoolOptions(1),
+    circuitBreakerThreshold: 1,
+  });
+  context.after(() => pool.close());
+  await warmWorkerPool(pool, server);
+
+  for (const error of [
+    new NntpError('local_backpressure', 'bounded carry exceeded'),
+    new NntpError('timeout', 'local deadline', {
+      timeoutSource: 'local_backpressure',
+    }),
+    new NntpError('connection', 'aborted'),
+  ]) {
+    await assert.rejects(
+      pool.submit({
+        priority: CommandPriority.High,
+        run: async () => {
+          throw error;
+        },
+      }),
+      (actual: unknown) => actual === error
+    );
+    assert.equal(pool.info().tripped, false);
+  }
+
+  const providerStall = new NntpError('timeout', 'provider silent', {
+    timeoutSource: 'provider_stall',
+  });
+  await assert.rejects(
+    pool.submit({
+      priority: CommandPriority.High,
+      run: async () => {
+        throw providerStall;
+      },
+    }),
+    (actual: unknown) => actual === providerStall
+  );
+  assert.equal(pool.info().tripped, true);
 });
 
 test('streaming attempts occupy a depth-one provider slot before async preparation completes', async (context) => {

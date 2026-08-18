@@ -10,6 +10,9 @@ export type ResourceSummaryItem =
       readonly peak?: number;
       readonly waiting?: number;
       readonly reserved?: number;
+      readonly carryBytes?: number;
+      readonly carryChunks?: number;
+      readonly carryLimitBytes?: number;
     }
   | {
       readonly id: 'ownership';
@@ -53,6 +56,9 @@ export function resourceSummaryItems(
       max: resources.memory.maxBytes,
       peak: resources.memory.peakBytes,
       waiting: resources.memory.waiting,
+      carryBytes: resources.memory.carryBytes,
+      carryChunks: resources.memory.carryChunks,
+      carryLimitBytes: resources.memory.carryLimitBytes,
     },
     {
       id: 'spool',

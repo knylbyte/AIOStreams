@@ -459,7 +459,7 @@ function ResourcePanel({ resources }: { resources: ResourceStats }) {
                     ? `${resources.arena.exhaustions} exhaustions`
                     : item.id === 'spool'
                       ? `${formatBytes(item.reserved ?? 0)} reserved · peak ${formatBytes(item.peak ?? 0)}`
-                      : `peak ${formatBytes(item.peak ?? 0)} · ${item.waiting ?? 0} waiting`}
+                      : `peak ${formatBytes(item.peak ?? 0)} · ${item.waiting ?? 0} waiting · carry ${formatBytes(item.carryBytes ?? 0)} in ${item.carryChunks ?? 0} chunks`}
                 </p>
               </>
             ) : (

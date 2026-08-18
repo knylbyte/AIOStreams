@@ -381,7 +381,7 @@ export class GrowingSpoolArtifactAdapter implements SegmentArtifact {
     const completion = this.producerCompletion?.then((metadata) => {
       if (metadata.size !== lengthAtOpen) {
         throw new UsenetSpoolError(
-          'USENET_SPOOL_IO',
+          'USENET_SPOOL_METADATA_MISMATCH',
           'Decoded segment length differs from the exact file range'
         );
       }

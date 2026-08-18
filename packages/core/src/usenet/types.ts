@@ -231,6 +231,11 @@ export interface ProviderPoolInfo {
   freeSlots: number;
   throughput: number;
   queued: number;
+  /** Actual process-owned TLS/onread carry currently retained by this pool. */
+  readCarryBytes?: number;
+  readCarryChunks?: number;
+  /** Sum of the hard carry limits for currently open connections. */
+  readCarryLimitBytes?: number;
   lastDialOkAt?: number;
   lastDialError?: { at: number; kind: string; message: string };
 }
@@ -299,7 +304,7 @@ export function providerSetFingerprint(
       priority: p.priority,
       isBackup: !!p.isBackup,
       // Depth changes pool sizing (pipeline slots), so it must rebuild the engine.
-      pipelineDepth: p.pipelineDepth ?? 0,
+      pipelineDepth: Math.max(1, p.pipelineDepth ?? 1),
     }))
     .sort((a, b) =>
       `${a.host}:${a.port}:${a.username}`.localeCompare(

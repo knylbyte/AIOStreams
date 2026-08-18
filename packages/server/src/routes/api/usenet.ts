@@ -11,6 +11,11 @@ import {
   isStreamShutdownError,
   sendStreamShutdownResponse,
 } from './stream-shutdown.js';
+import {
+  safeErrorCode,
+  UsenetStreamLifecycle,
+  usenetStreamFailureLogFields,
+} from './usenet-stream-lifecycle.js';
 
 const logger = createLogger('server:usenet');
 const router: Router = Router();
@@ -76,7 +81,17 @@ router.get(
     const { token } = req.params;
     const requested = parseRange(req.headers.range);
     const controller = new AbortController();
-    const onClose = () => controller.abort();
+    const lifecycle = new UsenetStreamLifecycle();
+    const onClose = () => {
+      if (
+        lifecycle.recordResponseClose(
+          res.writableEnded || res.writableFinished
+        ) &&
+        !controller.signal.aborted
+      ) {
+        controller.abort(new Error('Usenet client disconnected'));
+      }
+    };
     res.on('close', onClose);
     const socket = req.socket;
     socket.setKeepAlive(true, 60_000);
@@ -92,6 +107,7 @@ router.get(
       });
 
       const { size, start, end, stream, filename, etag, lastModified } = opened;
+      lifecycle.advance('headers');
 
       // set appropriate cache headers
       res.setHeader('ETag', etag);
@@ -109,6 +125,7 @@ router.get(
       ) {
         res.removeListener('close', onClose);
         stream.destroy();
+        lifecycle.recordNormalEof();
         res.status(304).end();
         return;
       }
@@ -117,6 +134,7 @@ router.get(
       if (requested && requested.start >= size) {
         res.removeListener('close', onClose);
         stream.destroy();
+        lifecycle.recordNormalEof();
         res.status(416).set('Content-Range', `bytes */${size}`).end();
         return;
       }
@@ -144,12 +162,18 @@ router.get(
 
       if (req.method === 'HEAD') {
         stream.destroy();
+        lifecycle.recordNormalEof();
         res.end();
         return;
       }
 
-      // A clean FIN is invisible to a player whose buffer is full.
+      lifecycle.advance('streaming');
+      // Capture the first producer failure before pipeline tears down the
+      // response and emits `close`; that later close cannot reclassify it as a
+      // client abort. A clean shutdown FIN is invisible to a buffered player.
       stream.once('error', (err: NodeJS.ErrnoException) => {
+        lifecycle.recordStreamError(err, isStreamShutdownError(err));
+        if (!controller.signal.aborted) controller.abort(err);
         if (
           (err?.code === 'USENET_STREAM_REAPED' ||
             err?.code === 'STREAM_STOPPED' ||
@@ -161,13 +185,15 @@ router.get(
       });
 
       await pipeline(stream, res);
+      lifecycle.recordNormalEof();
     } catch (err) {
       if (opened && !opened.stream.destroyed) opened.stream.destroy();
 
-      const code = (err as NodeJS.ErrnoException)?.code;
+      const effectiveError = lifecycle.firstError ?? err;
+      const code = safeErrorCode(effectiveError);
       if (
-        isStreamShutdownError(err) &&
-        !controller.signal.aborted &&
+        isStreamShutdownError(effectiveError) &&
+        !lifecycle.clientAborted &&
         !res.headersSent &&
         !res.destroyed
       ) {
@@ -175,15 +201,26 @@ router.get(
         sendStreamShutdownResponse(res);
         return;
       }
+      if (isStreamShutdownError(effectiveError)) {
+        logger.debug(
+          usenetStreamFailureLogFields(
+            err,
+            effectiveError,
+            lifecycle,
+            res.headersSent
+          ),
+          'usenet stream stopped during response shutdown'
+        );
+        return;
+      }
       const isClientDisconnect =
-        controller.signal.aborted ||
-        code === 'ERR_STREAM_PREMATURE_CLOSE' ||
-        code === 'ECONNRESET' ||
-        code === 'EPIPE' ||
-        code === 'ERR_STREAM_DESTROYED' ||
-        code === 'ABORT_ERR' ||
-        code === 'USENET_STREAM_REAPED' ||
-        isStreamShutdownError(err);
+        lifecycle.clientAborted ||
+        (!lifecycle.firstError &&
+          (code === 'ERR_STREAM_PREMATURE_CLOSE' ||
+            code === 'ECONNRESET' ||
+            code === 'EPIPE' ||
+            code === 'ERR_STREAM_DESTROYED' ||
+            code === 'ABORT_ERR'));
 
       if (isClientDisconnect) {
         logger.debug({ code }, 'client disconnected from usenet stream');
@@ -191,27 +228,47 @@ router.get(
       }
 
       if (res.headersSent) {
-        logger.warn({ err }, 'usenet stream failed after headers sent');
+        logger.warn(
+          usenetStreamFailureLogFields(
+            err,
+            effectiveError,
+            lifecycle,
+            res.headersSent
+          ),
+          'usenet stream failed after headers sent'
+        );
         res.destroy();
         return;
       }
 
-      if (err instanceof DebridError) {
+      if (effectiveError instanceof DebridError) {
         logger.warn(
-          { err: err.message, code: err.code, status: err.statusCode },
+          {
+            ...usenetStreamFailureLogFields(
+              err,
+              effectiveError,
+              lifecycle,
+              res.headersSent
+            ),
+            code: effectiveError.code,
+            status: effectiveError.statusCode,
+          },
           'usenet stream failed before any bytes were sent'
         );
         if (req.query.download !== undefined) {
-          res.status(err.statusCode || 502).json({
+          res.status(effectiveError.statusCode || 502).json({
             success: false,
-            detail: err.message,
+            detail: effectiveError.message,
           });
         } else {
-          res.redirect(302, `/static/${mapDebridErrorToStaticFile(err.code)}`);
+          res.redirect(
+            302,
+            `/static/${mapDebridErrorToStaticFile(effectiveError.code)}`
+          );
         }
         return;
       }
-      next(err);
+      next(effectiveError);
     } finally {
       res.removeListener('close', onClose);
     }

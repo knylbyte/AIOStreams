@@ -5,7 +5,15 @@ import type { ResourceStats } from '../queries';
 function resources(mode: ResourceStats['streamingMode']): ResourceStats {
   return {
     streamingMode: mode,
-    memory: { usedBytes: 1, maxBytes: 2, peakBytes: 3, waiting: 4 },
+    memory: {
+      usedBytes: 1,
+      maxBytes: 2,
+      peakBytes: 3,
+      waiting: 4,
+      carryBytes: 20,
+      carryChunks: 21,
+      carryLimitBytes: 22,
+    },
     spool: {
       reservedBytes: 5,
       actualBytes: 6,
@@ -48,6 +56,9 @@ describe('resource dashboard model', () => {
       max: 2,
       peak: 3,
       waiting: 4,
+      carryBytes: 20,
+      carryChunks: 21,
+      carryLimitBytes: 22,
     });
     expect(items[3]).toEqual({
       id: 'ownership',

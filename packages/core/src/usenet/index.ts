@@ -1323,20 +1323,29 @@ export class UsenetEngine {
    */
   liveStats(): EngineLiveStats {
     const cache = this.cache.stats();
+    const pool = this.pool.poolInfo();
     return {
       fingerprint: this.fingerprint,
       tiles: this.stats.live(),
-      pool: this.pool.poolInfo(),
+      pool,
       cache,
-      resources: this.resourceStats(cache),
+      resources: this.resourceStats(cache, pool),
       streams: this.stats.liveStreams(),
     };
   }
 
-  private resourceStats(cache: CacheStats): ResourceStats {
+  private resourceStats(cache: CacheStats, pool: PoolInfo): ResourceStats {
     const runtime = this.pool.spoolingStats();
     const memory = runtime?.memory;
     const spool = runtime?.spool;
+    const carry = pool.providers.reduce(
+      (total, provider) => ({
+        bytes: total.bytes + (provider.readCarryBytes ?? 0),
+        chunks: total.chunks + (provider.readCarryChunks ?? 0),
+        limitBytes: total.limitBytes + (provider.readCarryLimitBytes ?? 0),
+      }),
+      { bytes: 0, chunks: 0, limitBytes: 0 }
+    );
     return {
       streamingMode: this.resourcePlan.mode,
       memory: {
@@ -1344,6 +1353,9 @@ export class UsenetEngine {
         maxBytes: memory?.maxBytes ?? 0,
         peakBytes: memory?.peakBytes ?? 0,
         waiting: memory?.waiting ?? 0,
+        carryBytes: carry.bytes,
+        carryChunks: carry.chunks,
+        carryLimitBytes: carry.limitBytes,
       },
       spool: {
         reservedBytes: spool?.budget.reservedBytes ?? 0,
