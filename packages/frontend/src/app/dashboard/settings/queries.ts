@@ -23,6 +23,7 @@ export interface SettingsUiHint {
    *  `ui.kind` override when the zod union doesn't classify cleanly. */
   kind: SettingsUiKind;
   options?: string[];
+  optionLabels?: Record<string, string>;
   mapValueKind?:
     | 'string'
     | 'number'

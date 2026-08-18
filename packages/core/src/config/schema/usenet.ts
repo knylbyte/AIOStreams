@@ -125,15 +125,29 @@ export const usenetSchema = {
     schema: z.enum(['segment_buffering', 'segment_spooling']),
     default: 'segment_buffering',
     label: 'Streaming mode',
-    description:
-      'How decoded Usenet segments are transported to the player. ' +
-      '**segment_buffering** uses the existing compatible, RAM-oriented ' +
-      'data path. **segment_spooling** uses bounded memory and a transient ' +
-      'disk spool. This setting is independent of the performance profile.',
+    description: {
+      env:
+        'How decoded Usenet segments are transported to the player. ' +
+        '**segment_buffering** uses the existing compatible, RAM-oriented ' +
+        'data path. **segment_spooling** uses bounded memory and a transient ' +
+        'disk spool. This setting is independent of the performance profile.',
+      ui:
+        'Choose how decoded Usenet segments are staged for playback. ' +
+        '**Segment Buffering** stores complete decoded segments in memory. ' +
+        '**Segment Spooling** decodes segments incrementally into a transient ' +
+        'disk spool and reads from it under fixed memory and disk budgets. ' +
+        'This setting is independent of the performance profile.',
+    },
     env: 'USENET_STREAMING_MODE',
     requiresRestart: true,
     secret: false,
-    ui: HIDDEN,
+    ui: {
+      ...HIDDEN,
+      optionLabels: {
+        segment_buffering: 'Segment Buffering',
+        segment_spooling: 'Segment Spooling',
+      },
+    },
   },
   maxConcurrentDownloads: {
     schema: nonNegativeInt,

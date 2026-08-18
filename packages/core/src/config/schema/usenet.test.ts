@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { describeSettings } from '../describe.js';
+import { resolveDescription } from '../types.js';
 import { PERFORMANCE_PROFILES, usenetSchema } from './usenet.js';
 
 const NEW_FIELDS = [
@@ -29,14 +31,28 @@ test('Usenet streaming resource fields expose the specified metadata', () => {
         env: 'USENET_STREAMING_MODE',
         default: 'segment_buffering',
         label: 'Streaming mode',
-        description:
-          'How decoded Usenet segments are transported to the player. ' +
-          '**segment_buffering** uses the existing compatible, RAM-oriented ' +
-          'data path. **segment_spooling** uses bounded memory and a transient ' +
-          'disk spool. This setting is independent of the performance profile.',
+        description: {
+          env:
+            'How decoded Usenet segments are transported to the player. ' +
+            '**segment_buffering** uses the existing compatible, RAM-oriented ' +
+            'data path. **segment_spooling** uses bounded memory and a transient ' +
+            'disk spool. This setting is independent of the performance profile.',
+          ui:
+            'Choose how decoded Usenet segments are staged for playback. ' +
+            '**Segment Buffering** stores complete decoded segments in memory. ' +
+            '**Segment Spooling** decodes segments incrementally into a transient ' +
+            'disk spool and reads from it under fixed memory and disk budgets. ' +
+            'This setting is independent of the performance profile.',
+        },
         requiresRestart: true,
         secret: false,
-        ui: { hidden: true },
+        ui: {
+          hidden: true,
+          optionLabels: {
+            segment_buffering: 'Segment Buffering',
+            segment_spooling: 'Segment Spooling',
+          },
+        },
       },
       {
         name: 'segmentMemoryCacheBytes',
@@ -134,6 +150,28 @@ test('streaming mode and byte-size schemas accept explicit overrides', () => {
     usenetSchema.segmentSpoolingMinFreeDiskBytes.schema.parse('1GB'),
     1_000_000_000
   );
+});
+
+test('streaming mode exposes human labels and neutral UI copy', () => {
+  const hint = describeSettings()['usenet.streamingMode'];
+  assert.deepEqual(hint, {
+    kind: 'enum',
+    options: ['segment_buffering', 'segment_spooling'],
+    optionLabels: {
+      segment_buffering: 'Segment Buffering',
+      segment_spooling: 'Segment Spooling',
+    },
+    hidden: true,
+  });
+
+  const description = resolveDescription(
+    usenetSchema.streamingMode.description,
+    'ui'
+  );
+  assert.match(description, /\*\*Segment Buffering\*\*/);
+  assert.match(description, /\*\*Segment Spooling\*\*/);
+  assert.doesNotMatch(description, /segment_(?:buffering|spooling)/);
+  assert.doesNotMatch(description, /existing compatible/i);
 });
 
 test('performance profiles retain only their three existing fields', () => {

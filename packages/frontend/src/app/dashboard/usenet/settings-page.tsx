@@ -142,13 +142,14 @@ function SegmentHandlingInfo() {
     <Alert intent="info-basic" title="Segment handling">
       <div className="space-y-2 text-sm">
         <p>
-          <strong>Segment Buffering</strong> keeps prefetched, decoded segments
-          in memory and uses the existing compatible data path.
+          <strong>Segment Buffering</strong> downloads and decodes complete
+          segments into memory, where they remain available for ordered playback
+          and prefetching.
         </p>
         <p>
           <strong>Segment Spooling</strong> decodes segment data incrementally
-          and writes prefetched data to a transient disk spool, from which it is
-          streamed under fixed byte budgets.
+          into a transient disk spool. Playback can read growing segments while
+          fixed memory and disk budgets bound read-ahead.
         </p>
         <p>
           The performance profile remains independent and continues to control

@@ -53,6 +53,8 @@ export interface RuntimeConfigUiOverride {
    * ones the schema accepts
    */
   options?: string[];
+  /** Human-readable labels keyed by the stable persisted enum value. */
+  optionLabels?: Readonly<Record<string, string>>;
   /**
    * Hide this field from the generic settings page. Used for fields managed by
    * a bespoke editor elsewhere (e.g. `usenet.providers` lives in the usenet

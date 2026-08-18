@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { FormProvider, useForm } from 'react-hook-form';
 import { describe, expect, it } from 'vitest';
 import type { SettingsKey } from '../../queries';
-import { SettingsField, toName } from '../settings-field';
+import { enumOptionsFor, SettingsField, toName } from '../settings-field';
 
 const ENV_NAME = 'USENET_SEGMENT_SPOOLING_SPOOL_BYTES';
 
@@ -54,5 +54,28 @@ describe('SettingsField size ENV lock', () => {
 
     expect(markup).not.toContain('Set by environment variable:');
     expect(markup).not.toContain(' disabled=""');
+  });
+});
+
+describe('SettingsField enum labels', () => {
+  it('keeps stable values while displaying schema-provided labels', () => {
+    expect(
+      enumOptionsFor({
+        options: ['segment_buffering', 'segment_spooling'],
+        optionLabels: {
+          segment_buffering: 'Segment Buffering',
+          segment_spooling: 'Segment Spooling',
+        },
+      })
+    ).toEqual([
+      { label: 'Segment Buffering', value: 'segment_buffering' },
+      { label: 'Segment Spooling', value: 'segment_spooling' },
+    ]);
+  });
+
+  it('falls back to the stable value when no display label is defined', () => {
+    expect(enumOptionsFor({ options: ['custom'] })).toEqual([
+      { label: 'custom', value: 'custom' },
+    ]);
   });
 });

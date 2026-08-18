@@ -25,6 +25,15 @@ export { SECRET_CLEAR_SENTINEL };
 /** dotted config key → react-hook-form-safe flat name (no dots/brackets). */
 export const toName = (key: string) => key.replace(/\./g, '--');
 
+export function enumOptionsFor(
+  ui: Pick<SettingsKey['ui'], 'options' | 'optionLabels'>
+): { label: string; value: string }[] {
+  return (ui.options ?? []).map((value) => ({
+    label: ui.optionLabels?.[value] ?? value,
+    value,
+  }));
+}
+
 /** Single-line password field with an optional "Clear" button when a secret is already set. */
 function SecretTextField({
   name,
@@ -206,7 +215,7 @@ function SettingsFieldControl({ k }: { k: SettingsKey }) {
           label={labelNode as unknown as string}
           help={md(help)}
           disabled={disabled}
-          options={(k.ui.options ?? []).map((o) => ({ label: o, value: o }))}
+          options={enumOptionsFor(k.ui)}
         />
       );
     case 'list':

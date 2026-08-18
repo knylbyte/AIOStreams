@@ -45,6 +45,8 @@ export interface SettingsUiHint {
   kind: SettingsUiKind;
   /** For `enum` - the allowed string values. */
   options?: string[];
+  /** For `enum` - human-readable labels keyed by the persisted value. */
+  optionLabels?: Record<string, string>;
   /** For `map` - the value cell kind. */
   mapValueKind?:
     | 'string'
@@ -256,6 +258,7 @@ export function describeSettings(): Record<string, SettingsUiHint> {
       if (ui?.max !== undefined) hint.max = ui.max;
       if (ui?.step !== undefined) hint.step = ui.step;
       if (ui?.options) hint.options = [...ui.options];
+      if (ui?.optionLabels) hint.optionLabels = { ...ui.optionLabels };
       if (ui?.hidden) hint.hidden = true;
       out[key] = hint;
     }
