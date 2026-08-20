@@ -307,6 +307,9 @@ class UninstrumentedHotpathCounters implements HotpathCounterContract {
   spoolWriteSyscalls = 0;
   spoolShortWrites = 0;
   spoolBytesWritten = 0;
+  spoolGrowthRequests = 0;
+  spoolGrowthBytes = 0;
+  terminalGrowthRequests = 0;
   headerLinesParsed = 0;
   headerTransitionCopies = 0;
   resourceEventsObserved = 0;
@@ -351,6 +354,9 @@ class UninstrumentedHotpathCounters implements HotpathCounterContract {
       spoolWriteSyscalls: this.spoolWriteSyscalls,
       spoolShortWrites: this.spoolShortWrites,
       spoolBytesWritten: this.spoolBytesWritten,
+      spoolGrowthRequests: this.spoolGrowthRequests,
+      spoolGrowthBytes: this.spoolGrowthBytes,
+      terminalGrowthRequests: this.terminalGrowthRequests,
       headerLinesParsed: this.headerLinesParsed,
       headerTransitionCopies: this.headerTransitionCopies,
       resourceEventsObserved: this.resourceEventsObserved,
@@ -1238,6 +1244,7 @@ async function runScenario(
   const firstByteFastestMs = Math.min(...firstByteByConsumer);
   const firstByteSlowestMs = Math.max(...firstByteByConsumer);
   assert.equal(hotpathSnapshot.activeDownloads, 0);
+  assert.equal(hotpathSnapshot.terminalGrowthRequests, 0);
   assert.equal(final.memory.usedBytes, 0);
   assert.equal(final.spool.budget.reservedBytes, 0);
   assert.equal(final.spool.budget.actualBytes, 0);

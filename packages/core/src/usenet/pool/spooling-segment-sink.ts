@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import type { ByteLease } from './byte-budget.js';
-import type { DirectDecodeByteSink } from './streaming-yenc-article-decoder.js';
+import type {
+  DirectDecodeByteSink,
+  DirectDecodeCommitOptions,
+} from './streaming-yenc-article-decoder.js';
 import { UsenetSpoolError } from '../spool/errors.js';
 import type { SegmentSpoolingHotpathCounters } from './hotpath-counters.js';
 
@@ -66,6 +69,7 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
   private writeSettlement: PromiseWithResolvers<void> | undefined;
   private secondaryFailure: Error | undefined;
   private endPromise: Promise<void> | undefined;
+  private inputComplete = false;
   private ending = false;
   private closed = false;
   private sinkCommitNotified = false;
@@ -127,7 +131,16 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
     return batch.subarray(this.batchBytes, this.batchBytes + maxDecodedBytes);
   }
 
-  commitDecoded(bytes: number, inputBoundary: boolean): boolean {
+  commitDecoded(bytes: number, options: DirectDecodeCommitOptions): boolean {
+    if (
+      typeof options.inputBoundary !== 'boolean' ||
+      typeof options.articleEnded !== 'boolean'
+    ) {
+      throw new UsenetSpoolError(
+        'USENET_SPOOL_INVALID_ARGUMENT',
+        'Segment spool decoder supplied invalid commit metadata'
+      );
+    }
     if (
       !Number.isSafeInteger(bytes) ||
       bytes < 0 ||
@@ -140,14 +153,15 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
     }
     this.decodeTargetBytes = 0;
     this.batchBytes += bytes;
-    if (!inputBoundary || this.batchBytes === 0) {
+    if (options.articleEnded) this.inputComplete = true;
+    if (!options.inputBoundary || this.batchBytes === 0) {
       this.assertInvariants();
       return true;
     }
     const remaining = this.leasedWindowBytes - this.batchBytes;
     if (this.firstPayloadPending || remaining < this.requiredHeadroomBytes) {
       this.firstPayloadPending = false;
-      return this.flushDecodeBatch();
+      return this.flushDecodeBatch(false, options.articleEnded);
     }
     if (
       !this.cooperativeYieldPending &&
@@ -235,6 +249,7 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
 
   private async endOnce(): Promise<void> {
     this.ending = true;
+    this.inputComplete = true;
     try {
       this.cancelCooperativeYield();
       if (this.decodeTargetBytes !== 0) {
@@ -248,7 +263,7 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
       // writer-owned batch is represented by `retainedBytes > 0` and its
       // existing settlement must be observed before the terminal result.
       if (this.batchBytes > 0 && this.retainedBytes === 0) {
-        this.flushDecodeBatch(true);
+        this.flushDecodeBatch(true, true);
       }
       const settlement = this.writeSettlement;
       if (settlement) await settlement.promise;
@@ -295,11 +310,12 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
           this.sinkCommitNotified = true;
           this.lifecycleObserver?.onFirstSinkCommit?.();
         }
-        if (this.failure) {
+        if (this.failure || this.inputComplete || this.ending || this.closed) {
           // A writer-owned child may settle after the producer has already
-          // failed. Growth belongs only to a live next-write admission; do not
-          // resurrect it after terminal failure. Settlement still wakes every
-          // drain/end owner exactly once.
+          // failed or after yEnc synchronously proved article completion.
+          // Growth belongs only to a live next-write admission; terminal
+          // settlement still wakes every drain/end owner exactly once.
+          this.readyForNextWrite = true;
           this.writeSettlement?.resolve();
           this.writeSettlement = undefined;
           this.emitDrain();
@@ -312,6 +328,16 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
   }
 
   private startPreparingNextWrite(): void {
+    if (this.failure || this.inputComplete || this.ending || this.closed) {
+      if (this.hotpathCounters) {
+        this.hotpathCounters.terminalGrowthRequests++;
+      }
+      this.readyForNextWrite = true;
+      this.writeSettlement?.resolve();
+      this.writeSettlement = undefined;
+      this.emitDrain();
+      return;
+    }
     this.settledBatches++;
     const yieldToEventLoop =
       this.settledBatches % SETTLED_BATCHES_PER_EVENT_LOOP_TURN === 0;
@@ -350,6 +376,10 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
     if (available >= this.requiredHeadroomBytes) return;
     const missing = this.requiredHeadroomBytes - available;
     const growth = Math.max(MEBIBYTE_BYTES, missing);
+    if (this.hotpathCounters) {
+      this.hotpathCounters.spoolGrowthRequests++;
+      this.hotpathCounters.spoolGrowthBytes += growth;
+    }
     await this.artifact.grow(growth);
   }
 
@@ -360,9 +390,16 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
     queueMicrotask(listener);
   }
 
-  private assertWritable(allowEnding = false): void {
+  private assertWritable(
+    allowEnding = false,
+    allowInputComplete = false
+  ): void {
     if (this.failure) throw this.terminalFailure();
-    if (this.closed || (this.ending && !allowEnding)) {
+    if (
+      this.closed ||
+      (this.ending && !allowEnding) ||
+      (this.inputComplete && !allowInputComplete)
+    ) {
       throw new UsenetSpoolError(
         'USENET_SPOOL_CLOSED',
         'Segment spool sink is ending'
@@ -389,6 +426,7 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
     assert(this.cooperativeYieldsForBatch >= 0);
     assert(this.cooperativeYieldsForBatch <= MAX_COOPERATIVE_YIELDS_PER_BATCH);
     if (this.closed) assert(this.ending);
+    if (this.ending) assert(this.inputComplete);
     if (this.cooperativeYieldPending) {
       assert.equal(this.readyForNextWrite, true);
       assert.equal(this.retainedBytes, 0);
@@ -408,8 +446,11 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
     return this.batch;
   }
 
-  private flushDecodeBatch(allowEnding = false): false {
-    this.assertWritable(allowEnding);
+  private flushDecodeBatch(
+    allowEnding = false,
+    allowInputComplete = false
+  ): false {
+    this.assertWritable(allowEnding, allowInputComplete);
     if (this.batchBytes <= 0 || this.decodeTargetBytes !== 0) {
       throw new UsenetSpoolError(
         'USENET_MEMORY_BUDGET',

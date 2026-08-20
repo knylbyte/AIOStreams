@@ -1,9 +1,12 @@
 import { NextFunction, Request, Response, Router } from 'express';
-import { pipeline } from 'stream/promises';
+import type { Readable } from 'node:stream';
 import {
   createLogger,
+  downloadAdmissionCapacityCode,
   openNativeUsenetStream,
   DebridError,
+  toDebridError,
+  type DownloadAdmissionCapacityErrorCode,
 } from '@aiostreams/core';
 import { mapDebridErrorToStaticFile } from '../../app.js';
 import { corsMiddleware } from '../../middlewares/cors.js';
@@ -39,6 +42,80 @@ const MIME_BY_EXT: Record<string, string> = {
 function mimeForFilename(name: string): string {
   const ext = name.split('.').pop()?.toLowerCase() ?? '';
   return MIME_BY_EXT[ext] ?? 'application/octet-stream';
+}
+
+const STREAM_REPRESENTATION_HEADERS = [
+  'Accept-Ranges',
+  'Content-Disposition',
+  'Content-Length',
+  'Content-Range',
+  'Content-Type',
+  'ETag',
+  'Last-Modified',
+  'Location',
+] as const;
+
+function sendAdmissionCapacityResponse(
+  res: Response,
+  error: DebridError,
+  usenetCode: DownloadAdmissionCapacityErrorCode
+): void {
+  for (const header of STREAM_REPRESENTATION_HEADERS) {
+    res.removeHeader(header);
+  }
+  res.status(503).json({
+    success: false,
+    detail: error.message,
+    usenetCode,
+  });
+}
+
+function prematureStreamClose(): Error & { readonly code: string } {
+  return Object.assign(new Error('Usenet stream closed before completion'), {
+    code: 'USENET_STREAM_PREMATURE_CLOSE',
+  });
+}
+
+/**
+ * Preserve ordinary Node pipe backpressure without letting a pre-byte source
+ * failure destroy the HTTP response before it can be mapped to a public 503.
+ * Post-header failures are destroyed deliberately by the route catch path.
+ */
+function pipeToResponse(stream: Readable, res: Response): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const cleanup = (): void => {
+      stream.removeListener('error', onStreamError);
+      stream.removeListener('close', onStreamClose);
+      res.removeListener('error', onResponseError);
+      res.removeListener('finish', onResponseFinish);
+      res.removeListener('close', onResponseClose);
+    };
+    const settle = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      stream.unpipe(res);
+      cleanup();
+      if (error) reject(error);
+      else resolve();
+    };
+    const onStreamError = (error: Error): void => settle(error);
+    const onStreamClose = (): void => {
+      if (!stream.readableEnded) settle(prematureStreamClose());
+    };
+    const onResponseError = (error: Error): void => settle(error);
+    const onResponseFinish = (): void => settle();
+    const onResponseClose = (): void => {
+      if (!res.writableFinished) settle(prematureStreamClose());
+    };
+
+    stream.once('error', onStreamError);
+    stream.once('close', onStreamClose);
+    res.once('error', onResponseError);
+    res.once('finish', onResponseFinish);
+    res.once('close', onResponseClose);
+    stream.pipe(res);
+  });
 }
 
 /**
@@ -184,12 +261,17 @@ router.get(
         }
       });
 
-      await pipeline(stream, res);
+      await pipeToResponse(stream, res);
       lifecycle.recordNormalEof();
     } catch (err) {
       if (opened && !opened.stream.destroyed) opened.stream.destroy();
 
       const effectiveError = lifecycle.firstError ?? err;
+      const admissionCapacityCode =
+        downloadAdmissionCapacityCode(effectiveError);
+      const publicError = admissionCapacityCode
+        ? toDebridError(effectiveError)
+        : effectiveError;
       const code = safeErrorCode(effectiveError);
       if (
         isStreamShutdownError(effectiveError) &&
@@ -241,7 +323,7 @@ router.get(
         return;
       }
 
-      if (effectiveError instanceof DebridError) {
+      if (publicError instanceof DebridError) {
         logger.warn(
           {
             ...usenetStreamFailureLogFields(
@@ -250,20 +332,26 @@ router.get(
               lifecycle,
               res.headersSent
             ),
-            code: effectiveError.code,
-            status: effectiveError.statusCode,
+            code: publicError.code,
+            status: publicError.statusCode,
           },
           'usenet stream failed before any bytes were sent'
         );
-        if (req.query.download !== undefined) {
-          res.status(effectiveError.statusCode || 502).json({
+        if (admissionCapacityCode) {
+          sendAdmissionCapacityResponse(
+            res,
+            publicError,
+            admissionCapacityCode
+          );
+        } else if (req.query.download !== undefined) {
+          res.status(publicError.statusCode || 502).json({
             success: false,
-            detail: effectiveError.message,
+            detail: publicError.message,
           });
         } else {
           res.redirect(
             302,
-            `/static/${mapDebridErrorToStaticFile(effectiveError.code)}`
+            `/static/${mapDebridErrorToStaticFile(publicError.code)}`
           );
         }
         return;

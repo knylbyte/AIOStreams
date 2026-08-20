@@ -4,6 +4,7 @@ import yencode from 'yencode';
 import {
   StreamingYencArticleDecoder,
   type BackpressuredByteSink,
+  type DirectDecodeCommitOptions,
   type DirectDecodeByteSink,
   type DecodedSegmentMetadata,
 } from './streaming-yenc-article-decoder.js';
@@ -55,6 +56,7 @@ class DirectCollectingSink implements DirectDecodeByteSink {
   readonly maxDecodeInputBytes = 4096;
   readonly backing = Buffer.allocUnsafeSlow(64 * 1024);
   readonly targetBackings = new Set<ArrayBufferLike>();
+  readonly commits: DirectDecodeCommitOptions[] = [];
   cursor = 0;
   endCalls = 0;
   failure: Error | undefined;
@@ -72,8 +74,9 @@ class DirectCollectingSink implements DirectDecodeByteSink {
     return target;
   }
 
-  commitDecoded(bytes: number): boolean {
+  commitDecoded(bytes: number, options: DirectDecodeCommitOptions): boolean {
     this.cursor += bytes;
+    this.commits.push(options);
     return true;
   }
 
@@ -261,6 +264,8 @@ test('decodes many native calls into one caller-owned output backing', async () 
   assert(counters.yencDecodeCalls > 100);
   assert.equal(counters.yencOutputBackingReuses, counters.yencDecodeCalls);
   assert.equal(counters.yencOutputBackingAllocations, 0);
+  assert.equal(sink.commits.at(-1)?.articleEnded, true);
+  assert.equal(sink.commits.filter((commit) => commit.articleEnded).length, 1);
 });
 
 test('direct header transition avoids the legacy combined transition buffer', async () => {

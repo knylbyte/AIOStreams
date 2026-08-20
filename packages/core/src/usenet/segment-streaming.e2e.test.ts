@@ -11,6 +11,7 @@ import '../config/index.js';
 import { MultiProviderPool } from './pool/multi-provider-pool.js';
 import { SegmentCache } from './pool/segment-cache.js';
 import { SegmentSpoolingRuntime } from './pool/segment-spooling-runtime.js';
+import { SegmentSpoolingHotpathCounters } from './pool/hotpath-counters.js';
 import { FileStream } from './pool/file-stream.js';
 import { StatsAccumulator } from './stats/accumulator.js';
 import { SpoolManager } from './spool/manager.js';
@@ -306,6 +307,7 @@ async function createHarness(
     readonly fileSystem?: Partial<SpoolFileSystem>;
     readonly engineOptions?: Partial<EngineOptions>;
     readonly onResourceEvent?: UsenetResourceEventObserver;
+    readonly hotpathCounters?: SegmentSpoolingHotpathCounters;
   } = {}
 ): Promise<E2eHarness> {
   const cacheRoot = await fs.mkdtemp(path.join(tmpdir(), 'spooling-e2e-'));
@@ -336,7 +338,9 @@ async function createHarness(
           cacheRoot,
           fileSystem: options.fileSystem,
           onEvent: options.onResourceEvent,
+          hotpathCounters: options.hotpathCounters,
         }),
+        hotpathCounters: options.hotpathCounters,
       })
     : undefined;
   const pool = new MultiProviderPool(
@@ -590,6 +594,77 @@ test('1x1 TLS segment spooling survives a paused player and reuses its provider 
   assert.equal(finalStats.spool.budget.actualBytes, 0);
   assert.equal(finalStats.spool.files.openFiles, 0);
   assert.equal(finalStats.spool.artifacts, 0);
+});
+
+test('an exactly full terminal spool reservation reaches byte-identical EOF without growth', async (context) => {
+  const body = Buffer.alloc(MEBIBYTE_BYTES, 0x58);
+  const response = articleResponse(body, 1, 1, 0, body.length);
+  const server = await FakeNntpServer.create(context, () => ({
+    response,
+  }));
+  const hotpathCounters = new SegmentSpoolingHotpathCounters();
+  const decoderChunkBytes = 256 * KIBIBYTE_BYTES;
+  const plan = testPlan({
+    spoolBytes: body.length,
+    decoderChunkBytes,
+    writerQueueBytes: 2 * decoderChunkBytes,
+    perDownloadBaseLeaseBytes:
+      2 * decoderChunkBytes + NNTP_READ_CARRY_MAX_BYTES,
+  });
+  const harness = await createHarness(
+    context,
+    [
+      provider('exact-terminal-reservation', server.port, {
+        maxConnections: 1,
+        pipelineDepth: 1,
+      }),
+    ],
+    'segment_spooling',
+    {
+      plan,
+      hotpathCounters,
+      engineOptions: {
+        maxConcurrentDownloads: 1,
+        prefetchSegments: 1,
+      },
+    }
+  );
+  const file = new FileStream(
+    harness.pool,
+    {
+      segments: [{ messageId: 'segment-0', bytes: body.length }],
+      knownSize: body.length,
+      filename: 'stream.bin',
+    },
+    'exact-terminal-reservation-nzb',
+    harness.options,
+    undefined,
+    undefined,
+    {
+      mode: 'segment_spooling',
+      arenaBytes: 4 * MEBIBYTE_BYTES,
+      segmentSpooling: plan,
+    }
+  );
+
+  await file.open();
+  assert.deepEqual(await collect(file.createReadStream()), body);
+  await harness.waitForPoolIdle();
+
+  assert(harness.runtime);
+  const final = harness.runtime.stats();
+  assert.equal(final.spool.budget.peakReservedBytes, body.length);
+  assert.equal(final.spool.budget.reservedBytes, 0);
+  assert.equal(final.spool.budget.actualBytes, 0);
+  assert.equal(final.spool.budget.waiting, 0);
+  assert.equal(final.spool.files.openFiles, 0);
+  assert.equal(final.spool.artifacts, 0);
+  assert.equal(final.memory.usedBytes, 0);
+  assert.equal(final.memory.waiting, 0);
+  const counters = hotpathCounters.snapshot();
+  assert.equal(counters.spoolGrowthRequests, 0);
+  assert.equal(counters.spoolGrowthBytes, 0);
+  assert.equal(counters.terminalGrowthRequests, 0);
 });
 
 test('a paused TLS player fills the bounded spool window before future BODY commands go on wire', async (context) => {

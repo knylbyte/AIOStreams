@@ -21,6 +21,9 @@ export interface SegmentSpoolingHotpathSnapshot {
   readonly spoolWriteSyscalls: number;
   readonly spoolShortWrites: number;
   readonly spoolBytesWritten: number;
+  readonly spoolGrowthRequests: number;
+  readonly spoolGrowthBytes: number;
+  readonly terminalGrowthRequests: number;
   readonly headerLinesParsed: number;
   readonly headerTransitionCopies: number;
   readonly resourceEventsObserved: number;
@@ -67,6 +70,9 @@ export class SegmentSpoolingHotpathCounters {
   spoolWriteSyscalls = 0;
   spoolShortWrites = 0;
   spoolBytesWritten = 0;
+  spoolGrowthRequests = 0;
+  spoolGrowthBytes = 0;
+  terminalGrowthRequests = 0;
   headerLinesParsed = 0;
   headerTransitionCopies = 0;
   resourceEventsObserved = 0;
@@ -160,6 +166,9 @@ export class SegmentSpoolingHotpathCounters {
       spoolWriteSyscalls: this.spoolWriteSyscalls,
       spoolShortWrites: this.spoolShortWrites,
       spoolBytesWritten: this.spoolBytesWritten,
+      spoolGrowthRequests: this.spoolGrowthRequests,
+      spoolGrowthBytes: this.spoolGrowthBytes,
+      terminalGrowthRequests: this.terminalGrowthRequests,
       headerLinesParsed: this.headerLinesParsed,
       headerTransitionCopies: this.headerTransitionCopies,
       resourceEventsObserved: this.resourceEventsObserved,

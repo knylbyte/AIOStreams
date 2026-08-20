@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { DebridError } from '../../debrid/base.js';
 import { UsenetSpoolError } from '../spool/errors.js';
 import { NntpError } from '../nntp/errors.js';
 import { YencDecodeError, YencMetadataError } from '../pool/yenc.js';
 import { PrioritySemaphoreError } from '../pool/priority-semaphore.js';
 import {
   describeUsenetError,
+  downloadAdmissionCapacityCode,
   friendlyUsenetError,
   isDownloadAdmissionCapacityError,
   toDebridError,
@@ -60,6 +62,35 @@ test('maps typed download-admission capacity to a stable 503 without erasing its
     assert.equal(mapped.code, 'SERVICE_UNAVAILABLE');
     assert.deepEqual(mapped.body, { usenetCode: code });
     assert.equal(mapped.cause, error);
+    assert.equal(downloadAdmissionCapacityCode(mapped), code);
+
+    const lazilyWrapped = new DebridError('internal wrapper', {
+      statusCode: 502,
+      statusText: 'Bad Gateway',
+      code: 'DOWNLOAD_FAILED',
+      headers: {},
+      body: null,
+      type: 'upstream_error',
+      cause: error,
+    });
+    const normalized = toDebridError(lazilyWrapped);
+    assert.equal(normalized.statusCode, 503);
+    assert.equal(normalized.code, 'SERVICE_UNAVAILABLE');
+    assert.deepEqual(normalized.body, { usenetCode: code });
+    assert.equal(normalized.cause, lazilyWrapped);
+    assert.deepEqual(describeUsenetError(lazilyWrapped), {
+      rootErrorName: 'PrioritySemaphoreError',
+      rootCode: code,
+      nntpKind: undefined,
+      timeoutSource: undefined,
+      faultDomain: 'local',
+      providerLabel: undefined,
+      connId: undefined,
+      localBackpressureMs: undefined,
+      carryBytes: undefined,
+      carryChunks: undefined,
+      carryLimitBytes: undefined,
+    });
   }
 
   for (const code of [
@@ -73,6 +104,12 @@ test('maps typed download-admission capacity to a stable 503 without erasing its
         new PrioritySemaphoreError(code, 'not capacity')
       ),
       false
+    );
+    assert.equal(
+      downloadAdmissionCapacityCode(
+        new PrioritySemaphoreError(code, 'not capacity')
+      ),
+      undefined
     );
   }
 });

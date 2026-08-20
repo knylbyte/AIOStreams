@@ -14,16 +14,43 @@ import {
 import { YencDecodeError, YencMetadataError } from '../pool/yenc.js';
 import { PrioritySemaphoreError } from '../pool/priority-semaphore.js';
 
+export type DownloadAdmissionCapacityErrorCode =
+  | 'SEMAPHORE_GLOBAL_CAPACITY'
+  | 'SEMAPHORE_OWNER_CAPACITY'
+  | 'SEMAPHORE_ACTIVE_OWNER_CAPACITY';
+
 /** True only for bounded global-download admission exhaustion. */
 export function isDownloadAdmissionCapacityError(
   error: unknown
-): error is PrioritySemaphoreError {
+): error is PrioritySemaphoreError & {
+  readonly code: DownloadAdmissionCapacityErrorCode;
+} {
   if (!(error instanceof PrioritySemaphoreError)) return false;
   return (
     error.code === 'SEMAPHORE_GLOBAL_CAPACITY' ||
     error.code === 'SEMAPHORE_OWNER_CAPACITY' ||
     error.code === 'SEMAPHORE_ACTIVE_OWNER_CAPACITY'
   );
+}
+
+/**
+ * Find a typed download-admission capacity code through a bounded error cause
+ * chain. This intentionally never inspects error messages: transport and route
+ * wrappers may add context, but the stable semaphore code remains authoritative.
+ */
+export function downloadAdmissionCapacityCode(
+  error: unknown
+): DownloadAdmissionCapacityErrorCode | undefined {
+  let current = error;
+  for (let depth = 0; depth < 8; depth++) {
+    if (isDownloadAdmissionCapacityError(current)) return current.code;
+    if (!(current instanceof Error) || !(current.cause instanceof Error)) {
+      return undefined;
+    }
+    if (current.cause === current) return undefined;
+    current = current.cause;
+  }
+  return undefined;
 }
 
 const ARCHIVE_REASONS: Record<ArchiveErrorCode, string> = {
@@ -232,6 +259,21 @@ export function friendlyUsenetError(err: unknown): {
 
 /** Map an engine/transport error onto a {@link DebridError}. */
 export function toDebridError(err: unknown): DebridError {
+  const admissionCapacityCode = downloadAdmissionCapacityCode(err);
+  if (admissionCapacityCode) {
+    return new DebridError(
+      'The Usenet download scheduler is at capacity. Please retry shortly.',
+      {
+        statusCode: 503,
+        statusText: 'Service Unavailable',
+        code: 'SERVICE_UNAVAILABLE',
+        headers: {},
+        body: { usenetCode: admissionCapacityCode },
+        type: 'api_error',
+        cause: err,
+      }
+    );
+  }
   if (err instanceof DebridError) return err;
   if (err instanceof ArticleNotFoundError) {
     return new DebridError('article not found on any provider', {
@@ -269,20 +311,6 @@ export function toDebridError(err: unknown): DebridError {
       type: 'upstream_error',
       cause: err,
     });
-  }
-  if (isDownloadAdmissionCapacityError(err)) {
-    return new DebridError(
-      'The Usenet download scheduler is at capacity. Please retry shortly.',
-      {
-        statusCode: 503,
-        statusText: 'Service Unavailable',
-        code: 'SERVICE_UNAVAILABLE',
-        headers: {},
-        body: { usenetCode: err.code },
-        type: 'api_error',
-        cause: err,
-      }
-    );
   }
   if (err instanceof UsenetEngineClosedError) {
     return new DebridError(
@@ -361,11 +389,15 @@ export function describeUsenetError(error: unknown): UsenetErrorLogDetails {
   let current = error instanceof Error ? error : new Error('Unknown error');
   let root = current;
   let nntp: NntpError | undefined;
+  let semaphore: PrioritySemaphoreError | undefined;
   const seen = new Set<Error>();
   for (let depth = 0; depth < 8 && !seen.has(current); depth++) {
     seen.add(current);
     root = current;
     if (!nntp && current instanceof NntpError) nntp = current;
+    if (!semaphore && current instanceof PrioritySemaphoreError) {
+      semaphore = current;
+    }
     if (!('cause' in current) || !(current.cause instanceof Error)) break;
     current = current.cause;
   }
@@ -374,7 +406,7 @@ export function describeUsenetError(error: unknown): UsenetErrorLogDetails {
     rootCode: stableErrorCode(root),
     nntpKind: nntp?.kind,
     timeoutSource: nntp?.timeoutSource,
-    faultDomain: nntp?.faultDomain,
+    faultDomain: nntp?.faultDomain ?? semaphore?.faultDomain,
     providerLabel: nntp?.provider,
     connId: nntp?.connId,
     localBackpressureMs: nntp?.localBackpressureMs,

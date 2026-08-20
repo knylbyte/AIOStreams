@@ -71,7 +71,17 @@ export interface DirectDecodeByteSink extends BackpressuredByteSink {
   readonly directDecode: true;
   readonly maxDecodeInputBytes: number;
   acquireDecodeTarget(maxDecodedBytes: number): Buffer;
-  commitDecoded(bytes: number, inputBoundary: boolean): boolean;
+  commitDecoded(bytes: number, options: DirectDecodeCommitOptions): boolean;
+}
+
+/**
+ * Synchronous terminal metadata for one caller-owned decode target. The yEnc
+ * decoder is the only authority for `articleEnded`; sinks must not infer it
+ * from byte counts, batch shape, or the later BODY `end()` callback.
+ */
+export interface DirectDecodeCommitOptions {
+  readonly inputBoundary: boolean;
+  readonly articleEnded: boolean;
 }
 
 /** Fixed-size lifecycle telemetry; it never receives article identifiers. */
@@ -356,7 +366,10 @@ export class StreamingYencArticleDecoder {
       const written = this.decoder.pushInto(raw, target);
       this.decodedBytes += written;
       this.notifyDecodedPayload(written);
-      return this.directSink.commitDecoded(written, inputBoundary);
+      return this.directSink.commitDecoded(written, {
+        inputBoundary,
+        articleEnded: this.decoder.ended,
+      });
     }
     const decoded = this.decoder.push(raw);
     if (decoded.length === 0) return true;
