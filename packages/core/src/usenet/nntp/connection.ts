@@ -76,6 +76,8 @@ export interface ConnectionOptions {
  * retain the raw chunk view beyond `write`; it aliases parser scratch.
  */
 export interface BackpressuredBodyConsumer {
+  /** Optional fixed-cost observer after a successful BODY status line. */
+  onStatus?(): void;
   write(chunk: Buffer): boolean;
   onceDrain(listener: () => void): void;
   end(): Promise<void>;
@@ -1461,6 +1463,7 @@ export class NntpConnection {
     if (head.solo) {
       this.opts.onLatencySample?.(this.now() - head.writtenAt);
     }
+    head.bodyConsumer?.onStatus?.();
     head.stage = 'payload';
     if (head.consumer) {
       parser.beginStreamingBody(head.consumer);

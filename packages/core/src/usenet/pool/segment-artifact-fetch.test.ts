@@ -43,7 +43,16 @@ import {
   SegmentSpoolingRuntime,
   type SegmentSpoolingRuntimeOptions,
 } from './segment-spooling-runtime.js';
-import { MultiProviderPool } from './multi-provider-pool.js';
+import {
+  MultiProviderPool,
+  type SegmentDownloadPhase,
+} from './multi-provider-pool.js';
+import {
+  MAX_ACTIVE_SEMAPHORE_OWNERS,
+  PrioritySemaphore,
+  PrioritySemaphoreError,
+  type PrioritySemaphoreErrorCode,
+} from './priority-semaphore.js';
 import { SpoolingSegmentsStream } from './spooling-segments-stream.js';
 import { YencDecodeError, YencMetadataError } from './yenc.js';
 import { resolveSegmentStreamMemoryBytes } from '../stream-queue-budget.js';
@@ -79,6 +88,7 @@ class FakeSegmentFetcher implements SegmentFetcher {
   streamingCalls = 0;
   bufferingCalls = 0;
   headCalls = 0;
+  probeCalls = 0;
   lastHeadOptions: SegmentHeadFetchOptions | undefined;
   closed = false;
 
@@ -212,6 +222,7 @@ class FakeSegmentFetcher implements SegmentFetcher {
   }
 
   probeBodyOnProvider(): Promise<'ok'> {
+    this.probeCalls++;
     return Promise.resolve('ok');
   }
 
@@ -400,6 +411,32 @@ async function writeBodyChunks(
   }
 }
 
+function hasSemaphoreCode(code: PrioritySemaphoreErrorCode) {
+  return (error: unknown): boolean => {
+    assert(error instanceof PrioritySemaphoreError);
+    assert.equal(error.code, code);
+    if (
+      code === 'SEMAPHORE_GLOBAL_CAPACITY' ||
+      code === 'SEMAPHORE_OWNER_CAPACITY' ||
+      code === 'SEMAPHORE_ACTIVE_OWNER_CAPACITY'
+    ) {
+      assert.equal(error.faultDomain, 'local');
+    }
+    return true;
+  };
+}
+
+async function waitForSemaphoreWaiting(
+  semaphore: PrioritySemaphore,
+  waiting: number
+): Promise<void> {
+  for (let turn = 0; turn < 50; turn++) {
+    if (semaphore.waiting === waiting) return;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.equal(semaphore.waiting, waiting);
+}
+
 function spoolingPlan(): SegmentSpoolingPlan {
   const readerHighWaterMarkBytes = 64 * KIBIBYTE_BYTES;
   return {
@@ -425,6 +462,12 @@ interface HarnessOptions {
   readonly spoolManager?: SpoolManager;
   readonly artifactCache?: SegmentArtifactCacheLookup;
   readonly onEvent?: SegmentSpoolingRuntimeOptions['onEvent'];
+  readonly globalDownloadSemaphore?: PrioritySemaphore;
+  readonly onDownloadPhase?: (
+    ownerKey: string,
+    phaseId: number,
+    phase: SegmentDownloadPhase
+  ) => void;
 }
 
 async function createHarness(
@@ -459,7 +502,12 @@ async function createHarness(
     engineOptions,
     cache,
     new StatsAccumulator(),
-    { fetcher, spooling: runtime }
+    {
+      fetcher,
+      spooling: runtime,
+      globalDownloadSemaphore: options.globalDownloadSemaphore,
+      onDownloadPhase: options.onDownloadPhase,
+    }
   );
   context.after(async () => {
     await Promise.allSettled([pool.close(), runtime.close(), cache.close()]);
@@ -870,6 +918,7 @@ test('an exact-length artifact becomes readable after its first committed spool 
   const firstChunkWritten = Promise.withResolvers<void>();
   const afterFirstChunkGate = Promise.withResolvers<void>();
   const finished = Promise.withResolvers<void>();
+  const phases: Array<{ readonly id: number; readonly phase: string }> = [];
   const body = Buffer.alloc(64 * KIBIBYTE_BYTES, 0x5a);
   fetcher.behaviors.set('growing', {
     body,
@@ -878,7 +927,9 @@ test('an exact-length artifact becomes readable after its first committed spool 
     afterFirstChunkGate: afterFirstChunkGate.promise,
     finished,
   });
-  const { pool, runtime } = await createHarness(context, fetcher);
+  const { pool, runtime } = await createHarness(context, fetcher, {
+    onDownloadPhase: (_ownerKey, id, phase) => phases.push({ id, phase }),
+  });
   let producerFinished = false;
   void finished.promise.then(() => {
     producerFinished = true;
@@ -894,6 +945,15 @@ test('an exact-length artifact becomes readable after its first committed spool 
   await firstChunkWritten.promise;
   const artifact = await artifactPromise;
   assert.equal(producerFinished, false);
+  const committed = phases.findIndex(
+    (entry) => entry.phase === 'first_sink_commit'
+  );
+  const readable = phases.findIndex(
+    (entry) => entry.phase === 'artifact_readable'
+  );
+  assert(committed >= 0);
+  assert.equal(readable, committed + 1);
+  assert.equal(phases[readable].id, phases[committed].id);
   const reader = artifact.createReadStream();
   const chunks: Buffer[] = [];
   const firstData = Promise.withResolvers<void>();
@@ -1180,6 +1240,86 @@ test('a future SpoolingSegmentsStream task waits for complete provider failover'
   assert.equal(fetcher.streamingCalls, 2);
   assert.equal(runtime.spoolManager.stats().artifacts, 0);
   assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+});
+
+test('startup admission exposes one follower on wire and the rest after first commit', async (context) => {
+  const fetcher = new FakeSegmentFetcher();
+  const firstAttempt = Promise.withResolvers<void>();
+  const firstWireGate = Promise.withResolvers<void>();
+  const firstPayloadGate = Promise.withResolvers<void>();
+  const firstStarted = Promise.withResolvers<void>();
+  const futureAttempt = Promise.withResolvers<void>();
+  const futureStarted = Promise.withResolvers<void>();
+  const laterAttempt = Promise.withResolvers<void>();
+  const laterStarted = Promise.withResolvers<void>();
+  fetcher.behaviors.set('startup-first', {
+    body: Buffer.from('first'),
+    attemptCreated: firstAttempt,
+    preWireGate: firstWireGate.promise,
+    gate: firstPayloadGate.promise,
+    started: firstStarted,
+  });
+  fetcher.behaviors.set('startup-future', {
+    body: Buffer.from('future'),
+    attemptCreated: futureAttempt,
+    started: futureStarted,
+  });
+  fetcher.behaviors.set('startup-later', {
+    body: Buffer.from('later'),
+    attemptCreated: laterAttempt,
+    started: laterStarted,
+  });
+  const { pool } = await createHarness(context, fetcher);
+
+  let futureAttemptCreated = false;
+  void futureAttempt.promise.then(() => {
+    futureAttemptCreated = true;
+  });
+  let laterAttemptCreated = false;
+  void laterAttempt.promise.then(() => {
+    laterAttemptCreated = true;
+  });
+  const first = pool.fetchSegmentArtifact(
+    { messageId: 'startup-first', bytes: 5 },
+    'startup-owner',
+    undefined,
+    CommandPriority.High,
+    { expectedLength: 5, allowGrowing: true }
+  );
+  const future = pool.fetchSegmentArtifact(
+    { messageId: 'startup-future', bytes: 6 },
+    'startup-owner',
+    undefined,
+    CommandPriority.High,
+    { expectedLength: 6, allowGrowing: false }
+  );
+  const later = pool.fetchSegmentArtifact(
+    { messageId: 'startup-later', bytes: 5 },
+    'startup-owner',
+    undefined,
+    CommandPriority.High,
+    { expectedLength: 5, allowGrowing: false }
+  );
+
+  await firstAttempt.promise;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(fetcher.streamingCalls, 1);
+  assert.equal(futureAttemptCreated, false);
+
+  firstWireGate.resolve();
+  await firstStarted.promise;
+  await futureAttempt.promise;
+  await futureStarted.promise;
+  assert.equal(fetcher.streamingCalls, 2);
+  assert.equal(laterAttemptCreated, false);
+
+  firstPayloadGate.resolve();
+  await laterAttempt.promise;
+  await laterStarted.promise;
+  assert.equal(fetcher.streamingCalls, 3);
+  assert.equal((await readArtifact(await first)).toString(), 'first');
+  assert.equal((await readArtifact(await future)).toString(), 'future');
+  assert.equal((await readArtifact(await later)).toString(), 'later');
 });
 
 test('stream memory atomically reserves the requested bounded queue bytes', async (context) => {
@@ -2068,6 +2208,254 @@ test('promotion release after runtime close is inert and frees its bytes', async
       return error.code === 'USENET_SPOOL_CLOSED';
     }
   );
+});
+
+test('buffering shared fetch preserves active-owner capacity without provider or miss-cache side effects', async (context) => {
+  const fetcher = new GatedBufferingFetcher();
+  context.after(() => fetcher.gate.resolve());
+  const semaphore = new PrioritySemaphore(1, 1, {
+    maxWaiters: MAX_ACTIVE_SEMAPHORE_OWNERS + 1,
+    maxWaitersPerOwner: 1,
+  });
+  const { pool } = await createHarness(context, fetcher, {
+    globalDownloadSemaphore: semaphore,
+  });
+  const holder = pool.fetchSegmentShared(
+    { messageId: 'owner-cap-holder' },
+    'holder',
+    undefined
+  );
+  await fetcher.started.promise;
+  const queued = Array.from(
+    { length: MAX_ACTIVE_SEMAPHORE_OWNERS },
+    (_, index) =>
+      pool.fetchSegmentShared(
+        { messageId: `owner-cap-${index}` },
+        `owner-${index}`,
+        undefined
+      )
+  );
+  await waitForSemaphoreWaiting(semaphore, MAX_ACTIVE_SEMAPHORE_OWNERS);
+
+  await assert.rejects(
+    pool.fetchSegmentShared(
+      { messageId: 'owner-cap-rejected' },
+      'owner-overflow',
+      undefined
+    ),
+    hasSemaphoreCode('SEMAPHORE_ACTIVE_OWNER_CAPACITY')
+  );
+  assert.equal(fetcher.bufferingCalls, 1, 'capacity must reject pre-provider');
+  assert.equal(
+    pool.poolInfo().globalDownloadsWaiting,
+    MAX_ACTIVE_SEMAPHORE_OWNERS
+  );
+
+  fetcher.gate.resolve();
+  for (const shared of await Promise.all([holder, ...queued])) {
+    shared.release();
+  }
+  const retried = await pool.fetchSegmentShared(
+    { messageId: 'owner-cap-rejected' },
+    'owner-overflow',
+    undefined
+  );
+  retried.release();
+  assert.equal(
+    fetcher.bufferingCalls,
+    MAX_ACTIVE_SEMAPHORE_OWNERS + 2,
+    'capacity rejection must not create a definitive negative-cache entry'
+  );
+  assert.equal(semaphore.activeOwners, 0);
+  assert.equal(semaphore.waiting, 0);
+});
+
+test('buffering fetch preserves global and per-owner waiter capacity codes', async (context) => {
+  const globalFetcher = new GatedBufferingFetcher();
+  context.after(() => globalFetcher.gate.resolve());
+  const globalSemaphore = new PrioritySemaphore(1, 1, {
+    maxWaiters: 1,
+    maxWaitersPerOwner: 1,
+    maxActiveOwners: 2,
+  });
+  const { pool: globalPool } = await createHarness(context, globalFetcher, {
+    globalDownloadSemaphore: globalSemaphore,
+  });
+  const globalHolder = globalPool.fetchSegmentShared(
+    { messageId: 'global-holder' },
+    'holder',
+    undefined
+  );
+  await globalFetcher.started.promise;
+  const globalQueued = globalPool.fetchSegmentShared(
+    { messageId: 'global-queued' },
+    'queued',
+    undefined
+  );
+  await waitForSemaphoreWaiting(globalSemaphore, 1);
+  await assert.rejects(
+    globalPool.fetchSegmentShared(
+      { messageId: 'global-rejected' },
+      'rejected',
+      undefined
+    ),
+    hasSemaphoreCode('SEMAPHORE_GLOBAL_CAPACITY')
+  );
+  globalFetcher.gate.resolve();
+  for (const shared of await Promise.all([globalHolder, globalQueued])) {
+    shared.release();
+  }
+  assert.equal(globalSemaphore.waiting, 0);
+  assert.equal(globalSemaphore.activeOwners, 0);
+
+  const ownerFetcher = new GatedBufferingFetcher();
+  context.after(() => ownerFetcher.gate.resolve());
+  const ownerSemaphore = new PrioritySemaphore(1, 1, {
+    maxWaiters: 2,
+    maxWaitersPerOwner: 1,
+    maxActiveOwners: 2,
+  });
+  const { pool: ownerPool } = await createHarness(context, ownerFetcher, {
+    globalDownloadSemaphore: ownerSemaphore,
+  });
+  const ownerHolder = ownerPool.fetchSegmentShared(
+    { messageId: 'per-owner-holder' },
+    'holder',
+    undefined
+  );
+  await ownerFetcher.started.promise;
+  const ownerQueued = ownerPool.fetchSegmentShared(
+    { messageId: 'per-owner-queued' },
+    'same-owner',
+    undefined
+  );
+  await waitForSemaphoreWaiting(ownerSemaphore, 1);
+  await assert.rejects(
+    ownerPool.fetchSegmentShared(
+      { messageId: 'per-owner-rejected' },
+      'same-owner',
+      undefined
+    ),
+    hasSemaphoreCode('SEMAPHORE_OWNER_CAPACITY')
+  );
+  ownerFetcher.gate.resolve();
+  for (const shared of await Promise.all([ownerHolder, ownerQueued])) {
+    shared.release();
+  }
+  assert.equal(ownerSemaphore.waiting, 0);
+  assert.equal(ownerSemaphore.activeOwners, 0);
+});
+
+test('every global download path shares the typed capacity boundary', async (context) => {
+  const fetcher = new GatedBufferingFetcher();
+  context.after(() => fetcher.gate.resolve());
+  const semaphore = new PrioritySemaphore(1, 1, {
+    maxWaiters: 1,
+    maxWaitersPerOwner: 1,
+    maxActiveOwners: 2,
+  });
+  const { pool, runtime } = await createHarness(context, fetcher, {
+    globalDownloadSemaphore: semaphore,
+  });
+  const holder = pool.fetchSegmentShared(
+    { messageId: 'taxonomy-holder' },
+    'holder',
+    undefined
+  );
+  await fetcher.started.promise;
+  const queued = pool.fetchSegmentShared(
+    { messageId: 'taxonomy-queued' },
+    'queued',
+    undefined
+  );
+  await waitForSemaphoreWaiting(semaphore, 1);
+
+  const operations: Array<Promise<unknown>> = [
+    pool.fetchSegmentShared(
+      { messageId: 'taxonomy-buffering' },
+      'buffering',
+      undefined
+    ),
+    pool.fetchSegmentInto(
+      { messageId: 'taxonomy-into' },
+      'into',
+      undefined,
+      CommandPriority.High,
+      () => Buffer.alloc(64)
+    ),
+    pool.fetchSegmentArtifact(
+      { messageId: 'taxonomy-artifact' },
+      'artifact',
+      undefined
+    ),
+    pool.fetchSegmentRangeMetadata(
+      { messageId: 'taxonomy-metadata' },
+      'metadata',
+      undefined
+    ),
+    pool.fetchSegmentHead(
+      { messageId: 'taxonomy-head' },
+      'head',
+      undefined,
+      CommandPriority.High,
+      16
+    ),
+    pool.probeBodyOnProvider({ messageId: 'taxonomy-probe' }, 'provider'),
+  ];
+  for (const operation of operations) {
+    await assert.rejects(
+      operation,
+      hasSemaphoreCode('SEMAPHORE_GLOBAL_CAPACITY')
+    );
+  }
+  assert.equal(fetcher.bufferingCalls, 1);
+  assert.equal(fetcher.streamingCalls, 0);
+  assert.equal(fetcher.headCalls, 0);
+  assert.equal(fetcher.probeCalls, 0);
+  assert.equal(runtime.memoryBudget.stats().usedBytes, 0);
+
+  fetcher.gate.resolve();
+  for (const shared of await Promise.all([holder, queued])) shared.release();
+  assert.equal(semaphore.waiting, 0);
+  assert.equal(semaphore.activeOwners, 0);
+});
+
+test('a real buffering admission abort remains the established NNTP abort contract', async (context) => {
+  const fetcher = new GatedBufferingFetcher();
+  context.after(() => fetcher.gate.resolve());
+  const semaphore = new PrioritySemaphore(1);
+  const { pool } = await createHarness(context, fetcher, {
+    globalDownloadSemaphore: semaphore,
+  });
+  const holder = pool.fetchSegmentShared(
+    { messageId: 'abort-holder' },
+    'holder',
+    undefined
+  );
+  await fetcher.started.promise;
+  const controller = new AbortController();
+  const pending = pool.fetchSegmentInto(
+    { messageId: 'abort-queued' },
+    'abort-owner',
+    controller.signal,
+    CommandPriority.High,
+    () => Buffer.alloc(64)
+  );
+  await waitForSemaphoreWaiting(semaphore, 1);
+
+  controller.abort();
+  await assert.rejects(pending, (error: unknown) => {
+    assert(error instanceof NntpError);
+    assert.equal(error.kind, 'connection');
+    assert.equal(error.message, 'aborted');
+    return true;
+  });
+  await waitForSemaphoreWaiting(semaphore, 0);
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+  assert.equal(fetcher.bufferingCalls, 1);
+
+  fetcher.gate.resolve();
+  (await holder).release();
 });
 
 test('pool close rejects and awaits an on-wire buffering shared flight', async (context) => {

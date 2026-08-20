@@ -19,6 +19,13 @@ function hasCode(code: PrioritySemaphoreErrorCode) {
   return (error: unknown): boolean => {
     assert(error instanceof PrioritySemaphoreError);
     assert.equal(error.code, code);
+    if (
+      code === 'SEMAPHORE_GLOBAL_CAPACITY' ||
+      code === 'SEMAPHORE_OWNER_CAPACITY' ||
+      code === 'SEMAPHORE_ACTIVE_OWNER_CAPACITY'
+    ) {
+      assert.equal(error.faultDomain, 'local');
+    }
     return true;
   };
 }
@@ -98,6 +105,38 @@ test('a later stream owner is not queued behind one owner prefetch tail', async 
   for (const release of occupied.slice(2)) release();
   for (const promise of queuedA.slice(1)) (await promise)();
   assert.equal(semaphore.inUse, 0);
+});
+
+test('a later playback first-byte turn precedes an existing low-priority prefetch tail', async () => {
+  const semaphore = new PrioritySemaphore(1, 0.8);
+  const occupied = await semaphore.acquire(
+    CommandPriority.High,
+    undefined,
+    'stream-a'
+  );
+  const grants: string[] = [];
+  const prefetch = Array.from({ length: 8 }, (_, index) =>
+    semaphore
+      .acquire(CommandPriority.Low, undefined, 'stream-a')
+      .then((release) => {
+        grants.push(`A-prefetch-${index}`);
+        return release;
+      })
+  );
+  const streamB = semaphore
+    .acquire(CommandPriority.High, undefined, 'stream-b')
+    .then((release) => {
+      grants.push('B-first-byte-admission');
+      return release;
+    });
+
+  occupied();
+  const releaseB = await streamB;
+  assert.deepEqual(grants, ['B-first-byte-admission']);
+  releaseB();
+  for (const pending of prefetch) (await pending)();
+  assert.equal(semaphore.waiting, 0);
+  assert.equal(semaphore.activeOwners, 0);
 });
 
 test('aborting a sole waiter removes its owner turn completely', async () => {

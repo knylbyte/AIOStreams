@@ -1,5 +1,9 @@
+import assert from 'node:assert/strict';
 import { SegmentCache } from './segment-cache.js';
-import { PrioritySemaphore } from './priority-semaphore.js';
+import {
+  PrioritySemaphore,
+  PrioritySemaphoreError,
+} from './priority-semaphore.js';
 import { StatsAccumulator } from '../stats/accumulator.js';
 import { createLogger } from '../../logging/logger.js';
 import {
@@ -53,6 +57,7 @@ import type { ByteLease } from './byte-budget.js';
 import type { SegmentStreamCleanupCause } from './resource-events.js';
 
 const logger = createLogger('usenet/multi-provider-pool');
+const UNCONTENDED_DECODE_TURNS_PER_YIELD = 2;
 
 function inferSegmentRangeLayout(
   metadata: SegmentRangeMetadata
@@ -177,16 +182,60 @@ interface ArtifactWaiter {
 interface ArtifactFlight {
   readonly waiters: Set<ArtifactWaiter>;
   readonly ctl: AbortController;
+  readonly ownerKey: string;
+  /** Anonymous monotonic correlation for fixed-cost phase telemetry. */
+  readonly phaseId: number;
   onWire: boolean;
   growingOwner?: SharedSpoolArtifactOwner;
   growingOwnerPublished: boolean;
+  startupGate?: ArtifactStartupGate;
+  startupWaitFor?: ArtifactStartupWaitPhase;
+  opensStartupGate: boolean;
   task?: Promise<void>;
 }
+
+type ArtifactStartupWaitPhase = 'early-follower' | 'first-commit';
+
+interface ArtifactStartupGate {
+  readonly ownerKey: string;
+  readonly earlyFollowersReady: Promise<void>;
+  readonly resolveEarlyFollowers: () => void;
+  readonly allReady: Promise<void>;
+  readonly resolveAll: () => void;
+  earlyFollowersAssigned: number;
+  earlyFollowersReleased: boolean;
+  opened: boolean;
+  earlyFollowersImmediate?: NodeJS.Immediate;
+  openImmediate?: NodeJS.Immediate;
+}
+
+interface ArtifactStartupAdmission {
+  readonly gate: ArtifactStartupGate;
+  readonly opener: boolean;
+  readonly waitFor?: ArtifactStartupWaitPhase;
+}
+
+export type SegmentDownloadPhase =
+  | 'global_admission_requested'
+  | 'global_admission_granted'
+  | 'provider_slot_granted'
+  | 'nntp_status'
+  | 'first_decoded_payload'
+  | 'first_sink_commit'
+  | 'artifact_readable';
 
 /** Optional construction seams used by the engine and deterministic tests. */
 export interface MultiProviderPoolDependencies {
   readonly fetcher?: SegmentFetcher;
   readonly spooling?: SegmentSpoolingRuntime;
+  /** Bounded admission seam for deterministic capacity-contract tests. */
+  readonly globalDownloadSemaphore?: PrioritySemaphore;
+  /** Fixed-cost benchmark observer; receives no payload or article id. */
+  readonly onDownloadPhase?: (
+    ownerKey: string,
+    phaseId: number,
+    phase: SegmentDownloadPhase
+  ) => void;
   /** Deterministic lifecycle seam; receives only the bounded owner count. */
   readonly onActiveOperationCountChanged?: (active: number) => void;
 }
@@ -336,6 +385,20 @@ export class MultiProviderPool {
   private readonly onActiveOperationCountChanged:
     | ((active: number) => void)
     | undefined;
+  private readonly onDownloadPhase:
+    | ((ownerKey: string, phaseId: number, phase: SegmentDownloadPhase) => void)
+    | undefined;
+  private downloadPhaseSequence = 0;
+  /** Ref-counted distinct playback owners; bounded by global download permits. */
+  private readonly activeSpoolingDownloadOwners = new Map<string, number>();
+  private readonly activeSpoolingDownloadOwnerLimit: number;
+  /** One bounded, two-stage startup fence per active playback owner. */
+  private readonly artifactStartupGates = new Map<
+    string,
+    ArtifactStartupGate
+  >();
+  /** At most one connection pipeline can precede the first committed byte. */
+  private readonly artifactStartupEarlyFollowerLimit: number;
   /** Single-flight coordinator for shared (arena-backed) segment fetches. */
   private sharedInflight = new Map<string, SharedFlight>();
   /** Single-flight coordinator for file-backed segment artifacts. */
@@ -360,6 +423,68 @@ export class MultiProviderPool {
     return signal
       ? AbortSignal.any([signal, this.closeController.signal])
       : this.closeController.signal;
+  }
+
+  /**
+   * One admission boundary for every BODY/head operation. Capacity and
+   * programming errors retain their typed semaphore contract; only actual
+   * cancellation is translated to the established NNTP abort error. A pool
+   * close always wins over the composite close signal.
+   */
+  private async acquireGlobalDownload(
+    priority: CommandPriority,
+    ownerKey: string,
+    signal: AbortSignal,
+    phaseId = this.nextDownloadPhaseId()
+  ): Promise<() => void> {
+    this.markDownloadPhase(ownerKey, phaseId, 'global_admission_requested');
+    try {
+      const release = await this.globalDownloads.acquire(
+        priority,
+        signal,
+        ownerKey
+      );
+      this.markDownloadPhase(ownerKey, phaseId, 'global_admission_granted');
+      return release;
+    } catch (error) {
+      if (this.closedError) throw this.closedError;
+      if (
+        signal.aborted ||
+        (error instanceof PrioritySemaphoreError &&
+          error.code === 'SEMAPHORE_ABORTED')
+      ) {
+        throw new NntpError('connection', 'aborted', { cause: error });
+      }
+      if (
+        error instanceof PrioritySemaphoreError &&
+        error.code === 'SEMAPHORE_CLOSED'
+      ) {
+        throw new UsenetSpoolError(
+          'USENET_SPOOL_CLOSED',
+          'Usenet download admission is closed',
+          { cause: error }
+        );
+      }
+      throw error;
+    }
+  }
+
+  private markDownloadPhase(
+    ownerKey: string,
+    phaseId: number,
+    phase: SegmentDownloadPhase
+  ): void {
+    try {
+      this.onDownloadPhase?.(ownerKey, phaseId, phase);
+    } catch {
+      // Benchmark/diagnostic observers never participate in ownership.
+    }
+  }
+
+  private nextDownloadPhaseId(): number {
+    const id = this.downloadPhaseSequence;
+    this.downloadPhaseSequence = id === Number.MAX_SAFE_INTEGER ? 0 : id + 1;
+    return id;
   }
 
   private trackOperation<T>(operation: () => Promise<T>): Promise<T> {
@@ -479,6 +604,17 @@ export class MultiProviderPool {
     this.spooling = dependencies.spooling;
     this.onActiveOperationCountChanged =
       dependencies.onActiveOperationCountChanged;
+    this.onDownloadPhase = dependencies.onDownloadPhase;
+    this.activeSpoolingDownloadOwnerLimit = Math.max(
+      1,
+      opts.maxConcurrentDownloads
+    );
+    this.artifactStartupEarlyFollowerLimit = Math.max(
+      1,
+      ...providers.map((provider) =>
+        Math.max(0, (provider.pipelineDepth ?? 1) - 1)
+      )
+    );
 
     // The global download budget is a HARD ceiling on concurrent in-flight
     // BODY/ARTICLE downloads. It is auto-sized (in buildUsenetEngineOptions) to
@@ -486,11 +622,13 @@ export class MultiProviderPool {
     // explicit `maxConcurrentDownloads` lower than that is honoured as a real
     // cap (the per-provider connection pools still bound sockets per account).
     // The per-stream priority reservation rides on this semaphore.
-    this.globalDownloads = new PrioritySemaphore(
-      Math.max(1, opts.maxConcurrentDownloads),
-      opts.streamingPriority,
-      { hotpathCounters: dependencies.spooling?.hotpathCounters }
-    );
+    this.globalDownloads =
+      dependencies.globalDownloadSemaphore ??
+      new PrioritySemaphore(
+        Math.max(1, opts.maxConcurrentDownloads),
+        opts.streamingPriority,
+        { hotpathCounters: dependencies.spooling?.hotpathCounters }
+      );
   }
 
   /**
@@ -656,6 +794,31 @@ export class MultiProviderPool {
         'Growing artifact delivery must be a boolean'
       );
     }
+    const startup = this.artifactStartupAdmission(nzbHash, allowGrowing);
+    try {
+      return await this.fetchSegmentArtifactOnce(
+        segment,
+        nzbHash,
+        signal,
+        priority,
+        expectations,
+        allowGrowing,
+        startup
+      );
+    } finally {
+      if (startup?.opener) this.openArtifactStartupGate(startup.gate);
+    }
+  }
+
+  private async fetchSegmentArtifactOnce(
+    segment: NzbSegmentRef,
+    nzbHash: string,
+    signal: AbortSignal | undefined,
+    priority: CommandPriority,
+    expectations: ArtifactExpectations,
+    allowGrowing: boolean,
+    startup: ArtifactStartupAdmission | undefined
+  ): Promise<SegmentArtifact> {
     const id = segment.messageId;
     const pinned = this.arena.acquire(id);
     if (pinned) {
@@ -702,7 +865,8 @@ export class MultiProviderPool {
       priority,
       signal,
       expectations,
-      allowGrowing
+      allowGrowing,
+      startup
     );
   }
 
@@ -770,10 +934,10 @@ export class MultiProviderPool {
     if (cached !== undefined) throw this.cachedMissError(id, cached);
     return this.trackOperation(async () => {
       const operationSignal = this.operationSignal(signal);
-      const releaseGlobal = await this.globalDownloads.acquire(
+      const releaseGlobal = await this.acquireGlobalDownload(
         priority,
-        operationSignal,
-        nzbHash
+        nzbHash,
+        operationSignal
       );
       const wire = this.wireTracker();
       try {
@@ -860,7 +1024,8 @@ export class MultiProviderPool {
     priority: CommandPriority,
     signal: AbortSignal | undefined,
     expectations: ArtifactExpectations,
-    allowGrowing: boolean
+    allowGrowing: boolean,
+    startup: ArtifactStartupAdmission | undefined
   ): Promise<SegmentArtifact> {
     try {
       this.assertOpen();
@@ -882,12 +1047,22 @@ export class MultiProviderPool {
       flight = {
         waiters: new Set<ArtifactWaiter>(),
         ctl: new AbortController(),
+        ownerKey: nzbHash,
+        phaseId: this.nextDownloadPhaseId(),
         onWire: false,
         growingOwnerPublished: false,
+        startupGate: startup?.gate,
+        startupWaitFor: startup?.waitFor,
+        opensStartupGate: startup?.opener ?? false,
       };
       this.artifactInflight.set(id, flight);
     }
     const joined = flight;
+    if (startup?.opener && !isNew) {
+      joined.startupGate = startup.gate;
+      joined.opensStartupGate = true;
+      this.openArtifactStartupGate(startup.gate);
+    }
     if (joined.waiters.size >= ARTIFACT_WAITERS_PER_FLIGHT_MAX) {
       return Promise.reject(
         new UsenetSpoolError(
@@ -986,29 +1161,36 @@ export class MultiProviderPool {
       | Awaited<ReturnType<SegmentSpoolingRuntime['acquireDownloadMemory']>>
       | undefined;
     let releaseGlobal: (() => void) | undefined;
+    let releaseDownloadOwner: (() => void) | undefined;
     let downloadCounted = false;
     const wire = this.wireTracker();
     let unownedArtifact: GrowingSpoolArtifact | undefined;
     try {
+      if (
+        flight.startupGate &&
+        !flight.opensStartupGate &&
+        flight.startupWaitFor
+      ) {
+        await this.awaitArtifactStartupGate(
+          flight.startupGate,
+          flight.startupWaitFor,
+          flight.ctl.signal
+        );
+      }
       const downloadMemoryLease = await runtime.acquireDownloadMemory(
         priority,
         flight.ctl.signal
       );
       memoryLease = downloadMemoryLease;
-      try {
-        releaseGlobal = await this.globalDownloads.acquire(
-          priority,
-          flight.ctl.signal,
-          nzbHash
-        );
-        runtime.hotpathCounters?.downloadStarted(nzbHash);
-        downloadCounted = true;
-      } catch (error) {
-        if (flight.ctl.signal.aborted) {
-          throw new NntpError('connection', 'aborted');
-        }
-        throw error;
-      }
+      releaseGlobal = await this.acquireGlobalDownload(
+        priority,
+        nzbHash,
+        flight.ctl.signal,
+        flight.phaseId
+      );
+      releaseDownloadOwner = this.registerSpoolingDownloadOwner(nzbHash);
+      runtime.hotpathCounters?.downloadStarted(nzbHash);
+      downloadCounted = true;
 
       const result = await this.fetcher.fetchBodyToSink(
         segment,
@@ -1024,11 +1206,53 @@ export class MultiProviderPool {
             signal: flight.ctl.signal,
             priority,
           });
+          let uncontendedDecodeTurns = 0;
+          let sharedPlayback = false;
           const sink = new SpoolingSegmentSink(
             artifact,
             2 * runtime.plan.decoderChunkBytes,
             runtime.plan.decoderChunkBytes,
-            runtime.hotpathCounters
+            runtime.hotpathCounters,
+            {
+              onFirstSinkCommit: () => {
+                sharedPlayback = flight.waiters.size > 1;
+                this.markDownloadPhase(
+                  flight.ownerKey,
+                  flight.phaseId,
+                  'first_sink_commit'
+                );
+                const owner = flight.growingOwner;
+                if (owner?.owns(artifact)) {
+                  // `committedBytes` has already advanced when the writer
+                  // releases its child lease. Publish in that same ownership
+                  // turn instead of scheduling an extra waiter-promise
+                  // continuation on the first-byte hot path.
+                  this.publishGrowingArtifact(flight, owner);
+                }
+                if (flight.opensStartupGate && flight.startupGate) {
+                  this.scheduleArtifactStartupGate(flight.startupGate);
+                }
+              },
+              shouldYieldBeforeNextDecodeInput: () => {
+                // A locally owned half-batch can yield without publishing,
+                // copying, or releasing its memory. Contended owners always
+                // get that bounded turn. An uncontended download yields every
+                // second opportunity so its longest decode turn remains below
+                // the measured event-loop tail without giving up the
+                // two-input write-batch CPU reduction.
+                if (
+                  sharedPlayback ||
+                  this.activeSpoolingDownloadOwners.size > 1
+                ) {
+                  uncontendedDecodeTurns = 0;
+                  return true;
+                }
+                uncontendedDecodeTurns =
+                  (uncontendedDecodeTurns + 1) %
+                  UNCONTENDED_DECODE_TURNS_PER_YIELD;
+                return uncontendedDecodeTurns === 0;
+              },
+            }
           );
           const prepareGrowingOwner = (
             header: DecodedSegmentHeaderMetadata
@@ -1043,12 +1267,6 @@ export class MultiProviderPool {
             );
             flight.growingOwner = owner;
             flight.growingOwnerPublished = false;
-            void artifact
-              .waitForChange(0, flight.ctl.signal)
-              .then(() => this.publishGrowingArtifact(flight, owner))
-              .catch(() => {
-                // Attempt disposal/provider failover owns the typed failure.
-              });
           };
           return {
             sink,
@@ -1069,7 +1287,30 @@ export class MultiProviderPool {
         flight.ctl.signal,
         () => {
           flight.onWire = true;
+          if (flight.opensStartupGate && flight.startupGate) {
+            this.scheduleEarlyArtifactStartupFollowers(flight.startupGate);
+          }
           wire.start();
+        },
+        {
+          onProviderSlotGranted: () =>
+            this.markDownloadPhase(
+              flight.ownerKey,
+              flight.phaseId,
+              'provider_slot_granted'
+            ),
+          onNntpStatus: () =>
+            this.markDownloadPhase(
+              flight.ownerKey,
+              flight.phaseId,
+              'nntp_status'
+            ),
+          onFirstDecodedPayload: () =>
+            this.markDownloadPhase(
+              flight.ownerKey,
+              flight.phaseId,
+              'first_decoded_payload'
+            ),
         }
       );
       this.assertOpen();
@@ -1152,11 +1393,166 @@ export class MultiProviderPool {
       flight.waiters.clear();
       for (const waiter of waiters) waiter.fail(normalized);
     } finally {
+      if (flight.opensStartupGate && flight.startupGate) {
+        this.openArtifactStartupGate(flight.startupGate);
+      }
       wire.end();
       if (downloadCounted) runtime.hotpathCounters?.downloadEnded();
+      releaseDownloadOwner?.();
       releaseGlobal?.();
       memoryLease?.release();
     }
+  }
+
+  private artifactStartupAdmission(
+    ownerKey: string,
+    allowGrowing: boolean
+  ): ArtifactStartupAdmission | undefined {
+    const existing = this.artifactStartupGates.get(ownerKey);
+    if (existing) {
+      const waitFor: ArtifactStartupWaitPhase =
+        existing.earlyFollowersAssigned < this.artifactStartupEarlyFollowerLimit
+          ? 'early-follower'
+          : 'first-commit';
+      if (waitFor === 'early-follower') {
+        existing.earlyFollowersAssigned++;
+      }
+      return { gate: existing, opener: false, waitFor };
+    }
+    if (!allowGrowing) return undefined;
+    if (
+      this.artifactStartupGates.size >= this.activeSpoolingDownloadOwnerLimit
+    ) {
+      throw new UsenetSpoolError(
+        'USENET_SPOOL_CAPACITY',
+        'Segment-spooling startup owner capacity reached'
+      );
+    }
+    const earlyFollowers = Promise.withResolvers<void>();
+    const all = Promise.withResolvers<void>();
+    const gate: ArtifactStartupGate = {
+      ownerKey,
+      earlyFollowersReady: earlyFollowers.promise,
+      resolveEarlyFollowers: earlyFollowers.resolve,
+      allReady: all.promise,
+      resolveAll: all.resolve,
+      earlyFollowersAssigned: 0,
+      earlyFollowersReleased: false,
+      opened: false,
+    };
+    this.artifactStartupGates.set(ownerKey, gate);
+    return { gate, opener: true };
+  }
+
+  private openArtifactStartupGate(gate: ArtifactStartupGate): void {
+    if (gate.opened) return;
+    if (gate.earlyFollowersImmediate) {
+      clearImmediate(gate.earlyFollowersImmediate);
+      gate.earlyFollowersImmediate = undefined;
+    }
+    if (gate.openImmediate) {
+      clearImmediate(gate.openImmediate);
+      gate.openImmediate = undefined;
+    }
+    if (!gate.earlyFollowersReleased) {
+      gate.earlyFollowersReleased = true;
+      gate.resolveEarlyFollowers();
+    }
+    gate.opened = true;
+    if (this.artifactStartupGates.get(gate.ownerKey) === gate) {
+      this.artifactStartupGates.delete(gate.ownerKey);
+    }
+    gate.resolveAll();
+  }
+
+  private scheduleEarlyArtifactStartupFollowers(
+    gate: ArtifactStartupGate
+  ): void {
+    if (
+      gate.opened ||
+      gate.earlyFollowersReleased ||
+      gate.earlyFollowersImmediate
+    ) {
+      return;
+    }
+    gate.earlyFollowersImmediate = setImmediate(() => {
+      gate.earlyFollowersImmediate = undefined;
+      if (gate.opened || gate.earlyFollowersReleased) return;
+      gate.earlyFollowersReleased = true;
+      gate.resolveEarlyFollowers();
+    });
+  }
+
+  private scheduleArtifactStartupGate(gate: ArtifactStartupGate): void {
+    if (gate.opened || gate.openImmediate) return;
+    gate.openImmediate = setImmediate(() => {
+      gate.openImmediate = undefined;
+      this.openArtifactStartupGate(gate);
+    });
+  }
+
+  private async awaitArtifactStartupGate(
+    gate: ArtifactStartupGate,
+    waitFor: ArtifactStartupWaitPhase,
+    signal: AbortSignal
+  ): Promise<void> {
+    if (
+      gate.opened ||
+      (waitFor === 'early-follower' && gate.earlyFollowersReleased)
+    ) {
+      return;
+    }
+    if (signal.aborted) throw new NntpError('connection', 'aborted');
+    const ready =
+      waitFor === 'early-follower' ? gate.earlyFollowersReady : gate.allReady;
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error): void => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        if (error) reject(error);
+        else resolve();
+      };
+      const onAbort = (): void =>
+        finish(new NntpError('connection', 'aborted'));
+      signal.addEventListener('abort', onAbort, { once: true });
+      ready.then(
+        () => finish(),
+        (error: unknown) =>
+          finish(error instanceof Error ? error : new Error(String(error)))
+      );
+      if (
+        gate.opened ||
+        (waitFor === 'early-follower' && gate.earlyFollowersReleased)
+      ) {
+        finish();
+      } else if (signal.aborted) onAbort();
+    });
+  }
+
+  private registerSpoolingDownloadOwner(ownerKey: string): () => void {
+    const count = this.activeSpoolingDownloadOwners.get(ownerKey) ?? 0;
+    if (
+      count === 0 &&
+      this.activeSpoolingDownloadOwners.size >=
+        this.activeSpoolingDownloadOwnerLimit
+    ) {
+      throw new UsenetSpoolError(
+        'USENET_SPOOL_CAPACITY',
+        'Active segment-spooling owner capacity reached'
+      );
+    }
+    this.activeSpoolingDownloadOwners.set(ownerKey, count + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const current = this.activeSpoolingDownloadOwners.get(ownerKey);
+      assert(current !== undefined && current > 0);
+      if (current === 1) this.activeSpoolingDownloadOwners.delete(ownerKey);
+      else this.activeSpoolingDownloadOwners.set(ownerKey, current - 1);
+    };
   }
 
   private startArtifactPromotion(
@@ -1308,6 +1704,11 @@ export class MultiProviderPool {
   ): void {
     if (flight.growingOwner !== owner || flight.ctl.signal.aborted) return;
     flight.growingOwnerPublished = true;
+    this.markDownloadPhase(
+      flight.ownerKey,
+      flight.phaseId,
+      'artifact_readable'
+    );
     const matching = [...flight.waiters].filter(
       (waiter) => waiter.allowGrowing && owner.matches(waiter)
     );
@@ -1471,17 +1872,11 @@ export class MultiProviderPool {
     signal?: AbortSignal
   ): Promise<SegmentData> {
     const operationSignal = this.operationSignal(signal);
-    let releaseGlobal: () => void;
-    try {
-      releaseGlobal = await this.globalDownloads.acquire(
-        priority,
-        operationSignal,
-        nzbHash
-      );
-    } catch (error) {
-      if (this.closedError) throw this.closedError;
-      throw new NntpError('connection', 'aborted');
-    }
+    const releaseGlobal = await this.acquireGlobalDownload(
+      priority,
+      nzbHash,
+      operationSignal
+    );
     const wire = this.wireTracker();
     try {
       const data = await this.fetcher.fetchBody(
@@ -1557,10 +1952,10 @@ export class MultiProviderPool {
           this.assertOpen();
           if (fromDisk) return fromHit(fromDisk);
           const operationSignal = this.operationSignal();
-          const releaseGlobal = await this.globalDownloads.acquire(
+          const releaseGlobal = await this.acquireGlobalDownload(
             priority,
-            operationSignal,
-            nzbHash
+            nzbHash,
+            operationSignal
           );
           const wire = this.wireTracker();
           try {
@@ -1651,10 +2046,10 @@ export class MultiProviderPool {
     this.assertOpen();
     return this.trackOperation(async () => {
       const operationSignal = this.operationSignal(signal);
-      const releaseGlobal = await this.globalDownloads.acquire(
+      const releaseGlobal = await this.acquireGlobalDownload(
         CommandPriority.Low,
-        operationSignal,
-        'probe'
+        'probe',
+        operationSignal
       );
       const wire = this.wireTracker();
       try {

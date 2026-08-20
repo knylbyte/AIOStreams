@@ -432,7 +432,9 @@ export class SpoolingSegmentsStream extends Readable {
         )
         .finally(() => {
           task.done = true;
-          if (!this.ending && !this.destroyed) this.pump();
+          if (!this.ending && !this.destroyed) {
+            this.pump();
+          }
         });
     }
   }

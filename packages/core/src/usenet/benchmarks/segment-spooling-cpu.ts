@@ -43,8 +43,51 @@ const DEFAULT_SLOW_BYTES_PER_SECOND = 16 * MEBIBYTE_BYTES;
 const MAX_TIMED_BOUNDARY_SAMPLES = 64;
 const PROVIDER_CONTROL_TIMEOUT_MS = 30_000;
 const MEMORY_SAMPLE_INTERVAL_MS = 100;
+const EVENT_LOOP_MONITOR_RESOLUTION_MS = 1;
+const EVENT_LOOP_HEARTBEAT_INTERVAL_MS = 2;
+const EVENT_LOOP_HEARTBEAT_BUCKET_WIDTH_MS = 0.25;
+const EVENT_LOOP_HEARTBEAT_BUCKETS = 512;
+const EVENT_LOOP_NULL_CONTROL_MS = 100;
 
 export type SegmentSpoolingCpuScenario = 'S1' | 'S2' | 'S3' | 'S4' | 'S5';
+
+type BenchmarkDownloadPhase =
+  | 'global_admission_requested'
+  | 'global_admission_granted'
+  | 'provider_slot_granted'
+  | 'nntp_status'
+  | 'first_decoded_payload'
+  | 'first_sink_commit'
+  | 'artifact_readable';
+
+export interface SegmentSpoolingFirstBytePhases {
+  readonly consumerIndex: number;
+  readonly readerRequestedAtMs: number;
+  readonly globalAdmissionRequestedAtMs: number | null;
+  readonly globalAdmissionGrantedAtMs: number | null;
+  readonly providerSlotGrantedAtMs: number | null;
+  readonly nntpStatusAtMs: number | null;
+  readonly firstDecodedPayloadAtMs: number | null;
+  readonly firstSinkCommitAtMs: number | null;
+  readonly artifactReadableAtMs: number | null;
+  readonly readerFirstByteAtMs: number;
+  readonly admissionWaitMs: number | null;
+  readonly providerWaitMs: number | null;
+  readonly nntpStatusWaitMs: number | null;
+  readonly decodeToCommitMs: number | null;
+  readonly commitToReadableMs: number | null;
+  readonly readableToConsumerMs: number | null;
+  readonly totalFirstByteMs: number;
+}
+
+export interface BoundedEventLoopHistogram {
+  readonly count: number;
+  readonly mean: number;
+  readonly p50: number;
+  readonly p95: number;
+  readonly p99: number;
+  readonly max: number;
+}
 
 export interface SlowClientBenchmarkContext {
   readonly stats: () => SegmentSpoolingRuntimeStats;
@@ -81,13 +124,21 @@ export interface SegmentSpoolingCpuRunResult {
   readonly cpuSystemMs: number;
   readonly cpuMsPerDecodedGiB: number;
   readonly wallTimeMs: number;
+  /** Compatibility alias for the fastest consumer in this scenario. */
   readonly firstByteMs: number;
+  readonly firstByteByConsumer: readonly number[];
+  readonly firstByteFastestMs: number;
+  readonly firstByteSlowestMs: number;
+  readonly firstBytePhases: readonly SegmentSpoolingFirstBytePhases[];
   readonly throughputBytesPerSecond: number;
   readonly eventLoopDelayMs: {
     readonly mean: number;
+    readonly p50: number;
     readonly p95: number;
+    readonly p99: number;
     readonly max: number;
   };
+  readonly eventLoopHeartbeatMs: BoundedEventLoopHistogram;
   readonly gc: { readonly count: number; readonly durationMs: number };
   readonly arrayBuffers: {
     readonly before: number;
@@ -126,20 +177,23 @@ export interface SegmentSpoolingCpuRunResult {
 export interface SegmentSpoolingCpuScenarioSummary {
   readonly scenario: SegmentSpoolingCpuScenario;
   readonly runs: readonly SegmentSpoolingCpuRunResult[];
-  readonly median: Pick<
-    SegmentSpoolingCpuRunResult,
-    | 'cpuMsPerDecodedGiB'
-    | 'wallTimeMs'
-    | 'firstByteMs'
-    | 'throughputBytesPerSecond'
-  >;
-  readonly p95: Pick<
-    SegmentSpoolingCpuRunResult,
-    | 'cpuMsPerDecodedGiB'
-    | 'wallTimeMs'
-    | 'firstByteMs'
-    | 'throughputBytesPerSecond'
-  >;
+  readonly median: SegmentSpoolingCpuAggregate;
+  readonly p95: SegmentSpoolingCpuAggregate;
+  readonly p99: SegmentSpoolingCpuAggregate;
+  readonly minimum: SegmentSpoolingCpuAggregate;
+  readonly maximum: SegmentSpoolingCpuAggregate;
+}
+
+export interface SegmentSpoolingCpuAggregate {
+  readonly cpuMsPerDecodedGiB: number;
+  readonly wallTimeMs: number;
+  readonly firstByteMs: number;
+  readonly firstByteByConsumer: readonly number[];
+  readonly firstByteFastestMs: number;
+  readonly firstByteSlowestMs: number;
+  readonly throughputBytesPerSecond: number;
+  readonly eventLoopP95Ms: number;
+  readonly heartbeatP95Ms: number;
 }
 
 export interface SegmentSpoolingCpuBenchmarkReport {
@@ -169,6 +223,19 @@ export interface SegmentSpoolingCpuBenchmarkReport {
     readonly fullIntegrityInsideCpuWindow: false;
     readonly correctnessRun: boolean;
     readonly providerChildCpuMs: number;
+    readonly eventLoopMonitorResolutionMs: 1;
+    readonly heartbeatIntervalMs: 2;
+    readonly heartbeatBucketWidthMs: 0.25;
+    readonly heartbeatBucketCount: 512;
+    readonly nullControl: {
+      readonly monitor: BoundedEventLoopHistogram;
+      readonly heartbeat: BoundedEventLoopHistogram;
+    };
+    /**
+     * Fixed pre-series tolerance derived only from idle-control tail spread.
+     * It is never fitted to the Base/Head scenario results.
+     */
+    readonly eventLoopNoiseToleranceMs: number;
   };
   readonly scenarios: readonly SegmentSpoolingCpuScenarioSummary[];
 }
@@ -535,8 +602,191 @@ function percentile(values: readonly number[], fraction: number): number {
   assert(values.length > 0);
   const sorted = [...values].sort((left, right) => left - right);
   return sorted[
-    Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)
+    Math.max(
+      0,
+      Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)
+    )
   ];
+}
+
+interface BenchmarkOwnerPhaseSlot {
+  readonly ownerKey: string;
+  readonly at: Partial<Record<BenchmarkDownloadPhase, number>>;
+  phaseId?: number;
+}
+
+class BenchmarkPhaseRecorder {
+  private readonly slots: readonly BenchmarkOwnerPhaseSlot[];
+
+  constructor(ownerKeys: readonly string[]) {
+    const unique = [...new Set(ownerKeys)];
+    assert(unique.length > 0 && unique.length <= 2);
+    this.slots = unique.map((ownerKey) => ({ ownerKey, at: {} }));
+  }
+
+  mark(ownerKey: string, phaseId: number, phase: BenchmarkDownloadPhase): void {
+    const slot = this.slots.find(
+      (candidate) => candidate.ownerKey === ownerKey
+    );
+    if (!slot) return;
+    if (slot.phaseId === undefined) {
+      if (phase !== 'global_admission_requested') return;
+      slot.phaseId = phaseId;
+    }
+    if (slot.phaseId !== phaseId || slot.at[phase] !== undefined) return;
+    slot.at[phase] = performance.now();
+  }
+
+  firstBytePhases(
+    ownerKey: string,
+    consumerIndex: number,
+    readerRequestedAt: number,
+    readerFirstByteAt: number,
+    benchmarkStartedAt: number
+  ): SegmentSpoolingFirstBytePhases {
+    const slot = this.slots.find(
+      (candidate) => candidate.ownerKey === ownerKey
+    );
+    assert(slot);
+    const value = (phase: BenchmarkDownloadPhase): number | undefined =>
+      slot.at[phase];
+    const relative = (at: number | undefined): number | null =>
+      at === undefined ? null : at - benchmarkStartedAt;
+    const difference = (
+      end: number | undefined,
+      start: number | undefined
+    ): number | null =>
+      end === undefined || start === undefined
+        ? null
+        : Math.max(0, end - start);
+    const admissionRequested = value('global_admission_requested');
+    const admissionGranted = value('global_admission_granted');
+    const providerGranted = value('provider_slot_granted');
+    const nntpStatus = value('nntp_status');
+    const firstDecoded = value('first_decoded_payload');
+    const firstCommit = value('first_sink_commit');
+    const artifactReadable = value('artifact_readable');
+    return {
+      consumerIndex,
+      readerRequestedAtMs: readerRequestedAt - benchmarkStartedAt,
+      globalAdmissionRequestedAtMs: relative(admissionRequested),
+      globalAdmissionGrantedAtMs: relative(admissionGranted),
+      providerSlotGrantedAtMs: relative(providerGranted),
+      nntpStatusAtMs: relative(nntpStatus),
+      firstDecodedPayloadAtMs: relative(firstDecoded),
+      firstSinkCommitAtMs: relative(firstCommit),
+      artifactReadableAtMs: relative(artifactReadable),
+      readerFirstByteAtMs: readerFirstByteAt - benchmarkStartedAt,
+      admissionWaitMs: difference(admissionGranted, admissionRequested),
+      providerWaitMs: difference(providerGranted, admissionGranted),
+      nntpStatusWaitMs: difference(nntpStatus, providerGranted),
+      decodeToCommitMs: difference(firstCommit, firstDecoded),
+      commitToReadableMs: difference(artifactReadable, firstCommit),
+      readableToConsumerMs: difference(readerFirstByteAt, artifactReadable),
+      totalFirstByteMs: Math.max(0, readerFirstByteAt - readerRequestedAt),
+    };
+  }
+}
+
+class FixedEventLoopHistogram {
+  private readonly buckets = new Uint32Array(EVENT_LOOP_HEARTBEAT_BUCKETS);
+  private countValue = 0;
+  private sum = 0;
+  private maxValue = 0;
+
+  record(delayMs: number): void {
+    const bounded = Math.max(0, delayMs);
+    const bucket = Math.min(
+      this.buckets.length - 1,
+      Math.floor(bounded / EVENT_LOOP_HEARTBEAT_BUCKET_WIDTH_MS)
+    );
+    this.buckets[bucket]++;
+    this.countValue++;
+    this.sum += bounded;
+    this.maxValue = Math.max(this.maxValue, bounded);
+  }
+
+  snapshot(): BoundedEventLoopHistogram {
+    return {
+      count: this.countValue,
+      mean: this.countValue === 0 ? 0 : this.sum / this.countValue,
+      p50: this.percentile(0.5),
+      p95: this.percentile(0.95),
+      p99: this.percentile(0.99),
+      max: this.maxValue,
+    };
+  }
+
+  private percentile(fraction: number): number {
+    if (this.countValue === 0) return 0;
+    const target = Math.ceil(this.countValue * fraction);
+    let observed = 0;
+    for (let index = 0; index < this.buckets.length; index++) {
+      observed += this.buckets[index];
+      if (observed >= target) {
+        return (index + 1) * EVENT_LOOP_HEARTBEAT_BUCKET_WIDTH_MS;
+      }
+    }
+    return this.maxValue;
+  }
+}
+
+class EventLoopHeartbeat {
+  private readonly histogram = new FixedEventLoopHistogram();
+  private expectedAt = performance.now() + EVENT_LOOP_HEARTBEAT_INTERVAL_MS;
+  private readonly timer = setInterval(() => {
+    const now = performance.now();
+    this.histogram.record(now - this.expectedAt);
+    this.expectedAt = now + EVENT_LOOP_HEARTBEAT_INTERVAL_MS;
+  }, EVENT_LOOP_HEARTBEAT_INTERVAL_MS);
+
+  constructor() {
+    this.timer.unref();
+  }
+
+  stop(): BoundedEventLoopHistogram {
+    clearInterval(this.timer);
+    return this.histogram.snapshot();
+  }
+}
+
+function monitorSnapshot(
+  monitor: ReturnType<typeof monitorEventLoopDelay>
+): BoundedEventLoopHistogram {
+  return {
+    count: Number(monitor.count),
+    mean: Number.isFinite(monitor.mean) ? monitor.mean / 1e6 : 0,
+    p50: monitor.percentile(50) / 1e6,
+    p95: monitor.percentile(95) / 1e6,
+    p99: monitor.percentile(99) / 1e6,
+    max: monitor.max / 1e6,
+  };
+}
+
+async function measureEventLoopNullControl(): Promise<{
+  readonly monitor: BoundedEventLoopHistogram;
+  readonly heartbeat: BoundedEventLoopHistogram;
+}> {
+  const monitor = monitorEventLoopDelay({
+    resolution: EVENT_LOOP_MONITOR_RESOLUTION_MS,
+  });
+  const heartbeat = new EventLoopHeartbeat();
+  monitor.enable();
+  await new Promise<void>((resolve) =>
+    setTimeout(resolve, EVENT_LOOP_NULL_CONTROL_MS)
+  );
+  monitor.disable();
+  return { monitor: monitorSnapshot(monitor), heartbeat: heartbeat.stop() };
+}
+
+function eventLoopNoiseTolerance(
+  control: SegmentSpoolingCpuBenchmarkReport['measurement']['nullControl']
+): number {
+  return Math.max(
+    EVENT_LOOP_HEARTBEAT_BUCKET_WIDTH_MS,
+    control.monitor.p95 - control.monitor.p50,
+    control.heartbeat.p95 - control.heartbeat.p50
+  );
 }
 
 function sha256(buffers: readonly Buffer[]): string {
@@ -744,6 +994,7 @@ async function runScenario(
       resourceEvents++;
     },
   });
+  let phaseRecorder: BenchmarkPhaseRecorder | undefined;
   const engineOptions = {
     ...DEFAULT_ENGINE_OPTIONS,
     streamingMode: 'segment_spooling' as const,
@@ -762,7 +1013,11 @@ async function runScenario(
     engineOptions,
     cache,
     new StatsAccumulator(),
-    { spooling: runtime }
+    {
+      spooling: runtime,
+      onDownloadPhase: (ownerKey, phaseId, phase) =>
+        phaseRecorder?.mark(ownerKey, phaseId, phase),
+    }
   );
 
   const perStreamBytes =
@@ -796,6 +1051,10 @@ async function runScenario(
     files.push(makeFile(pool, first, engineOptions, plan));
     fills.push(first.fill);
   }
+  const ownerKeys = files.map((_file, index) =>
+    index === 0 || scenario === 'S4' ? first.key : second.key
+  );
+  phaseRecorder = new BenchmarkPhaseRecorder(ownerKeys);
   await Promise.all(files.map((file) => file.open()));
 
   if (execution.mode === 'correctness') {
@@ -813,7 +1072,9 @@ async function runScenario(
   }
 
   let deliveredBytes = 0;
-  let firstByteMs = Number.POSITIVE_INFINITY;
+  const firstByteByConsumer = files.map(() => Number.POSITIVE_INFINITY);
+  const firstBytePhases: Array<SegmentSpoolingFirstBytePhases | undefined> =
+    files.map(() => undefined);
   let memoryPeak = 0;
   let memoryWaitingPeak = 0;
   let spoolReservedPeak = 0;
@@ -837,7 +1098,12 @@ async function runScenario(
     }
   });
   gcObserver.observe({ entryTypes: ['gc'] });
-  const eventLoop = monitorEventLoopDelay({ resolution: 10 });
+  const eventLoop = monitorEventLoopDelay({
+    resolution: EVENT_LOOP_MONITOR_RESOLUTION_MS,
+  });
+  const eventLoopHeartbeat = new EventLoopHeartbeat();
+  let eventLoopHeartbeatSnapshot: BoundedEventLoopHistogram | undefined;
+  let eventLoopSnapshot: BoundedEventLoopHistogram | undefined;
   eventLoop.enable();
   const startedAt = performance.now();
 
@@ -870,7 +1136,9 @@ async function runScenario(
   const consume = async (
     file: FileStream,
     fill: number,
-    slow: boolean
+    slow: boolean,
+    consumerIndex: number,
+    ownerKey: string
   ): Promise<void> => {
     const validator = new TimedBoundaryValidator(
       file.size(),
@@ -880,10 +1148,20 @@ async function runScenario(
     let localBytes = 0;
     let resumedAt = 0;
     let rateLimitedBytes = 0;
-    for await (const chunk of file.createReadStream()) {
+    const readerRequestedAt = performance.now();
+    const reader = file.createReadStream();
+    for await (const chunk of reader) {
       assert(Buffer.isBuffer(chunk));
-      if (!Number.isFinite(firstByteMs)) {
-        firstByteMs = performance.now() - startedAt;
+      if (!Number.isFinite(firstByteByConsumer[consumerIndex])) {
+        const readerFirstByteAt = performance.now();
+        firstByteByConsumer[consumerIndex] = readerFirstByteAt - startedAt;
+        firstBytePhases[consumerIndex] = phaseRecorder.firstBytePhases(
+          ownerKey,
+          consumerIndex,
+          readerRequestedAt,
+          readerFirstByteAt,
+          startedAt
+        );
       }
       validator.observe(chunk);
       localBytes += chunk.length;
@@ -920,7 +1198,13 @@ async function runScenario(
   try {
     await Promise.all(
       files.map((file, index) =>
-        consume(file, fills[index], scenario === 'S5' && index === 0)
+        consume(
+          file,
+          fills[index],
+          scenario === 'S5' && index === 0,
+          index,
+          ownerKeys[index]
+        )
       )
     );
     await cache.close();
@@ -928,6 +1212,8 @@ async function runScenario(
   } finally {
     clearInterval(sampler);
     eventLoop.disable();
+    eventLoopSnapshot = monitorSnapshot(eventLoop);
+    eventLoopHeartbeatSnapshot = eventLoopHeartbeat.stop();
     gcObserver.disconnect();
     await Promise.allSettled([pool.close(), cache.close()]);
     await fs.rm(root, { recursive: true, force: true });
@@ -945,7 +1231,12 @@ async function runScenario(
         ? perStreamBytes
         : deliveredBytes;
   assert(decodedBytes > 0);
-  assert(Number.isFinite(firstByteMs));
+  assert(firstByteByConsumer.every(Number.isFinite));
+  assert(firstBytePhases.every((phases) => phases !== undefined));
+  assert(eventLoopSnapshot);
+  assert(eventLoopHeartbeatSnapshot);
+  const firstByteFastestMs = Math.min(...firstByteByConsumer);
+  const firstByteSlowestMs = Math.max(...firstByteByConsumer);
   assert.equal(hotpathSnapshot.activeDownloads, 0);
   assert.equal(final.memory.usedBytes, 0);
   assert.equal(final.spool.budget.reservedBytes, 0);
@@ -971,13 +1262,23 @@ async function runScenario(
       cpuMsPerDecodedGiB:
         ((cpuUserMs + cpuSystemMs) * GIBIBYTE_BYTES) / decodedBytes,
       wallTimeMs,
-      firstByteMs,
+      firstByteMs: firstByteFastestMs,
+      firstByteByConsumer,
+      firstByteFastestMs,
+      firstByteSlowestMs,
+      firstBytePhases: firstBytePhases.filter(
+        (phases): phases is SegmentSpoolingFirstBytePhases =>
+          phases !== undefined
+      ),
       throughputBytesPerSecond: (deliveredBytes * 1000) / wallTimeMs,
       eventLoopDelayMs: {
-        mean: Number.isFinite(eventLoop.mean) ? eventLoop.mean / 1e6 : 0,
-        p95: eventLoop.percentile(95) / 1e6,
-        max: eventLoop.max / 1e6,
+        mean: eventLoopSnapshot.mean,
+        p50: eventLoopSnapshot.p50,
+        p95: eventLoopSnapshot.p95,
+        p99: eventLoopSnapshot.p99,
+        max: eventLoopSnapshot.max,
       },
+      eventLoopHeartbeatMs: eventLoopHeartbeatSnapshot,
       gc: { count: gcCount, durationMs: gcDurationMs },
       arrayBuffers: {
         before: memoryBefore.arrayBuffers,
@@ -1022,6 +1323,8 @@ function aggregate(
       | 'cpuMsPerDecodedGiB'
       | 'wallTimeMs'
       | 'firstByteMs'
+      | 'firstByteFastestMs'
+      | 'firstByteSlowestMs'
       | 'throughputBytesPerSecond',
     fraction: number
   ): number =>
@@ -1029,21 +1332,38 @@ function aggregate(
       runs.map((run) => run[key]),
       fraction
     );
+  const point = (fraction: number): SegmentSpoolingCpuAggregate => ({
+    cpuMsPerDecodedGiB: value('cpuMsPerDecodedGiB', fraction),
+    wallTimeMs: value('wallTimeMs', fraction),
+    firstByteMs: value('firstByteMs', fraction),
+    firstByteByConsumer: Array.from(
+      { length: runs[0].firstByteByConsumer.length },
+      (_, consumerIndex) =>
+        percentile(
+          runs.map((run) => run.firstByteByConsumer[consumerIndex]),
+          fraction
+        )
+    ),
+    firstByteFastestMs: value('firstByteFastestMs', fraction),
+    firstByteSlowestMs: value('firstByteSlowestMs', fraction),
+    throughputBytesPerSecond: value('throughputBytesPerSecond', fraction),
+    eventLoopP95Ms: percentile(
+      runs.map((run) => run.eventLoopDelayMs.p95),
+      fraction
+    ),
+    heartbeatP95Ms: percentile(
+      runs.map((run) => run.eventLoopHeartbeatMs.p95),
+      fraction
+    ),
+  });
   return {
     scenario,
     runs,
-    median: {
-      cpuMsPerDecodedGiB: value('cpuMsPerDecodedGiB', 0.5),
-      wallTimeMs: value('wallTimeMs', 0.5),
-      firstByteMs: value('firstByteMs', 0.5),
-      throughputBytesPerSecond: value('throughputBytesPerSecond', 0.5),
-    },
-    p95: {
-      cpuMsPerDecodedGiB: value('cpuMsPerDecodedGiB', 0.95),
-      wallTimeMs: value('wallTimeMs', 0.95),
-      firstByteMs: value('firstByteMs', 0.95),
-      throughputBytesPerSecond: value('throughputBytesPerSecond', 0.95),
-    },
+    median: point(0.5),
+    p95: point(0.95),
+    p99: point(0.99),
+    minimum: point(0),
+    maximum: point(1),
   };
 }
 
@@ -1145,6 +1465,7 @@ export async function runSegmentSpoolingCpuBenchmark(
     slowBytesPerSecond,
   };
   const identity = await benchmarkIdentity(configuration);
+  const nullControl = await measureEventLoopNullControl();
   const child = new BenchmarkProviderChild();
   let invocation = 0;
   try {
@@ -1173,25 +1494,30 @@ export async function runSegmentSpoolingCpuBenchmark(
       }
     }
 
-    const warmup = await runScenario(
-      child,
-      port,
-      'S1',
-      warmupBytes,
-      Math.min(segmentBytes, warmupBytes),
-      {
-        mode: 'timed',
-        correctnessLabel: 'warmup',
-        slowPauseMs: 0,
-        slowBytesPerSecond: Number.MAX_SAFE_INTEGER,
-        invocation: invocation++,
-        corruptFirstSegment: false,
-      }
-    );
-    assert.equal(warmup.kind, 'timed');
-
     const summaries: SegmentSpoolingCpuScenarioSummary[] = [];
     for (const scenario of scenarios) {
+      // Prime each production topology immediately before measuring that same
+      // topology. S2 promotion and S4 shared-flight code otherwise execute
+      // lazy module/JIT work in the measured Head run; grouping all warmups
+      // ahead of S1 also leaves cross-scenario GC and filesystem residue. Each
+      // measured run still constructs a fresh pool and cold provider
+      // connection.
+      const warmup = await runScenario(
+        child,
+        port,
+        scenario,
+        warmupBytes,
+        Math.min(segmentBytes, warmupBytes),
+        {
+          mode: 'timed',
+          correctnessLabel: 'warmup',
+          slowPauseMs: 0,
+          slowBytesPerSecond: Number.MAX_SAFE_INTEGER,
+          invocation: invocation++,
+          corruptFirstSegment: false,
+        }
+      );
+      assert.equal(warmup.kind, 'timed');
       const measured: SegmentSpoolingCpuRunResult[] = [];
       for (let index = 0; index < runs; index++) {
         const execution = await runScenario(
@@ -1227,6 +1553,12 @@ export async function runSegmentSpoolingCpuBenchmark(
         correctnessRun: runCorrectness,
         providerChildCpuMs:
           (childCpu.cpuUserMicros + childCpu.cpuSystemMicros) / 1000,
+        eventLoopMonitorResolutionMs: EVENT_LOOP_MONITOR_RESOLUTION_MS,
+        heartbeatIntervalMs: EVENT_LOOP_HEARTBEAT_INTERVAL_MS,
+        heartbeatBucketWidthMs: EVENT_LOOP_HEARTBEAT_BUCKET_WIDTH_MS,
+        heartbeatBucketCount: EVENT_LOOP_HEARTBEAT_BUCKETS,
+        nullControl,
+        eventLoopNoiseToleranceMs: eventLoopNoiseTolerance(nullControl),
       },
       scenarios: summaries,
     };

@@ -32,6 +32,12 @@ canonical concept itself is unchanged.
       ownership installed until its asynchronous `_destroy()` settles. Expected
       `USENET_SPOOL_ABORTED` errors stay inside the stream lifecycle; a genuine
       replacement close error is observed and propagated exactly once.
+- [x] `SpoolingSegmentSink.end()` distinguishes a local partial batch from a
+      writer-owned batch. It publishes the former once, waits the latter's
+      actual child-lease settlement, then observes preparation and reports the
+      primary error (plus at most one bounded secondary cleanup error). Multiple
+      callers share the same terminal promise; failure never starts another
+      `grow()` or write.
 - [x] Persistent cache hits and promotion are file-backed.
 - [x] No disk-error fallback to the buffering fetch path exists.
 
@@ -100,6 +106,12 @@ canonical concept itself is unchanged.
 - [x] Startup orphan cleanup is heartbeat/fence protected and emits a structured
       completion record.
 - [x] Stable spool failures map to actionable user and HTTP/debrid errors.
+- [x] Every BODY/head/artifact global-download path uses one admission helper.
+      Global, per-owner and active-owner capacity codes retain their typed local
+      resource domain and map to HTTP 503; they are never rewritten as abort,
+      never reach provider health/circuit accounting and never create a
+      definitive negative-cache entry. Actual abort and pool close retain their
+      separate established contracts.
 - [x] Local fake-NNTP E2E coverage includes real TLS, 1×1 admission,
       fragmentation, local backpressure, pipelining, out-of-order completion,
       ranges, parallel clients, 430 failover, injected slow disk, ENOSPC/EACCES,
@@ -120,6 +132,17 @@ canonical concept itself is unchanged.
       encryption and writes. Full SHA-256 byte verification runs separately
       from the timed window; timed runs use only byte counts and fixed boundary
       samples.
+- [x] CPU reports contain per-consumer first byte and a fixed-size phase record
+      from admission request through reader delivery. Event-loop delay uses a
+      1-ms native monitor plus a fixed 512-bucket, 2-ms heartbeat. Its idle null
+      control runs before the scenarios and fixes the comparison tolerance;
+      neither monitor retains per-chunk samples.
+- [x] Playback startup has a bounded two-stage fence per active owner. After
+      the first BODY is on wire, at most one provider pipeline's followers may
+      start; the rest wait for the first physical sink commit. This preserves
+      pipelining/out-of-order completion while keeping the complete prefetch
+      window out of the first-byte CPU turn. The fence is bounded by active
+      download owners and is released on every success/error/close path.
 
 The benchmark defaults to the concept's full 500 one-MiB segment run with a
 64-segment prefetch window, a 16 MiB memory budget and 60 configured producer
@@ -199,51 +222,70 @@ The release comparison uses the same copied harness for base
 identities are:
 
 ```text
-harness SHA-256:       be7ae4f20ccd5297fd63da85e5f751af47ca7c118058dba46255e23ac8d803b4
+harness SHA-256:       4aa9fa8bb252eb38c66359472899d68abb48633d643f66a528c9a24acbf0133b
 provider-child SHA-256:bfa2764362b8a8a4258355aa07802055d8862194f9d78e978eaa1b69f6bc81e4
 fixture SHA-256:       ea584ab7d2dc0d33918d424d7e771039d06aa4410e53499b6e58adf6543c3b55
-configuration SHA-256: 3997d74b1f87bf35b37b898ae6883d8b6ece760d07cac1b2ffe19b8a5e92efe1
+configuration SHA-256: 86166b7b892aa5ea5caef562a86fa68847ef6c93b3349faeaad60da39688a519
 Node/host:              v24.10.0, Apple M1 arm64, 8 logical CPUs
 ```
 
-Five base and five final 256-MiB runs were interleaved in the order
-base/final/final/base/base/final/final/base/base/final, with one-MiB segments,
-a 32-MiB warmup, a real 30-second S5 pause and a 16-MiB/s resumed reader. The
-medians are:
+Ten base and ten final 256-MiB runs were interleaved in alternating order. Each
+uses eight-MiB segments, a 32-MiB warmup, a real 30-second S5 pause and a
+16-MiB/s resumed reader. Parent-only CPU and throughput medians are:
 
-| Scenario         | CPU ms/GiB base/final | CPU delta | First byte base/final | Throughput MiB/s base/final | Event-loop p95 base/final |
-| ---------------- | --------------------: | --------: | --------------------: | --------------------------: | ------------------------: |
-| S1 single        |         7,331 / 4,701 |    −35.9% |        9.29 / 8.83 ms |               314.7 / 468.2 |          10.30 / 10.27 ms |
-| S2 + promotion   |         9,505 / 5,923 |    −37.7% |        8.68 / 9.52 ms |               256.9 / 421.2 |          10.25 / 10.33 ms |
-| S3 two streams   |         6,572 / 4,380 |    −33.4% |        9.31 / 8.96 ms |               340.7 / 512.0 |          10.44 / 11.32 ms |
-| S4 shared stream |        10,294 / 4,270 |    −58.5% |        8.45 / 9.41 ms |               430.1 / 565.8 |          10.31 / 10.97 ms |
-| S5 slow consumer |       27,182 / 20,862 |    −23.3% |        8.79 / 8.54 ms |                 5.56 / 5.56 |          12.16 / 12.13 ms |
+| Scenario         | CPU ms/GiB base/final | CPU delta | CPU p95 base/final | Throughput MiB/s base/final |
+| ---------------- | --------------------: | --------: | -----------------: | --------------------------: |
+| S1 single        |         6,111 / 3,830 |    −37.3% |      9,188 / 4,703 |               334.7 / 530.7 |
+| S2 + promotion   |         7,461 / 4,375 |    −41.4% |      9,799 / 5,516 |               276.5 / 467.9 |
+| S3 two streams   |         5,763 / 3,619 |    −37.2% |      7,180 / 4,333 |               322.7 / 504.3 |
+| S4 shared stream |         6,616 / 4,490 |    −32.1% |      8,103 / 5,383 |               681.5 / 886.5 |
+| S5 slow consumer |       22,025 / 19,158 |    −13.0% |    22,942 / 20,280 |                 5.56 / 5.56 |
 
-Nearest-rank p95 values across those five runs are retained rather than
-discarded:
+The required S1 and S3 CPU margins are therefore 37.3% and 37.2%, while
+throughput improves by 58.6% and 56.2%. Every S5 run records one real pause,
+one resume and 129 rate-limit waits. Its final median internal-memory peak is
+19,267,581 bytes; spool reservation/actual peaks are 75,628,544/67,108,864
+bytes. Rate-limited throughput changes by less than 0.01%, and all 100 measured
+scenario executions end with memory, spool, artifact, open-file and active-
+download ownership at zero.
 
-| Scenario | CPU ms/GiB base/final | CPU delta | First byte base/final | Event-loop p95 base/final |
-| -------- | --------------------: | --------: | --------------------: | ------------------------: |
-| S1       |         8,936 / 6,279 |    −29.7% |      11.47 / 13.91 ms |          10.46 / 10.60 ms |
-| S2       |        11,797 / 7,657 |    −35.1% |      11.38 / 14.75 ms |          10.32 / 10.96 ms |
-| S3       |         7,409 / 5,537 |    −25.3% |      12.66 / 19.92 ms |          11.15 / 12.02 ms |
-| S4       |        12,736 / 6,154 |    −51.7% |      10.41 / 19.61 ms |          10.82 / 11.46 ms |
-| S5       |       27,550 / 21,523 |    −21.9% |      10.61 / 13.84 ms |          12.16 / 12.19 ms |
+First-byte tails use a separate higher-sample series rather than the global
+earliest byte from the CPU run. Twenty base and twenty final 64-MiB runs were
+interleaved and process-isolated for each of S1–S4. Their configuration hashes
+are respectively
+`a54941a245a14f9a44eb76fb4d8e0d6d883b2f31b1987a8baafbcaca35028100`,
+`8fc03e93b0cb733d92d35bac15cc0712e88a5ee61bc216d545d3b07f47535fe6`,
+`638006a7bf8bf0f85b8ac28c6502fb767cd9d85c8e81ed47efa7a6e1ac40a540`
+and `e6bd0a18c950eae9e798e248250134ce41cc40b89578d9df110844e1e5410f7f`.
+Both consumers are measured independently in S3/S4:
 
-The S1 and S3 parent-CPU gates pass by wide margins, median throughput improves
-in S1–S4 and remains unchanged in the deliberately rate-limited S5, and median
-first byte improves in S1/S3/S5. The p95 first-byte tail and the 0.88-ms S3
-median event-loop-p95 increase remain explicit diagnostic evidence rather than
-being presented as a passed no-regression gate. Every S5 run records one real
-pause, one resume and 129 rate-limit waits; all memory, spool, artifact and
-open-file owners finish at zero.
+| Consumer            | Median ms base/final |  Delta | p95 ms base/final |  Delta |
+| ------------------- | -------------------: | -----: | ----------------: | -----: |
+| S1                  |         11.31 / 9.56 | −15.5% |      14.44 / 9.81 | −32.1% |
+| S2                  |        15.72 / 11.39 | −27.5% |     19.53 / 12.92 | −33.9% |
+| S3 stream A         |        12.53 / 10.05 | −19.8% |     23.94 / 18.12 | −24.3% |
+| S3 stream B         |        27.27 / 12.78 | −53.1% |     47.34 / 19.49 | −58.8% |
+| S4 client A         |         11.28 / 9.86 | −12.6% |     16.58 / 11.60 | −30.0% |
+| S4 client B/slowest |         11.29 / 9.79 | −13.3% |     16.84 / 11.82 | −29.8% |
 
-For one 512-segment S1 run, output-backing allocations fell from 33,792 to 512;
-spool writes, syscalls and drain cycles fell from 33,792 to 2,560; socket
-pause/resume calls fell from 13,824/13,824 to 2,560/2,560. Transition copies
-are zero. With debug disabled, 2,561 raw resource events produce no debug
-records; the deterministic debug-level regression test reduces 500 successful
-events to two summaries (99.6%) while errors and long waits remain immediate.
+The same series fixes the event-loop tolerance before scenario execution from
+its idle null control (0.25 ms here). Median and nearest-rank-p95 differences
+of each run's native event-loop p95 are respectively: S1 +0.180/+0.247 ms,
+S2 +0.132/−0.259 ms, S3 +0.112/+0.127 ms and S4 +0.042/+0.018 ms. The bounded
+heartbeat's corresponding deltas are S1 +0.250/+0.250 ms, S2 +0.000/−0.750
+ms, S3 +0.000/+0.250 ms and S4 +0.000/+0.000 ms. All pass without changing
+the pre-series 0.25-ms boundary. The fixed-size heartbeat emits p50/p95/p99/max
+and stores no sample history.
+
+The retained 512-segment structural comparison records output allocations
+33,792→512, spool writes/syscalls/drains 33,792→2,560 and socket pause/resume
+13,824→2,560. In the final 32-segment S1 release run, 16,672 native decode
+calls reuse only 32 output backings and publish 1,024 write/drain batches; the
+bounded cooperative turn records 5,115 pause/resume transitions. S3 records
+equal admission for both playback owners. Transition copies and semaphore
+global scans remain zero. Debug-disabled resource events emit no debug records;
+the deterministic debug-level regression still aggregates successful events
+while errors and long waits remain immediate.
 
 Persistent promotion has no queue. New work is skipped for memory, spool,
 open-file or foreground-download pressure, and active playback admits at most
@@ -265,7 +307,7 @@ cd packages/core
 LOG_LEVEL=error \
 AIOSTREAMS_CPU_BENCHMARK_SCENARIOS=S1 \
 AIOSTREAMS_CPU_BENCHMARK_RUNS=1 \
-AIOSTREAMS_CPU_BENCHMARK_TOTAL_BYTES=536870912 \
+AIOSTREAMS_CPU_BENCHMARK_TOTAL_BYTES=268435456 \
 AIOSTREAMS_CPU_BENCHMARK_WARMUP_BYTES=33554432 \
 AIOSTREAMS_CPU_BENCHMARK_CORRECTNESS=0 \
 node --cpu-prof --cpu-prof-dir="$(mktemp -d)" \
@@ -274,10 +316,12 @@ node --cpu-prof --cpu-prof-dir="$(mktemp -d)" \
 ```
 
 Profiles remain local and are excluded from commits and source exports. Before
-the change, the parent-only S1 profile contains 48 sampled native
-`decodeChunk` frames and 30 `writeBuffer` frames; the final profile contains 29
-`decodeChunk` frames and no `writeBuffer` frame in its top 20. SHA-256 work is
-absent, and no provider PID receives a CPU profile. A Worker-thread path was
+the change, the parent-main profile contains 1,137 samples, including 66
+sampled native `decodeChunk` frames and 35 `writeBuffer` frames. The final
+parent-main profile contains 935 samples, 44 native `decodeChunk` frames and
+one `writeBuffer` frame. SHA-256 work is absent. The second profile
+file in each directory belongs to the tsx ESM worker of the same parent PID;
+no provider-child PID receives a CPU profile. A Worker-thread decode path was
 not adopted: native decode no longer dominates, and moving the same work would
 add transfer/ownership complexity without evidence of lower total CPU.
 
@@ -331,6 +375,7 @@ generic cache's deterministic Windows-style tests; a native Windows runner is
 still missing and remains a platform-evidence risk rather than being reported
 as proven. External provider credentials were not available in the build
 environment, so P1–P5 above remain explicit deployment gates and are not
-reported as synthetically passed. The CPU-series p95 first-byte outliers and
-S3 event-loop-p95 increase likewise remain open performance evidence. The
-`readAt()`/archive MVP boundary above also remains intentional.
+reported as synthetically passed. The local parent-only CPU, per-consumer
+first-byte and event-loop gates above pass; they do not substitute for those
+real-provider deployment gates. The `readAt()`/archive MVP boundary above also
+remains intentional.

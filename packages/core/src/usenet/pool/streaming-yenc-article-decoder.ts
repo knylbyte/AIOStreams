@@ -74,6 +74,12 @@ export interface DirectDecodeByteSink extends BackpressuredByteSink {
   commitDecoded(bytes: number, inputBoundary: boolean): boolean;
 }
 
+/** Fixed-size lifecycle telemetry; it never receives article identifiers. */
+export interface StreamingYencLifecycleObserver {
+  onNntpStatus?(): void;
+  onFirstDecodedPayload?(): void;
+}
+
 function isDirectDecodeSink(
   sink: BackpressuredByteSink
 ): sink is DirectDecodeByteSink {
@@ -110,6 +116,7 @@ export class StreamingYencArticleDecoder {
   private nameValue: string | undefined;
   private multipartDeclared = false;
   private headerNotified = false;
+  private decodedPayloadNotified = false;
   private readonly directSink: DirectDecodeByteSink | undefined;
 
   constructor(
@@ -117,10 +124,16 @@ export class StreamingYencArticleDecoder {
     private readonly onHeader?: (
       metadata: DecodedSegmentHeaderMetadata
     ) => void,
-    private readonly hotpathCounters?: SegmentSpoolingHotpathCounters
+    private readonly hotpathCounters?: SegmentSpoolingHotpathCounters,
+    private readonly lifecycleObserver?: StreamingYencLifecycleObserver
   ) {
     this.decoder = new StreamingYencDecoder(hotpathCounters);
     this.directSink = isDirectDecodeSink(sink) ? sink : undefined;
+  }
+
+  /** NNTP BODY-consumer hook invoked after a successful response status. */
+  onStatus(): void {
+    this.lifecycleObserver?.onNntpStatus?.();
   }
 
   /**
@@ -342,13 +355,21 @@ export class StreamingYencArticleDecoder {
       const target = this.directSink.acquireDecodeTarget(raw.length);
       const written = this.decoder.pushInto(raw, target);
       this.decodedBytes += written;
+      this.notifyDecodedPayload(written);
       return this.directSink.commitDecoded(written, inputBoundary);
     }
     const decoded = this.decoder.push(raw);
     if (decoded.length === 0) return true;
     const acceptsMore = this.sink.write(decoded);
     this.decodedBytes += decoded.length;
+    this.notifyDecodedPayload(decoded.length);
     return acceptsMore;
+  }
+
+  private notifyDecodedPayload(bytes: number): void {
+    if (bytes <= 0 || this.decodedPayloadNotified) return;
+    this.decodedPayloadNotified = true;
+    this.lifecycleObserver?.onFirstDecodedPayload?.();
   }
 
   private async finishOnce(): Promise<DecodedSegmentMetadata> {

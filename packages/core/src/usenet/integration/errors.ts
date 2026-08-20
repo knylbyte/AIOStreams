@@ -12,6 +12,19 @@ import {
   type UsenetSpoolErrorCode,
 } from '../spool/errors.js';
 import { YencDecodeError, YencMetadataError } from '../pool/yenc.js';
+import { PrioritySemaphoreError } from '../pool/priority-semaphore.js';
+
+/** True only for bounded global-download admission exhaustion. */
+export function isDownloadAdmissionCapacityError(
+  error: unknown
+): error is PrioritySemaphoreError {
+  if (!(error instanceof PrioritySemaphoreError)) return false;
+  return (
+    error.code === 'SEMAPHORE_GLOBAL_CAPACITY' ||
+    error.code === 'SEMAPHORE_OWNER_CAPACITY' ||
+    error.code === 'SEMAPHORE_ACTIVE_OWNER_CAPACITY'
+  );
+}
 
 const ARCHIVE_REASONS: Record<ArchiveErrorCode, string> = {
   archive_compressed: 'Archive is compressed: not streamable',
@@ -169,6 +182,13 @@ export function friendlyUsenetError(err: unknown): {
   if (err instanceof UsenetSpoolError) {
     return { reason: SPOOL_REASONS[err.code], code: err.code };
   }
+  if (isDownloadAdmissionCapacityError(err)) {
+    return {
+      reason:
+        'The Usenet download scheduler is at capacity. Retry after active streams release their slots.',
+      code: err.code,
+    };
+  }
   if (err instanceof UsenetEngineClosedError) {
     return {
       reason:
@@ -249,6 +269,20 @@ export function toDebridError(err: unknown): DebridError {
       type: 'upstream_error',
       cause: err,
     });
+  }
+  if (isDownloadAdmissionCapacityError(err)) {
+    return new DebridError(
+      'The Usenet download scheduler is at capacity. Please retry shortly.',
+      {
+        statusCode: 503,
+        statusText: 'Service Unavailable',
+        code: 'SERVICE_UNAVAILABLE',
+        headers: {},
+        body: { usenetCode: err.code },
+        type: 'api_error',
+        cause: err,
+      }
+    );
   }
   if (err instanceof UsenetEngineClosedError) {
     return new DebridError(

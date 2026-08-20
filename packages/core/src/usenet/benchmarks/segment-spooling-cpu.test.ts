@@ -36,6 +36,17 @@ test('production TLS CPU benchmark reports bounded owners and fixed counters', a
   assert.equal(report.measurement.providerProcess, 'separate-node-child');
   assert.equal(report.measurement.fullIntegrityInsideCpuWindow, false);
   assert.equal(report.measurement.correctnessRun, true);
+  assert.equal(report.measurement.eventLoopMonitorResolutionMs, 1);
+  assert.equal(report.measurement.heartbeatIntervalMs, 2);
+  assert.equal(report.measurement.heartbeatBucketCount, 512);
+  assert(report.measurement.nullControl.monitor.count > 0);
+  assert(report.measurement.nullControl.heartbeat.count > 0);
+  assert(report.measurement.eventLoopNoiseToleranceMs >= 0.25);
+  assert(
+    report.measurement.eventLoopNoiseToleranceMs >=
+      report.measurement.nullControl.monitor.p95 -
+        report.measurement.nullControl.monitor.p50
+  );
   assert.match(report.identity.harnessSha256, /^[a-f\d]{64}$/);
   assert.match(report.identity.providerChildSha256, /^[a-f\d]{64}$/);
   for (const summary of report.scenarios) {
@@ -46,6 +57,35 @@ test('production TLS CPU benchmark reports bounded owners and fixed counters', a
     assert.equal(run.timedHashUpdates, 0);
     assert(run.timedValidationSamples > 0);
     assert(run.firstByteMs >= 0);
+    const consumers = run.scenario === 'S3' || run.scenario === 'S4' ? 2 : 1;
+    assert.equal(run.firstByteByConsumer.length, consumers);
+    assert.equal(run.firstBytePhases.length, consumers);
+    assert.equal(run.firstByteFastestMs, Math.min(...run.firstByteByConsumer));
+    assert.equal(run.firstByteSlowestMs, Math.max(...run.firstByteByConsumer));
+    for (const phases of run.firstBytePhases) {
+      assert(phases.readerRequestedAtMs >= 0);
+      assert(phases.globalAdmissionRequestedAtMs !== null);
+      assert(phases.globalAdmissionGrantedAtMs !== null);
+      assert(phases.providerSlotGrantedAtMs !== null);
+      assert(phases.nntpStatusAtMs !== null);
+      assert(phases.firstDecodedPayloadAtMs !== null);
+      assert(phases.firstSinkCommitAtMs !== null);
+      assert(phases.artifactReadableAtMs !== null);
+      assert(phases.totalFirstByteMs >= 0);
+      assert(phases.admissionWaitMs !== null && phases.admissionWaitMs >= 0);
+      assert(phases.providerWaitMs !== null && phases.providerWaitMs >= 0);
+      assert(phases.decodeToCommitMs !== null && phases.decodeToCommitMs >= 0);
+      assert(
+        phases.commitToReadableMs !== null && phases.commitToReadableMs >= 0
+      );
+      assert(
+        phases.readableToConsumerMs !== null && phases.readableToConsumerMs >= 0
+      );
+    }
+    assert(run.eventLoopDelayMs.p50 >= 0);
+    assert(run.eventLoopDelayMs.p95 >= run.eventLoopDelayMs.p50);
+    assert(run.eventLoopDelayMs.p99 >= run.eventLoopDelayMs.p95);
+    assert(run.eventLoopHeartbeatMs.count > 0);
     assert(run.hotpath.rawReadCallbacks > 0);
     assert(run.hotpath.yencDecodeCalls > 0);
     assert(run.hotpath.yencOutputBackingAllocations > 0);
@@ -86,6 +126,16 @@ test('production TLS CPU benchmark reports bounded owners and fixed counters', a
   const shared = report.scenarios.find((entry) => entry.scenario === 'S4');
   assert(shared);
   assert.equal(shared.runs[0].deliveredBytes, 2 * shared.runs[0].decodedBytes);
+  assert.equal(shared.median.firstByteByConsumer.length, 2);
+  assert.equal(shared.p95.firstByteByConsumer.length, 2);
+  const [sharedA, sharedB] = shared.runs[0].firstBytePhases;
+  assert(sharedA && sharedB);
+  assert.equal(
+    sharedA.globalAdmissionRequestedAtMs,
+    sharedB.globalAdmissionRequestedAtMs
+  );
+  assert.equal(sharedA.firstSinkCommitAtMs, sharedB.firstSinkCommitAtMs);
+  assert.equal(sharedA.artifactReadableAtMs, sharedB.artifactReadableAtMs);
 });
 
 test('provider CPU is isolated in a separate process', async () => {

@@ -19,6 +19,8 @@ export type PrioritySemaphoreErrorCode =
 /** Stable internal error taxonomy for bounded semaphore admission. */
 export class PrioritySemaphoreError extends Error {
   override readonly cause?: unknown;
+  /** Capacity is local process state, never provider health. */
+  readonly faultDomain: 'local' | undefined;
 
   constructor(
     readonly code: PrioritySemaphoreErrorCode,
@@ -27,6 +29,12 @@ export class PrioritySemaphoreError extends Error {
   ) {
     super(message);
     this.name = 'PrioritySemaphoreError';
+    this.faultDomain =
+      code === 'SEMAPHORE_GLOBAL_CAPACITY' ||
+      code === 'SEMAPHORE_OWNER_CAPACITY' ||
+      code === 'SEMAPHORE_ACTIVE_OWNER_CAPACITY'
+        ? 'local'
+        : undefined;
     if (options.cause !== undefined) this.cause = options.cause;
     Error.captureStackTrace?.(this, PrioritySemaphoreError);
   }

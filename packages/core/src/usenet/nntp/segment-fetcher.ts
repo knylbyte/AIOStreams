@@ -86,6 +86,13 @@ export interface StreamingSegmentResult<T> {
   readonly metadata: DecodedSegmentMetadata;
 }
 
+/** Fixed-cost phase hooks used by the production-path latency benchmark. */
+export interface StreamingSegmentTransferObserver {
+  onProviderSlotGranted?(): void;
+  onNntpStatus?(): void;
+  onFirstDecodedPayload?(): void;
+}
+
 /**
  * "Fetch one segment, with provider failover + decode." The connection-owning
  * half of the engine ({@link LocalSegmentFetcher}). The caller
@@ -118,7 +125,8 @@ export interface SegmentFetcher {
     priority: CommandPriority,
     createAttempt: () => Promise<StreamingSegmentAttempt<T>>,
     signal?: AbortSignal,
-    onWireStart?: () => void
+    onWireStart?: () => void,
+    observer?: StreamingSegmentTransferObserver
   ): Promise<StreamingSegmentResult<T>>;
   /** Head-only probe: decode the leading `want` bytes + yEnc header fields. */
   fetchHead(
@@ -418,7 +426,8 @@ export class LocalSegmentFetcher implements SegmentFetcher {
     priority: CommandPriority,
     createAttempt: () => Promise<StreamingSegmentAttempt<T>>,
     signal?: AbortSignal,
-    onWireStart?: () => void
+    onWireStart?: () => void,
+    observer?: StreamingSegmentTransferObserver
   ): Promise<StreamingSegmentResult<T>> {
     return this.submitWithFailover<StreamingSegmentResult<T>>(
       segment,
@@ -441,7 +450,11 @@ export class LocalSegmentFetcher implements SegmentFetcher {
                 decoder: new StreamingYencArticleDecoder(
                   attempt.sink,
                   attempt.onHeader,
-                  this.hotpathCounters
+                  this.hotpathCounters,
+                  {
+                    onNntpStatus: observer?.onNntpStatus,
+                    onFirstDecodedPayload: observer?.onFirstDecodedPayload,
+                  }
                 ),
               };
             } catch (error) {
@@ -458,6 +471,7 @@ export class LocalSegmentFetcher implements SegmentFetcher {
             }
           },
           run: (conn, prepared, markTransferStarted) => {
+            observer?.onProviderSlotGranted?.();
             const transfer = conn.bodyToConsumer(
               segment.messageId,
               prepared.decoder,

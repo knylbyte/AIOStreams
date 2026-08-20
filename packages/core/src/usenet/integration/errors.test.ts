@@ -3,9 +3,11 @@ import test from 'node:test';
 import { UsenetSpoolError } from '../spool/errors.js';
 import { NntpError } from '../nntp/errors.js';
 import { YencDecodeError, YencMetadataError } from '../pool/yenc.js';
+import { PrioritySemaphoreError } from '../pool/priority-semaphore.js';
 import {
   describeUsenetError,
   friendlyUsenetError,
+  isDownloadAdmissionCapacityError,
   toDebridError,
 } from './errors.js';
 
@@ -37,6 +39,41 @@ test('maps transient resource admission errors to service unavailable', () => {
     assert.equal(mapped.statusCode, 503);
     assert.equal(mapped.code, 'SERVICE_UNAVAILABLE');
     assert.deepEqual(mapped.body, { usenetCode: code });
+  }
+});
+
+test('maps typed download-admission capacity to a stable 503 without erasing its code', () => {
+  for (const code of [
+    'SEMAPHORE_GLOBAL_CAPACITY',
+    'SEMAPHORE_OWNER_CAPACITY',
+    'SEMAPHORE_ACTIVE_OWNER_CAPACITY',
+  ] as const) {
+    const error = new PrioritySemaphoreError(code, 'internal capacity');
+    assert.equal(isDownloadAdmissionCapacityError(error), true);
+    assert.deepEqual(friendlyUsenetError(error), {
+      reason:
+        'The Usenet download scheduler is at capacity. Retry after active streams release their slots.',
+      code,
+    });
+    const mapped = toDebridError(error);
+    assert.equal(mapped.statusCode, 503);
+    assert.equal(mapped.code, 'SERVICE_UNAVAILABLE');
+    assert.deepEqual(mapped.body, { usenetCode: code });
+    assert.equal(mapped.cause, error);
+  }
+
+  for (const code of [
+    'SEMAPHORE_INVALID_OWNER',
+    'SEMAPHORE_INVALID_PRIORITY',
+    'SEMAPHORE_CLOSED',
+    'SEMAPHORE_ABORTED',
+  ] as const) {
+    assert.equal(
+      isDownloadAdmissionCapacityError(
+        new PrioritySemaphoreError(code, 'not capacity')
+      ),
+      false
+    );
   }
 });
 

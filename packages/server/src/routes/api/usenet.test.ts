@@ -45,7 +45,11 @@ vi.mock('../../middlewares/cors.js', () => ({
     next(),
 }));
 
-import { DebridError } from '@aiostreams/core';
+import {
+  DebridError,
+  PrioritySemaphoreError,
+  toDebridError,
+} from '@aiostreams/core';
 import usenetRouter from './usenet.js';
 
 function opened(stream: PassThrough, size = 6) {
@@ -196,5 +200,27 @@ describe('native usenet route failure ownership', () => {
       detail: 'safe public failure',
     });
     expect(mocks.warn).toHaveBeenCalledTimes(1);
+  });
+
+  test('download admission capacity before headers is a stable 503', async () => {
+    const capacity = new PrioritySemaphoreError(
+      'SEMAPHORE_ACTIVE_OWNER_CAPACITY',
+      'internal scheduler detail'
+    );
+    mocks.openNativeUsenetStream.mockRejectedValue(toDebridError(capacity));
+
+    const response = await fetch(
+      `${baseUrl}/usenet/stream/test-token/video.mkv?download=1`
+    );
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      success: false,
+      detail:
+        'The Usenet download scheduler is at capacity. Please retry shortly.',
+    });
+    expect(mocks.warn).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(mocks.warn.mock.calls)).not.toContain(
+      'internal scheduler detail'
+    );
   });
 });

@@ -179,6 +179,28 @@ test('publishes exact bounded yEnc header metadata before the first sink write',
   assert.deepEqual(sink.decoded(), body);
 });
 
+test('reports NNTP status and the first decoded payload exactly once', async () => {
+  const raw = yencode.post(
+    'lifecycle.bin',
+    Buffer.from('decoder lifecycle payload'),
+    7
+  );
+  const sink = new CollectingSink();
+  const phases: string[] = [];
+  const decoder = new StreamingYencArticleDecoder(sink, undefined, undefined, {
+    onNntpStatus: () => phases.push('status'),
+    onFirstDecodedPayload: () => phases.push('decoded'),
+  });
+
+  decoder.onStatus();
+  for (let offset = 0; offset < raw.length; offset += 3) {
+    assert.equal(decoder.push(raw.subarray(offset, offset + 3)), true);
+  }
+  await decoder.finish();
+
+  assert.deepEqual(phases, ['status', 'decoded']);
+});
+
 test('preserves escape and NNTP dot-unstuffing state across byte boundaries', async () => {
   const raw = Buffer.from(
     [

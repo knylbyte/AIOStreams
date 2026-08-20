@@ -36,7 +36,11 @@ import {
   type UsenetLibraryEntry,
 } from '../../db/index.js';
 import { type UsenetStreamToken, decodeUsenetStreamToken } from './tokens.js';
-import { friendlyUsenetError } from './errors.js';
+import {
+  friendlyUsenetError,
+  isDownloadAdmissionCapacityError,
+  toDebridError,
+} from './errors.js';
 import {
   markReleaseDead,
   markReleaseDeadForCode,
@@ -932,6 +936,7 @@ export async function openNativeUsenetStream(opts: {
         cause: err,
       });
     }
+    if (isDownloadAdmissionCapacityError(err)) throw toDebridError(err);
     throw err;
   }
 }
