@@ -1,12 +1,13 @@
 import { NextFunction, Request, Response, Router } from 'express';
 import type { Readable, Writable } from 'node:stream';
 import {
+  APIError,
+  constants,
   createLogger,
   downloadAdmissionCapacityCode,
   openNativeUsenetStream,
   DebridError,
-  toDebridError,
-  type DownloadAdmissionCapacityErrorCode,
+  toPublicUsenetStreamError,
 } from '@aiostreams/core';
 import { mapDebridErrorToStaticFile } from '../../app.js';
 import { corsMiddleware } from '../../middlewares/cors.js';
@@ -55,18 +56,26 @@ const STREAM_REPRESENTATION_HEADERS = [
   'Location',
 ] as const;
 
-function sendAdmissionCapacityResponse(
+function publicUsenetCode(error: DebridError): string | undefined {
+  const body = error.body;
+  if (typeof body !== 'object' || body === null || !('usenetCode' in body)) {
+    return undefined;
+  }
+  return typeof body.usenetCode === 'string' ? body.usenetCode : undefined;
+}
+
+function sendTypedUsenetFailureResponse(
   res: Response,
-  error: DebridError,
-  usenetCode: DownloadAdmissionCapacityErrorCode
+  error: DebridError
 ): void {
   for (const header of STREAM_REPRESENTATION_HEADERS) {
     res.removeHeader(header);
   }
-  res.status(503).json({
+  const usenetCode = publicUsenetCode(error);
+  res.status(error.statusCode || 502).json({
     success: false,
     detail: error.message,
-    usenetCode,
+    ...(usenetCode ? { usenetCode } : {}),
   });
 }
 
@@ -76,13 +85,15 @@ function prematureStreamClose(): Error & { readonly code: string } {
   });
 }
 
+const MAX_ROUTE_SETTLEMENT_ERRORS = 8;
+
 interface ResponsePipeSettlementState {
   sourceEnded: boolean;
   sourceClosed: boolean;
   responseFinished: boolean;
   responseClosed: boolean;
   primaryError?: Error;
-  secondaryError?: Error;
+  readonly secondaryErrors: Error[];
 }
 
 function asError(error: unknown): Error {
@@ -96,18 +107,21 @@ function recordSettlementError(
   const failure = asError(error);
   if (!state.primaryError) {
     state.primaryError = failure;
-  } else if (failure !== state.primaryError && !state.secondaryError) {
-    state.secondaryError = failure;
+  } else if (
+    failure !== state.primaryError &&
+    state.secondaryErrors.length < MAX_ROUTE_SETTLEMENT_ERRORS - 1 &&
+    !state.secondaryErrors.includes(failure)
+  ) {
+    state.secondaryErrors.push(failure);
   }
 }
 
 function settlementError(state: ResponsePipeSettlementState): Error {
   const primary = state.primaryError;
   if (!primary) return prematureStreamClose();
-  const secondary = state.secondaryError;
-  if (!secondary) return primary;
+  if (state.secondaryErrors.length === 0) return primary;
   return new AggregateError(
-    [primary, secondary],
+    [primary, ...state.secondaryErrors],
     'Usenet stream failed and source cleanup also failed',
     { cause: primary }
   );
@@ -124,6 +138,106 @@ function combineSettlementErrors(primary: unknown, secondary: unknown): Error {
   );
 }
 
+interface UsenetRouteSettlementFailure {
+  readonly outer: Error;
+  readonly primary: Error;
+  readonly cleanupErrors: readonly Error[];
+}
+
+function aggregatePrimary(error: Error): Error {
+  let current = error;
+  const seen = new Set<Error>();
+  for (let depth = 0; depth < MAX_ROUTE_SETTLEMENT_ERRORS; depth++) {
+    if (seen.has(current)) return error;
+    seen.add(current);
+    if (!(current instanceof AggregateError)) return current;
+
+    if (current.cause instanceof Error && !seen.has(current.cause)) {
+      current = current.cause;
+      continue;
+    }
+
+    let firstError: Error | undefined;
+    const inspected = Math.min(
+      current.errors.length,
+      MAX_ROUTE_SETTLEMENT_ERRORS - depth - 1
+    );
+    for (let index = 0; index < inspected; index++) {
+      const candidate = current.errors[index];
+      if (candidate instanceof Error && !seen.has(candidate)) {
+        firstError = candidate;
+        break;
+      }
+    }
+    if (!firstError) return error;
+    current = firstError;
+  }
+  return error;
+}
+
+function leadsToPrimary(error: Error, primary: Error): boolean {
+  let current: Error | undefined = error;
+  const seen = new Set<Error>();
+  for (let depth = 0; current && depth < MAX_ROUTE_SETTLEMENT_ERRORS; depth++) {
+    if (current === primary) return true;
+    if (seen.has(current)) return false;
+    seen.add(current);
+    current = current.cause instanceof Error ? current.cause : undefined;
+  }
+  return false;
+}
+
+function cleanupErrorsFor(outer: Error, primary: Error): readonly Error[] {
+  if (!(outer instanceof AggregateError)) return [];
+  const cleanupErrors: Error[] = [];
+  const seen = new Set<Error>();
+  let inspected = 0;
+
+  const visit = (error: Error, depth: number): void => {
+    if (
+      depth >= MAX_ROUTE_SETTLEMENT_ERRORS ||
+      inspected >= MAX_ROUTE_SETTLEMENT_ERRORS ||
+      seen.has(error)
+    ) {
+      return;
+    }
+    inspected++;
+    seen.add(error);
+    if (error instanceof AggregateError) {
+      if (error.cause instanceof Error) visit(error.cause, depth + 1);
+      const remaining = MAX_ROUTE_SETTLEMENT_ERRORS - inspected;
+      const count = Math.min(error.errors.length, remaining);
+      for (let index = 0; index < count; index++) {
+        const candidate = error.errors[index];
+        if (candidate instanceof Error) visit(candidate, depth + 1);
+      }
+      return;
+    }
+    if (
+      !leadsToPrimary(error, primary) &&
+      safeErrorCode(error) !== 'USENET_STREAM_PREMATURE_CLOSE'
+    ) {
+      cleanupErrors.push(error);
+    }
+  };
+
+  visit(outer, 0);
+  return cleanupErrors;
+}
+
+function routeSettlementFailure(
+  caught: unknown,
+  lifecyclePrimary: Error | undefined
+): UsenetRouteSettlementFailure {
+  const outer = asError(caught);
+  const primary = lifecyclePrimary ?? aggregatePrimary(outer);
+  return {
+    outer,
+    primary,
+    cleanupErrors: cleanupErrorsFor(outer, primary),
+  };
+}
+
 const EXPECTED_CLIENT_CLOSE_CODES = new Set([
   'USENET_STREAM_PREMATURE_CLOSE',
   'ERR_STREAM_PREMATURE_CLOSE',
@@ -134,15 +248,38 @@ const EXPECTED_CLIENT_CLOSE_CODES = new Set([
   'USENET_SPOOL_ABORTED',
 ]);
 
-function isExpectedClientCloseError(error: unknown, depth = 0): boolean {
-  if (depth >= 8 || !(error instanceof Error)) return false;
+interface ExpectedCloseTraversal {
+  remaining: number;
+  readonly seen: Set<Error>;
+}
+
+function isExpectedClientCloseError(
+  error: unknown,
+  traversal: ExpectedCloseTraversal = {
+    remaining: MAX_ROUTE_SETTLEMENT_ERRORS,
+    seen: new Set<Error>(),
+  }
+): boolean {
+  if (
+    traversal.remaining <= 0 ||
+    !(error instanceof Error) ||
+    traversal.seen.has(error)
+  ) {
+    return false;
+  }
+  traversal.remaining--;
+  traversal.seen.add(error);
   if (error instanceof AggregateError) {
-    return (
-      error.errors.length > 0 &&
-      error.errors.every((entry) =>
-        isExpectedClientCloseError(entry, depth + 1)
-      )
-    );
+    if (
+      error.errors.length === 0 ||
+      error.errors.length > traversal.remaining
+    ) {
+      return false;
+    }
+    for (const entry of error.errors) {
+      if (!isExpectedClientCloseError(entry, traversal)) return false;
+    }
+    return true;
   }
   const code = safeErrorCode(error);
   if (
@@ -152,7 +289,7 @@ function isExpectedClientCloseError(error: unknown, depth = 0): boolean {
     return true;
   }
   return error.cause instanceof Error
-    ? isExpectedClientCloseError(error.cause, depth + 1)
+    ? isExpectedClientCloseError(error.cause, traversal)
     : false;
 }
 
@@ -168,6 +305,7 @@ export function pipeToResponse(stream: Readable, res: Writable): Promise<void> {
       sourceClosed: stream.closed,
       responseFinished: res.writableFinished,
       responseClosed: res.closed,
+      secondaryErrors: [],
     };
     let settled = false;
     const cleanup = (): void => {
@@ -268,6 +406,7 @@ export function destroySourceAndWait(stream: Readable): Promise<void> {
       sourceClosed: false,
       responseFinished: false,
       responseClosed: false,
+      secondaryErrors: [],
     };
     const onError = (error: Error): void => {
       recordSettlementError(state, error);
@@ -427,6 +566,7 @@ router.get(
           (err?.code === 'USENET_STREAM_REAPED' ||
             err?.code === 'STREAM_STOPPED' ||
             err?.code === 'USENET_ENGINE_CLOSED') &&
+          res.headersSent &&
           !socket.destroyed
         ) {
           socket.resetAndDestroy();
@@ -450,84 +590,74 @@ router.get(
         }
       }
 
-      const effectiveError =
-        caughtError instanceof AggregateError
-          ? caughtError
-          : (lifecycle.firstError ?? caughtError);
-      const admissionCapacityCode =
-        downloadAdmissionCapacityCode(effectiveError);
-      const publicError = admissionCapacityCode
-        ? toDebridError(effectiveError)
-        : effectiveError;
-      const code = safeErrorCode(effectiveError);
-      if (
-        isStreamShutdownError(effectiveError) &&
-        !lifecycle.clientAborted &&
-        !res.headersSent &&
-        !res.destroyed
-      ) {
-        logger.info({ code }, 'usenet stream stopped before response startup');
+      const failure = routeSettlementFailure(caughtError, lifecycle.firstError);
+      const { outer, primary, cleanupErrors } = failure;
+      const code = safeErrorCode(primary);
+      const responseUnavailable =
+        lifecycle.clientAborted ||
+        res.destroyed ||
+        res.closed ||
+        socket.destroyed;
+      if (responseUnavailable && !res.writableFinished) {
+        lifecycle.recordResponseClose(false);
+      }
+      const logFields = usenetStreamFailureLogFields(
+        outer,
+        primary,
+        lifecycle,
+        res.headersSent,
+        cleanupErrors
+      );
+      const shutdown = isStreamShutdownError(primary);
+
+      if (shutdown && !responseUnavailable && !res.headersSent) {
+        logger.info(logFields, 'usenet stream stopped before response startup');
         sendStreamShutdownResponse(res);
         return;
       }
-      if (isStreamShutdownError(effectiveError)) {
+      if (shutdown) {
         logger.debug(
-          usenetStreamFailureLogFields(
-            caughtError,
-            effectiveError,
-            lifecycle,
-            res.headersSent
-          ),
+          logFields,
           'usenet stream stopped during response shutdown'
         );
         return;
       }
-      const isClientDisconnect =
-        (lifecycle.clientAborted && isExpectedClientCloseError(caughtError)) ||
-        (!lifecycle.firstError && isExpectedClientCloseError(caughtError));
 
-      if (isClientDisconnect) {
-        logger.debug(
-          { code: safeErrorCode(lifecycle.firstError) ?? code },
-          'client disconnected from usenet stream'
+      const expectedClientClose =
+        isExpectedClientCloseError(primary) &&
+        cleanupErrors.every((error) => isExpectedClientCloseError(error));
+      if (expectedClientClose && responseUnavailable) {
+        logger.debug({ code }, 'client disconnected from usenet stream');
+        return;
+      }
+
+      if (responseUnavailable) {
+        logger.warn(
+          logFields,
+          'usenet stream failed after response connection closed'
         );
         return;
       }
 
       if (res.headersSent) {
-        logger.warn(
-          usenetStreamFailureLogFields(
-            caughtError,
-            effectiveError,
-            lifecycle,
-            res.headersSent
-          ),
-          'usenet stream failed after headers sent'
-        );
+        logger.warn(logFields, 'usenet stream failed after headers sent');
         res.destroy();
         return;
       }
 
-      if (publicError instanceof DebridError) {
+      const admissionCapacityCode = downloadAdmissionCapacityCode(primary);
+      const publicError = toPublicUsenetStreamError(primary);
+      if (publicError) {
         logger.warn(
           {
-            ...usenetStreamFailureLogFields(
-              caughtError,
-              effectiveError,
-              lifecycle,
-              res.headersSent
-            ),
+            ...logFields,
             code: publicError.code,
             status: publicError.statusCode,
           },
           'usenet stream failed before any bytes were sent'
         );
-        if (admissionCapacityCode) {
-          sendAdmissionCapacityResponse(
-            res,
-            publicError,
-            admissionCapacityCode
-          );
+        if (!(primary instanceof DebridError) || admissionCapacityCode) {
+          sendTypedUsenetFailureResponse(res, publicError);
         } else if (req.query.download !== undefined) {
           res.status(publicError.statusCode || 502).json({
             success: false,
@@ -541,7 +671,9 @@ router.get(
         }
         return;
       }
-      next(effectiveError);
+
+      logger.warn(logFields, 'usenet stream failed before any bytes were sent');
+      next(new APIError(constants.ErrorCode.INTERNAL_SERVER_ERROR));
     } finally {
       res.removeListener('close', onClose);
     }

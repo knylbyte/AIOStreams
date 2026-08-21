@@ -2,15 +2,17 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DebridError } from '../../debrid/base.js';
 import { UsenetSpoolError } from '../spool/errors.js';
-import { NntpError } from '../nntp/errors.js';
+import { ArticleNotFoundError, NntpError } from '../nntp/errors.js';
 import { YencDecodeError, YencMetadataError } from '../pool/yenc.js';
 import { PrioritySemaphoreError } from '../pool/priority-semaphore.js';
+import { UsenetEngineClosedError } from '../pool/tracked-stream.js';
 import {
   describeUsenetError,
   downloadAdmissionCapacityCode,
   friendlyUsenetError,
   isDownloadAdmissionCapacityError,
   toDebridError,
+  toPublicUsenetStreamError,
 } from './errors.js';
 
 test('maps spool disk exhaustion to a clear stable user error', () => {
@@ -187,4 +189,73 @@ test('extracts safe root-cause fields through the public error wrapper', () => {
     carryChunks: 3,
     carryLimitBytes: 1_048_576,
   });
+});
+
+test('maps only established public stream errors and preserves unknown 500 semantics', () => {
+  const known: ReadonlyArray<{
+    readonly error: Error;
+    readonly status: number;
+  }> = [
+    {
+      error: new ArticleNotFoundError('private article identifier'),
+      status: 404,
+    },
+    {
+      error: new UsenetSpoolError('USENET_SPOOL_DISK_FULL', 'private path'),
+      status: 507,
+    },
+    {
+      error: new UsenetSpoolError('USENET_SPOOL_CAPACITY', 'private detail'),
+      status: 503,
+    },
+    {
+      error: new UsenetSpoolError('USENET_SPOOL_IO', 'private path'),
+      status: 502,
+    },
+    { error: new UsenetEngineClosedError(), status: 503 },
+    {
+      error: new YencDecodeError('invalid_header', 'private article data'),
+      status: 502,
+    },
+    {
+      error: new YencMetadataError('invalid_header', 'private metadata'),
+      status: 502,
+    },
+    {
+      error: new NntpError('local_backpressure', 'private provider detail'),
+      status: 502,
+    },
+    {
+      error: new PrioritySemaphoreError(
+        'SEMAPHORE_ACTIVE_OWNER_CAPACITY',
+        'private owner key'
+      ),
+      status: 503,
+    },
+  ];
+
+  for (const { error, status } of known) {
+    const mapped = toPublicUsenetStreamError(error);
+    assert.ok(mapped);
+    assert.equal(mapped.statusCode, status);
+    assert.equal(mapped.cause, error);
+  }
+
+  const existing = new DebridError('safe public failure', {
+    statusCode: 418,
+    statusText: "I'm a Teapot",
+    code: 'UNKNOWN',
+    headers: {},
+    body: null,
+    type: 'api_error',
+  });
+  assert.equal(toPublicUsenetStreamError(existing), existing);
+  assert.equal(
+    toPublicUsenetStreamError(new Error('internal invariant and private path')),
+    undefined
+  );
+  assert.equal(
+    toPublicUsenetStreamError(new NntpError('protocol', 'private command')),
+    undefined
+  );
 });

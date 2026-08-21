@@ -23,6 +23,7 @@ export function safeErrorCode(error: unknown): string | number | undefined {
 
 /** Monotonic request-local state; later response close cannot mask an error. */
 export class UsenetStreamLifecycle {
+  private clientAbortedValue = false;
   private firstErrorValue: Error | undefined;
   private stageValue: UsenetStreamStage = 'opening';
   private terminationValue: UsenetStreamTermination = 'active';
@@ -40,7 +41,7 @@ export class UsenetStreamLifecycle {
   }
 
   get clientAborted(): boolean {
-    return this.terminationValue === 'client_aborted';
+    return this.clientAbortedValue;
   }
 
   advance(stage: Exclude<UsenetStreamStage, 'opening'>): void {
@@ -49,7 +50,13 @@ export class UsenetStreamLifecycle {
   }
 
   recordStreamError(error: Error, shutdown: boolean): boolean {
-    if (this.firstErrorValue) return false;
+    if (
+      this.firstErrorValue ||
+      this.terminationValue === 'client_aborted' ||
+      this.terminationValue === 'normal_eof'
+    ) {
+      return false;
+    }
     this.firstErrorValue = error;
     if (this.terminationValue === 'active') {
       this.terminationValue = shutdown ? 'shutdown' : 'internal_error';
@@ -65,6 +72,7 @@ export class UsenetStreamLifecycle {
       // its actual close (which may follow asynchronous file cleanup).
       return false;
     }
+    this.clientAbortedValue = true;
     if (this.terminationValue !== 'active') return false;
     this.terminationValue = 'client_aborted';
     return true;
@@ -80,16 +88,12 @@ export class UsenetStreamLifecycle {
 /** Credential-free fields for the route's single internal-failure warning. */
 export function usenetStreamFailureLogFields(
   outerError: unknown,
-  effectiveError: unknown,
+  primaryError: unknown,
   lifecycle: UsenetStreamLifecycle,
-  headersSent: boolean
+  headersSent: boolean,
+  cleanupErrors: readonly Error[] = []
 ): Record<string, unknown> {
-  const cleanupError =
-    outerError instanceof AggregateError
-      ? outerError.errors.find(
-          (error) => error instanceof Error && error !== outerError.cause
-        )
-      : undefined;
+  const cleanupError = cleanupErrors[0];
   return {
     outerErrorName:
       outerError instanceof Error ? outerError.name : 'UnknownError',
@@ -97,7 +101,8 @@ export function usenetStreamFailureLogFields(
     cleanupErrorName:
       cleanupError instanceof Error ? cleanupError.name : undefined,
     cleanupCode: safeErrorCode(cleanupError),
-    ...describeUsenetError(effectiveError),
+    cleanupErrorCount: Math.min(cleanupErrors.length, 8),
+    ...describeUsenetError(primaryError),
     streamStage: lifecycle.stage,
     streamTermination: lifecycle.termination,
     headersSent,

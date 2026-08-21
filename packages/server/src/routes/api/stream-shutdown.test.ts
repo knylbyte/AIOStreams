@@ -48,6 +48,35 @@ describe('stream shutdown response contract', () => {
     expect(isStreamShutdownError(new Error('stopped'))).toBe(false);
   });
 
+  test('follows only the bounded primary cause of settlement aggregates', () => {
+    const shutdown = Object.assign(new Error('private shutdown detail'), {
+      code: 'USENET_ENGINE_CLOSED',
+    });
+    const cleanup = Object.assign(new Error('private path'), { code: 'EIO' });
+    expect(
+      isStreamShutdownError(
+        new AggregateError([shutdown, cleanup], 'settlement', {
+          cause: shutdown,
+        })
+      )
+    ).toBe(true);
+
+    const primary = Object.assign(new Error('primary'), {
+      code: 'USENET_SPOOL_IO',
+    });
+    expect(
+      isStreamShutdownError(
+        new AggregateError([primary, shutdown], 'settlement', {
+          cause: primary,
+        })
+      )
+    ).toBe(false);
+
+    const cyclic = new Error('cycle');
+    cyclic.cause = cyclic;
+    expect(isStreamShutdownError(cyclic)).toBe(false);
+  });
+
   test('writes the stable pre-header 503 response', async () => {
     const response = await fetch(`${baseUrl}/stopped`);
     expect(response.status).toBe(503);

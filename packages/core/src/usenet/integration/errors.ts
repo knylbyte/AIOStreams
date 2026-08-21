@@ -19,6 +19,14 @@ export type DownloadAdmissionCapacityErrorCode =
   | 'SEMAPHORE_OWNER_CAPACITY'
   | 'SEMAPHORE_ACTIVE_OWNER_CAPACITY';
 
+export {
+  ArticleNotFoundError,
+  NntpError,
+  UsenetEngineClosedError,
+} from '../index.js';
+export { UsenetSpoolError } from '../spool/errors.js';
+export { YencDecodeError, YencMetadataError } from '../pool/yenc.js';
+
 /** True only for bounded global-download admission exhaustion. */
 export function isDownloadAdmissionCapacityError(
   error: unknown
@@ -356,6 +364,32 @@ export function toDebridError(err: unknown): DebridError {
       cause: err,
     }
   );
+}
+
+/**
+ * Map only errors with an established public Usenet streaming contract.
+ * Unknown programming and invariant failures deliberately remain undefined so
+ * the HTTP boundary preserves its generic internal-500 behavior.
+ */
+export function toPublicUsenetStreamError(
+  error: unknown
+): DebridError | undefined {
+  if (
+    error instanceof DebridError ||
+    error instanceof ArticleNotFoundError ||
+    error instanceof UsenetSpoolError ||
+    error instanceof UsenetEngineClosedError ||
+    error instanceof YencDecodeError ||
+    error instanceof YencMetadataError ||
+    (error instanceof NntpError &&
+      (error.kind === 'local_backpressure' ||
+        (error.kind === 'timeout' &&
+          error.timeoutSource === 'local_backpressure'))) ||
+    downloadAdmissionCapacityCode(error) !== undefined
+  ) {
+    return toDebridError(error);
+  }
+  return undefined;
 }
 
 export interface UsenetErrorLogDetails {

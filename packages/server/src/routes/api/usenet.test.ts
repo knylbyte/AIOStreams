@@ -21,6 +21,10 @@ const mocks = vi.hoisted(() => ({
   debug: vi.fn(),
   info: vi.fn(),
   warn: vi.fn(),
+  responseJson: vi.fn(),
+  responseRedirect: vi.fn(),
+  responseClose: vi.fn(),
+  responseAfterClose: vi.fn(),
 }));
 
 vi.mock('@aiostreams/core', async (importOriginal) => {
@@ -46,9 +50,15 @@ vi.mock('../../middlewares/cors.js', () => ({
 }));
 
 import {
+  ArticleNotFoundError,
   DebridError,
+  NntpError,
   PrioritySemaphoreError,
   toDebridError,
+  UsenetEngineClosedError,
+  UsenetSpoolError,
+  YencDecodeError,
+  YencMetadataError,
 } from '@aiostreams/core';
 import usenetRouter, {
   destroySourceAndWait,
@@ -124,6 +134,52 @@ async function waitForStreamErrorOwnership(stream: PassThrough): Promise<void> {
   expect(stream.listenerCount('error')).toBeGreaterThanOrEqual(2);
 }
 
+async function beginLazyFailure(
+  url: string,
+  error: Error,
+  init?: RequestInit
+): Promise<{
+  readonly stream: DeferredCloseStream;
+  readonly response: Promise<globalThis.Response>;
+}> {
+  const stream = new DeferredCloseStream();
+  mocks.openNativeUsenetStream.mockResolvedValue(opened(stream));
+  const response = fetch(url, init);
+  void response.catch(() => undefined);
+  await waitForStreamErrorOwnership(stream);
+  stream.fail(error);
+  await stream.closeStarted.promise;
+  return { stream, response };
+}
+
+async function expectTypedFailure(
+  responsePromise: Promise<globalThis.Response>,
+  status: number,
+  usenetCode?: string
+): Promise<void> {
+  const response = await responsePromise;
+  expect(response.status).toBe(status);
+  expect(response.headers.get('location')).toBeNull();
+  const body = await response.json();
+  expect(body).toMatchObject({
+    success: false,
+    ...(usenetCode ? { usenetCode } : {}),
+  });
+  expect(JSON.stringify(body)).not.toContain('private');
+}
+
+function expectNoPublicResponseAttempt(testId: string): void {
+  expect(
+    mocks.responseJson.mock.calls.filter(([id]) => id === testId)
+  ).toHaveLength(0);
+  expect(
+    mocks.responseRedirect.mock.calls.filter(([id]) => id === testId)
+  ).toHaveLength(0);
+  expect(
+    mocks.responseAfterClose.mock.calls.filter(([id]) => id === testId)
+  ).toHaveLength(0);
+}
+
 const CAPACITY_CODES = [
   'SEMAPHORE_GLOBAL_CAPACITY',
   'SEMAPHORE_OWNER_CAPACITY',
@@ -185,6 +241,41 @@ describe('native usenet route failure ownership', () => {
 
   beforeAll(async () => {
     const app = express();
+    app.use((request, response, next) => {
+      const testId = request.get('x-route-test-id');
+      let responseClosed = false;
+      response.once('close', () => {
+        responseClosed = true;
+        mocks.responseClose(testId);
+      });
+      const originalStatus = response.status.bind(response);
+      response.status = (statusCode: number) => {
+        if (responseClosed) {
+          mocks.responseAfterClose(testId, 'status', statusCode);
+        }
+        return originalStatus(statusCode);
+      };
+      const originalJson = response.json.bind(response);
+      response.json = (body: unknown) => {
+        if (responseClosed) mocks.responseAfterClose(testId, 'json');
+        mocks.responseJson(testId, body);
+        return originalJson(body);
+      };
+      const originalRedirect = response.redirect.bind(response);
+      function trackedRedirect(url: string): void;
+      function trackedRedirect(status: number, url: string): void;
+      function trackedRedirect(statusOrUrl: number | string, url?: string) {
+        if (responseClosed) mocks.responseAfterClose(testId, 'redirect');
+        mocks.responseRedirect(testId, statusOrUrl, url);
+        if (typeof statusOrUrl === 'number') {
+          originalRedirect(statusOrUrl, url ?? '/');
+        } else {
+          originalRedirect(statusOrUrl);
+        }
+      }
+      response.redirect = trackedRedirect;
+      next();
+    });
     app.use('/usenet', usenetRouter);
     app.use(
       (
@@ -212,6 +303,10 @@ describe('native usenet route failure ownership', () => {
     mocks.debug.mockReset();
     mocks.info.mockReset();
     mocks.warn.mockReset();
+    mocks.responseJson.mockReset();
+    mocks.responseRedirect.mockReset();
+    mocks.responseClose.mockReset();
+    mocks.responseAfterClose.mockReset();
   });
 
   afterAll(async () => {
@@ -262,12 +357,16 @@ describe('native usenet route failure ownership', () => {
   });
 
   test('a genuine client abort remains a quiet client-owned cancellation', async () => {
+    const testId = 'pure-client-abort';
     const stream = new DeferredCloseStream();
     mocks.openNativeUsenetStream.mockResolvedValue(opened(stream));
     const controller = new AbortController();
     const responsePromise = fetch(
       `${baseUrl}/usenet/stream/test-token/video.mkv`,
-      { signal: controller.signal }
+      {
+        signal: controller.signal,
+        headers: { 'x-route-test-id': testId },
+      }
     );
     stream.write(Buffer.from('a'));
     const response = await responsePromise;
@@ -291,15 +390,20 @@ describe('native usenet route failure ownership', () => {
         ([, text]) => text === 'client disconnected from usenet stream'
       )
     ).toBe(true);
+    expectNoPublicResponseAttempt(testId);
   });
 
   test('a genuine client abort still reports an unexpected async cleanup EIO', async () => {
+    const testId = 'client-abort-cleanup-error';
     const stream = new DeferredCloseStream();
     mocks.openNativeUsenetStream.mockResolvedValue(opened(stream));
     const controller = new AbortController();
     const responsePromise = fetch(
       `${baseUrl}/usenet/stream/test-token/video.mkv`,
-      { signal: controller.signal }
+      {
+        signal: controller.signal,
+        headers: { 'x-route-test-id': testId },
+      }
     );
     stream.write(Buffer.from('a'));
     const response = await responsePromise;
@@ -316,6 +420,7 @@ describe('native usenet route failure ownership', () => {
       cleanupCode: 'EIO',
       clientAborted: true,
     });
+    expectNoPublicResponseAttempt(testId);
   });
 
   test('a pre-header DebridError retains the existing public mapping', async () => {
@@ -471,6 +576,284 @@ describe('native usenet route failure ownership', () => {
     expect(JSON.stringify(fields)).not.toContain('private');
   });
 
+  test('lazy disk exhaustion maps to 507 after successful source close', async () => {
+    const pending = await beginLazyFailure(
+      `${baseUrl}/usenet/stream/test-token/video.mkv`,
+      new UsenetSpoolError(
+        'USENET_SPOOL_DISK_FULL',
+        'private spool path and operation'
+      ),
+      { redirect: 'manual' }
+    );
+    pending.stream.releaseClose();
+    await expectTypedFailure(pending.response, 507, 'USENET_SPOOL_DISK_FULL');
+    expect(mocks.warn).toHaveBeenCalledTimes(1);
+  });
+
+  test('lazy disk exhaustion remains 507 when async close also fails', async () => {
+    const pending = await beginLazyFailure(
+      `${baseUrl}/usenet/stream/test-token/video.mkv`,
+      new UsenetSpoolError('USENET_SPOOL_DISK_FULL', 'private spool path'),
+      { redirect: 'manual' }
+    );
+    pending.stream.releaseClose(
+      Object.assign(new Error('private cleanup path'), { code: 'EIO' })
+    );
+    await expectTypedFailure(pending.response, 507, 'USENET_SPOOL_DISK_FULL');
+    expect(mocks.warn).toHaveBeenCalledTimes(1);
+    expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({
+      rootCode: 'USENET_SPOOL_DISK_FULL',
+      cleanupCode: 'EIO',
+      cleanupErrorCount: 1,
+    });
+    expect(JSON.stringify(mocks.warn.mock.calls)).not.toContain('private');
+  });
+
+  test('lazy spool and memory capacity retain their typed 503 after close EIO', async () => {
+    for (const code of [
+      'USENET_SPOOL_CAPACITY',
+      'USENET_MEMORY_BUDGET',
+      'USENET_SPOOL_OPEN_FILE_LIMIT',
+      'USENET_SPOOL_CLOSED',
+    ] as const) {
+      mocks.warn.mockReset();
+      const pending = await beginLazyFailure(
+        `${baseUrl}/usenet/stream/test-token/video.mkv`,
+        new UsenetSpoolError(code, 'private resource detail'),
+        { redirect: 'manual' }
+      );
+      pending.stream.releaseClose(
+        Object.assign(new Error('private cleanup path'), { code: 'EIO' })
+      );
+      await expectTypedFailure(pending.response, 503, code);
+      expect(mocks.warn).toHaveBeenCalledTimes(1);
+      expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({
+        rootCode: code,
+        cleanupCode: 'EIO',
+      });
+    }
+  });
+
+  test('lazy spool I/O and metadata failures retain their typed 502 after close EIO', async () => {
+    for (const code of [
+      'USENET_SPOOL_IO',
+      'USENET_SPOOL_METADATA_MISMATCH',
+    ] as const) {
+      mocks.warn.mockReset();
+      const pending = await beginLazyFailure(
+        `${baseUrl}/usenet/stream/test-token/video.mkv`,
+        new UsenetSpoolError(code, 'private spool detail'),
+        { redirect: 'manual' }
+      );
+      pending.stream.releaseClose(
+        Object.assign(new Error('private cleanup path'), { code: 'EIO' })
+      );
+      await expectTypedFailure(pending.response, 502, code);
+      expect(mocks.warn).toHaveBeenCalledTimes(1);
+      expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({
+        rootCode: code,
+        cleanupCode: 'EIO',
+      });
+    }
+  });
+
+  test('lazy shutdown remains the stable shutdown 503 after close EIO', async () => {
+    const shutdowns = [
+      new UsenetEngineClosedError(),
+      Object.assign(new Error('private process detail'), {
+        code: 'PROCESS_SHUTDOWN',
+      }),
+    ];
+    for (const shutdown of shutdowns) {
+      mocks.info.mockReset();
+      const pending = await beginLazyFailure(
+        `${baseUrl}/usenet/stream/test-token/video.mkv`,
+        shutdown
+      );
+      pending.stream.releaseClose(
+        Object.assign(new Error('private cleanup path'), { code: 'EIO' })
+      );
+      const response = await pending.response;
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toEqual({
+        error: 'Server is shutting down',
+        success: false,
+      });
+      expect(mocks.info).toHaveBeenCalledTimes(1);
+      expect(mocks.info.mock.calls[0]?.[0]).toMatchObject({
+        rootCode: shutdown.code,
+        cleanupCode: 'EIO',
+        streamTermination: 'shutdown',
+      });
+    }
+  });
+
+  test('lazy Debrid failures preserve playback and download presentation after close EIO', async () => {
+    for (const download of [false, true]) {
+      mocks.warn.mockReset();
+      const error = new DebridError('safe public failure', {
+        statusCode: 409,
+        statusText: 'Conflict',
+        code: 'CONFLICT',
+        headers: {},
+        body: null,
+        type: 'api_error',
+      });
+      const pending = await beginLazyFailure(
+        `${baseUrl}/usenet/stream/test-token/video.mkv${download ? '?download=1' : ''}`,
+        error,
+        { redirect: 'manual' }
+      );
+      pending.stream.releaseClose(
+        Object.assign(new Error('private cleanup path'), { code: 'EIO' })
+      );
+      const response = await pending.response;
+      if (download) {
+        expect(response.status).toBe(409);
+        await expect(response.json()).resolves.toEqual({
+          success: false,
+          detail: 'safe public failure',
+        });
+      } else {
+        expect(response.status).toBe(302);
+        expect(response.headers.get('location')).toBe('/static/CONFLICT.html');
+      }
+      expect(mocks.warn).toHaveBeenCalledTimes(1);
+      expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({
+        cleanupCode: 'EIO',
+      });
+    }
+  });
+
+  test('lazy yEnc and local NNTP failures retain their typed 502 after close EIO', async () => {
+    const failures: ReadonlyArray<{
+      readonly error: Error;
+      readonly code: string;
+    }> = [
+      {
+        error: new YencDecodeError('invalid_header', 'private article data'),
+        code: 'USENET_STREAMING_DECODE',
+      },
+      {
+        error: new YencMetadataError('invalid_header', 'private metadata'),
+        code: 'USENET_STREAMING_METADATA',
+      },
+      {
+        error: new NntpError('local_backpressure', 'private transport detail'),
+        code: 'USENET_STREAMING_LOCAL_BACKPRESSURE',
+      },
+    ];
+    for (const failure of failures) {
+      mocks.warn.mockReset();
+      const pending = await beginLazyFailure(
+        `${baseUrl}/usenet/stream/test-token/video.mkv`,
+        failure.error,
+        { redirect: 'manual' }
+      );
+      pending.stream.releaseClose(
+        Object.assign(new Error('private cleanup path'), { code: 'EIO' })
+      );
+      await expectTypedFailure(pending.response, 502, failure.code);
+      expect(mocks.warn).toHaveBeenCalledTimes(1);
+      expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({
+        cleanupCode: 'EIO',
+      });
+    }
+  });
+
+  test('lazy article-not-found remains 404 after close EIO', async () => {
+    const pending = await beginLazyFailure(
+      `${baseUrl}/usenet/stream/test-token/video.mkv`,
+      new ArticleNotFoundError('private message id', { allProviders: true }),
+      { redirect: 'manual' }
+    );
+    pending.stream.releaseClose(
+      Object.assign(new Error('private cleanup path'), { code: 'EIO' })
+    );
+    await expectTypedFailure(pending.response, 404);
+    expect(mocks.warn).toHaveBeenCalledTimes(1);
+    expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({ cleanupCode: 'EIO' });
+  });
+
+  test('unknown lazy failures remain generic 500 with or without close EIO', async () => {
+    for (const cleanupError of [
+      undefined,
+      Object.assign(new Error('private cleanup path'), { code: 'EIO' }),
+    ]) {
+      mocks.warn.mockReset();
+      const pending = await beginLazyFailure(
+        `${baseUrl}/usenet/stream/test-token/video.mkv`,
+        new Error('private internal invariant'),
+        { redirect: 'manual' }
+      );
+      pending.stream.releaseClose(cleanupError);
+      const response = await pending.response;
+      expect(response.status).toBe(500);
+      const body = await response.json();
+      expect(body).toEqual({ error: 'APIError' });
+      expect(JSON.stringify(body)).not.toContain('private');
+      expect(mocks.warn).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(mocks.warn.mock.calls)).not.toContain('private');
+    }
+  });
+
+  test('client disconnect during lazy capacity close suppresses every public response attempt', async () => {
+    const testId = 'lazy-capacity-disconnect';
+    const controller = new AbortController();
+    const pending = await beginLazyFailure(
+      `${baseUrl}/usenet/stream/test-token/video.mkv`,
+      new PrioritySemaphoreError(
+        'SEMAPHORE_ACTIVE_OWNER_CAPACITY',
+        'private owner key'
+      ),
+      {
+        redirect: 'manual',
+        signal: controller.signal,
+        headers: { 'x-route-test-id': testId },
+      }
+    );
+    controller.abort();
+    await expect(pending.response).rejects.toBeDefined();
+    await waitForCalls(mocks.responseClose, 1);
+    pending.stream.releaseClose();
+    await waitForCalls(mocks.warn, 1);
+
+    expectNoPublicResponseAttempt(testId);
+    expect(pending.stream.closed).toBe(true);
+    expect(mocks.warn).toHaveBeenCalledTimes(1);
+    expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({
+      rootCode: 'SEMAPHORE_ACTIVE_OWNER_CAPACITY',
+      clientAborted: true,
+    });
+  });
+
+  test('an internal lazy spool failure followed by disconnect warns once without responding', async () => {
+    const testId = 'lazy-spool-disconnect';
+    const controller = new AbortController();
+    const pending = await beginLazyFailure(
+      `${baseUrl}/usenet/stream/test-token/video.mkv`,
+      new UsenetSpoolError('USENET_SPOOL_IO', 'private spool path'),
+      {
+        redirect: 'manual',
+        signal: controller.signal,
+        headers: { 'x-route-test-id': testId },
+      }
+    );
+    controller.abort();
+    await expect(pending.response).rejects.toBeDefined();
+    await waitForCalls(mocks.responseClose, 1);
+    pending.stream.releaseClose();
+    await waitForCalls(mocks.warn, 1);
+
+    expectNoPublicResponseAttempt(testId);
+    expect(mocks.warn).toHaveBeenCalledTimes(1);
+    expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({
+      rootCode: 'USENET_SPOOL_IO',
+      clientAborted: true,
+      cleanupErrorCount: 0,
+    });
+  });
+
   test('post-header source failure is not logged until async source close settles', async () => {
     const stream = new DeferredCloseStream();
     mocks.openNativeUsenetStream.mockResolvedValue(opened(stream));
@@ -480,19 +863,24 @@ describe('native usenet route failure ownership', () => {
     stream.write(Buffer.from('a'));
     const response = await responsePromise;
     expect(response.status).toBe(200);
-    const failure = Object.assign(new Error('internal stream failure'), {
-      code: 'USENET_SPOOL_IO',
-    });
+    const failure = new UsenetSpoolError(
+      'USENET_SPOOL_IO',
+      'internal stream failure'
+    );
     stream.fail(failure);
     await stream.closeStarted.promise;
     expect(mocks.warn).not.toHaveBeenCalled();
 
-    stream.releaseClose();
+    stream.releaseClose(
+      Object.assign(new Error('private cleanup path'), { code: 'EIO' })
+    );
     await expect(response.arrayBuffer()).rejects.toBeDefined();
     await waitForCalls(mocks.warn, 1);
     expect(mocks.warn).toHaveBeenCalledTimes(1);
     expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({
       rootCode: 'USENET_SPOOL_IO',
+      cleanupCode: 'EIO',
+      outerErrorName: 'AggregateError',
       headersSent: true,
     });
   });

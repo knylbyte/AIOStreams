@@ -136,6 +136,19 @@ canonical concept itself is unchanged.
       client abort likewise await close; only expected abort causes remain
       quiet. Explicit HEAD, 304 and unsatisfiable-range reader destruction uses
       the same close barrier.
+- [x] Native HTTP failure settlement keeps three separate typed values: the
+      complete outer settlement error, the object-identical primary producer or
+      shutdown error, and at most seven secondary cleanup errors. Selection is
+      bounded to eight aggregate/cause nodes and is cycle-safe. Public status,
+      shutdown, static/download presentation and expected-abort decisions use
+      only the primary error; the outer aggregate and cleanup codes remain in
+      credential-free structured logs.
+- [x] After source close settles, the route rechecks the lifecycle, response and
+      socket before any status, JSON or redirect operation. A departed client
+      therefore receives no late response attempt. A pure expected abort stays
+      debug-only; an earlier internal primary produces one warning with
+      `clientAborted=true`, and an asynchronous cleanup failure remains in that
+      same warning without replacing the primary contract.
 - [x] Local fake-NNTP E2E coverage includes real TLS, 1×1 admission,
       fragmentation, local backpressure, pipelining, out-of-order completion,
       ranges, parallel clients, 430 failover, injected slow disk, ENOSPC/EACCES,
@@ -167,6 +180,30 @@ canonical concept itself is unchanged.
       pipelining/out-of-order completion while keeping the complete prefetch
       window out of the first-byte CPU turn. The fence is bounded by active
       download owners and is released on every success/error/close path.
+
+### Native stream public error contract
+
+Lazy failures raised after stream open but before the first response byte use
+the same public mapping as synchronous admission failures. Unknown programming
+or invariant errors are intentionally not normalized to an upstream 502:
+
+| Primary failure                                      | Pre-byte public result                                     |
+| ---------------------------------------------------- | ---------------------------------------------------------- |
+| Existing `DebridError`                               | Existing playback static redirect or download status/JSON  |
+| Global/per-owner/active-owner semaphore capacity     | 503 JSON with stable `usenetCode`; never a static redirect |
+| `USENET_SPOOL_DISK_FULL`                             | 507 JSON                                                   |
+| Spool capacity, memory budget, open-file limit/close | 503 JSON                                                   |
+| Spool I/O or metadata mismatch                       | 502 JSON                                                   |
+| Engine/process shutdown                              | Stable shutdown 503 body                                   |
+| Article missing on every provider                    | Existing 404 contract                                      |
+| yEnc or local NNTP/backpressure failure              | 502 JSON with stable `usenetCode`                          |
+| Unknown internal error                               | Generic internal 500                                       |
+
+A later source-close `EIO` never changes any row in this table. After headers,
+no second public response is attempted: the response is closed once and one
+structured record retains the primary root code, outer aggregate name and
+bounded cleanup code. A primary shutdown remains shutdown even when its source
+close also fails.
 
 The benchmark defaults to the concept's full 500 one-MiB segment run with a
 64-segment prefetch window, a 16 MiB memory budget and 60 configured producer

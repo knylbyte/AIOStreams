@@ -13,6 +13,18 @@ describe('UsenetStreamLifecycle', () => {
     expect(lifecycle.clientAborted).toBe(true);
   });
 
+  it('does not promote a cleanup error emitted after client-close ownership', () => {
+    const lifecycle = new UsenetStreamLifecycle();
+    lifecycle.advance('streaming');
+    expect(lifecycle.recordResponseClose(false)).toBe(true);
+    const cleanup = Object.assign(new Error('private close path'), {
+      code: 'EIO',
+    });
+    expect(lifecycle.recordStreamError(cleanup, false)).toBe(false);
+    expect(lifecycle.firstError).toBeUndefined();
+    expect(lifecycle.termination).toBe('client_aborted');
+  });
+
   it('keeps the first internal error when response close follows', () => {
     const lifecycle = new UsenetStreamLifecycle();
     lifecycle.advance('streaming');
@@ -23,7 +35,7 @@ describe('UsenetStreamLifecycle', () => {
     expect(lifecycle.recordResponseClose(false)).toBe(false);
     expect(lifecycle.firstError).toBe(internal);
     expect(lifecycle.termination).toBe('internal_error');
-    expect(lifecycle.clientAborted).toBe(false);
+    expect(lifecycle.clientAborted).toBe(true);
   });
 
   it('does not mark normal EOF until source close settlement is recorded', () => {
@@ -45,6 +57,7 @@ describe('UsenetStreamLifecycle', () => {
     lifecycle.recordStreamError(shutdown, true);
     expect(lifecycle.recordResponseClose(false)).toBe(false);
     expect(lifecycle.termination).toBe('shutdown');
+    expect(lifecycle.clientAborted).toBe(true);
   });
 
   it('emits credential-free structured fields without error messages', () => {
@@ -88,15 +101,17 @@ describe('UsenetStreamLifecycle', () => {
     });
     const fields = usenetStreamFailureLogFields(
       aggregate,
-      aggregate,
+      primary,
       lifecycle,
-      true
+      true,
+      [cleanup]
     );
     expect(fields).toMatchObject({
       outerErrorName: 'AggregateError',
       rootCode: 'USENET_SPOOL_CAPACITY',
       cleanupErrorName: 'Error',
       cleanupCode: 'EIO',
+      cleanupErrorCount: 1,
     });
     expect(JSON.stringify(fields)).not.toContain('secret');
   });
