@@ -35,6 +35,7 @@ interface FakeArticleReply {
   readonly response?: Buffer;
   readonly gate?: Promise<void>;
   readonly fragmentBytes?: number;
+  readonly fragmentOffsets?: readonly number[];
   readonly status?: 430;
   readonly onWritten?: () => void;
 }
@@ -180,7 +181,12 @@ class FakeNntpServer {
       await this.write(socket, Buffer.from('430 no such article\r\n'));
     } else {
       assert(reply.response);
-      await this.write(socket, reply.response, reply.fragmentBytes);
+      await this.write(
+        socket,
+        reply.response,
+        reply.fragmentBytes,
+        reply.fragmentOffsets
+      );
     }
     reply.onWritten?.();
   }
@@ -188,8 +194,23 @@ class FakeNntpServer {
   private async write(
     socket: net.Socket,
     buffer: Buffer,
-    fragmentBytes = buffer.length
+    fragmentBytes = buffer.length,
+    fragmentOffsets?: readonly number[]
   ): Promise<void> {
+    if (fragmentOffsets) {
+      let start = 0;
+      for (const end of [...fragmentOffsets, buffer.length]) {
+        assert(
+          Number.isSafeInteger(end) && end > start && end <= buffer.length
+        );
+        await new Promise<void>((resolve) =>
+          socket.write(buffer.subarray(start, end), resolve)
+        );
+        start = end;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      return;
+    }
     for (let offset = 0; offset < buffer.length; offset += fragmentBytes) {
       const chunk = buffer.subarray(offset, offset + fragmentBytes);
       await new Promise<void>((resolve) => socket.write(chunk, resolve));
@@ -596,11 +617,14 @@ test('1x1 TLS segment spooling survives a paused player and reuses its provider 
   assert.equal(finalStats.spool.artifacts, 0);
 });
 
-test('an exactly full terminal spool reservation reaches byte-identical EOF without growth', async (context) => {
+test('an exactly full terminal spool reservation survives a separate TLS yend callback without growth', async (context) => {
   const body = Buffer.alloc(MEBIBYTE_BYTES, 0x58);
   const response = articleResponse(body, 1, 1, 0, body.length);
-  const server = await FakeNntpServer.create(context, () => ({
+  const yendOffset = response.indexOf('=yend');
+  assert(yendOffset > 0);
+  const server = await FakeNntpServer.createTls(context, () => ({
     response,
+    fragmentOffsets: [yendOffset],
   }));
   const hotpathCounters = new SegmentSpoolingHotpathCounters();
   const decoderChunkBytes = 256 * KIBIBYTE_BYTES;
@@ -615,6 +639,8 @@ test('an exactly full terminal spool reservation reaches byte-identical EOF with
     context,
     [
       provider('exact-terminal-reservation', server.port, {
+        tls: true,
+        tlsSkipVerify: true,
         maxConnections: 1,
         pipelineDepth: 1,
       }),
@@ -665,6 +691,8 @@ test('an exactly full terminal spool reservation reaches byte-identical EOF with
   assert.equal(counters.spoolGrowthRequests, 0);
   assert.equal(counters.spoolGrowthBytes, 0);
   assert.equal(counters.terminalGrowthRequests, 0);
+  assert.equal(counters.growthRequestsWithDecodedPayload, 0);
+  assert.equal(counters.growthRequestsWithoutDecodedPayload, 0);
 });
 
 test('a paused TLS player fills the bounded spool window before future BODY commands go on wire', async (context) => {

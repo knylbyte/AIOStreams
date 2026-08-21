@@ -102,6 +102,7 @@ test('production TLS CPU benchmark reports bounded owners and fixed counters', a
     );
     assert(run.hotpath.spoolWriteSyscalls >= run.hotpath.spoolWriteOperations);
     assert.equal(run.hotpath.terminalGrowthRequests, 0);
+    assert.equal(run.hotpath.growthRequestsWithoutDecodedPayload, 0);
     assert(run.hotpath.spoolGrowthRequests >= 0);
     assert(run.hotpath.spoolGrowthBytes >= 0);
     assert(

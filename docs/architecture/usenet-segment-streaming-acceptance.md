@@ -39,12 +39,16 @@ canonical concept itself is unchanged.
       callers share the same terminal promise; failure never starts another
       `grow()` or write.
 - [x] Direct decode commits carry the decoder-proven `articleEnded` state in the
-      same synchronous ownership turn as the final accepted yEnc input. Final
-      writer settlement therefore never reserves a hypothetical next batch;
-      an E2E with a completely consumed one-MiB spool reservation reaches
-      byte-identical EOF with zero terminal growth requests and zero final
-      owners. Nonterminal batches retain their bounded growth-before-drain
-      contract.
+      same synchronous ownership turn as the final accepted yEnc input. Every
+      writer release now publishes drain without reserving a hypothetical next
+      batch. A zero-output `=yend` window therefore completes without growth,
+      including when it arrives in the bounded TLS carry. Only a later local
+      batch containing actual decoded payload may enter the single bounded
+      `awaiting-reservation` state; its exact missing bytes are reserved before
+      the same Buffer view becomes writer-owned. Tail-split tests cover every
+      byte boundary around the final data line/CRLF/`=yend`/NNTP terminator, and
+      the targeted TLS 1×1 E2E fills a one-MiB spool exactly with zero
+      payload-free growth and zero final owners.
 - [x] Persistent cache hits and promotion are file-backed.
 - [x] No disk-error fallback to the buffering fetch path exists.
 
@@ -124,6 +128,14 @@ canonical concept itself is unchanged.
       once and records the typed local root cause without a client-disconnect
       reclassification. Actual abort and pool close retain their separate
       established contracts.
+- [x] Native HTTP success is linearized at both response `finish` and the
+      request-owned source's actual `close`. Source error ownership remains
+      installed through asynchronous `_destroy()` settlement. Lazy capacity
+      still maps to the safe 503 after close, while a later `EIO` is retained as
+      one bounded secondary cleanup error. Post-header failure and genuine
+      client abort likewise await close; only expected abort causes remain
+      quiet. Explicit HEAD, 304 and unsatisfiable-range reader destruction uses
+      the same close barrier.
 - [x] Local fake-NNTP E2E coverage includes real TLS, 1×1 admission,
       fragmentation, local backpressure, pipelining, out-of-order completion,
       ranges, parallel clients, 430 failover, injected slow disk, ENOSPC/EACCES,
@@ -295,26 +307,32 @@ The retained 512-segment structural comparison records output allocations
 calls reuse only 32 output backings and publish 1,024 write/drain batches; the
 bounded cooperative turn records 5,115 pause/resume transitions. S3 records
 equal admission for both playback owners. Transition copies and semaphore
-global scans remain zero. The terminal reservation counter remains zero: only
-nonterminal batches may increment bounded spool-growth request/byte counters.
+global scans remain zero. The terminal reservation counter remains zero. The
+stronger `growthRequestsWithoutDecodedPayload` counter also remains zero:
+bounded spool growth is admitted only for a concrete local decoded batch,
+never merely because its predecessor was nonterminal when the writer released
+it.
 Debug-disabled resource events emit no debug records; the deterministic
 debug-level regression still aggregates successful events while errors and
 long waits remain immediate.
 
 The terminal-reservation follow-up reran the complete five-run S1–S5 command
 with the updated harness
-`8b910f9ed6306a933197e5ab626a3673b9f0ea0e0d5d38c27e24d912c82cd653`;
-the provider-child hash remains
-`bfa2764362b8a8a4258355aa07802055d8862194f9d78e978eaa1b69f6bc81e4`.
-Every scenario now hard-asserts `terminalGrowthRequests = 0` before publishing
-its result and again ends every memory, spool, artifact, open-file and active-
-download owner at zero. A five-run 512-MiB S1/S3 diagnostic reported median
-parent CPU of 4,847/4,430 ms per GiB, throughput of 494.0/507.0 MB/s and first
-byte of 7.28 ms for S1 and 7.94/8.45 ms for the two S3 consumers. Their p95
-first-byte values were 8.68 ms and 9.16/9.65 ms; native event-loop p95 was
-1.235/1.242 ms. These remain within the previously fixed CPU, throughput,
-per-consumer first-byte and event-loop release margins without changing any
-profile or resource bound.
+`62a17b2bd00f907c9f1690753bfeaee22508966ba72d303a738139c804c5c123`;
+the provider-child and full-run configuration hashes are respectively
+`bfa2764362b8a8a4258355aa07802055d8862194f9d78e978eaa1b69f6bc81e4` and
+`28d07596f091c401b48390b9fb5975a0f31d52274f35e7e8ac6a8260d18a2f15`.
+Every scenario hard-asserts both `terminalGrowthRequests = 0` and
+`growthRequestsWithoutDecodedPayload = 0` before publishing its result and
+again ends every memory, spool, artifact, open-file and active-download owner
+at zero. An additional five-run 512-MiB S1–S4 diagnostic (configuration
+`2dbebab7e060471c05212607c60c51452de81bbfbb4d8dc0b5f3489344d3db96`)
+reported median parent CPU of 4,500/4,201 ms per GiB and throughput of
+505.0/504.5 MiB/s for S1/S3. Median first byte was 6.87 ms for S1 and
+7.62/7.88 ms for the two S3 consumers; p95 was 7.14 ms and 10.19/10.28 ms.
+Native event-loop p95 was 1.185/1.268 ms. These remain within the previously
+fixed CPU, throughput, per-consumer first-byte and event-loop release margins
+without changing any profile or resource bound.
 
 Persistent promotion has no queue. New work is skipped for memory, spool,
 open-file or foreground-download pressure, and active playback admits at most

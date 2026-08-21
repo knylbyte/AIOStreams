@@ -26,10 +26,13 @@ describe('UsenetStreamLifecycle', () => {
     expect(lifecycle.clientAborted).toBe(false);
   });
 
-  it('marks a completed response as normal EOF', () => {
+  it('does not mark normal EOF until source close settlement is recorded', () => {
     const lifecycle = new UsenetStreamLifecycle();
     lifecycle.advance('streaming');
     expect(lifecycle.recordResponseClose(true)).toBe(false);
+    expect(lifecycle.termination).toBe('active');
+    expect(lifecycle.stage).toBe('streaming');
+    lifecycle.recordNormalEof();
     expect(lifecycle.termination).toBe('normal_eof');
     expect(lifecycle.stage).toBe('complete');
   });
@@ -66,6 +69,34 @@ describe('UsenetStreamLifecycle', () => {
       headersSent: true,
       clientAborted: false,
       responseClosedByInternalFailure: true,
+    });
+    expect(JSON.stringify(fields)).not.toContain('secret');
+  });
+
+  it('reports one bounded secondary cleanup code without exposing messages', () => {
+    const lifecycle = new UsenetStreamLifecycle();
+    lifecycle.advance('streaming');
+    const primary = Object.assign(new Error('primary-secret'), {
+      code: 'USENET_SPOOL_CAPACITY',
+    });
+    const cleanup = Object.assign(new Error('cleanup-secret-path'), {
+      code: 'EIO',
+    });
+    lifecycle.recordStreamError(primary, false);
+    const aggregate = new AggregateError([primary, cleanup], 'aggregate', {
+      cause: primary,
+    });
+    const fields = usenetStreamFailureLogFields(
+      aggregate,
+      aggregate,
+      lifecycle,
+      true
+    );
+    expect(fields).toMatchObject({
+      outerErrorName: 'AggregateError',
+      rootCode: 'USENET_SPOOL_CAPACITY',
+      cleanupErrorName: 'Error',
+      cleanupCode: 'EIO',
     });
     expect(JSON.stringify(fields)).not.toContain('secret');
   });

@@ -7,7 +7,6 @@ import type {
 import { UsenetSpoolError } from '../spool/errors.js';
 import type { SegmentSpoolingHotpathCounters } from './hotpath-counters.js';
 
-const MEBIBYTE_BYTES = 1024 * 1024;
 /**
  * Yielding after each settled write breaks long chains of writer/drain
  * microtasks. The writer advances `committedBytes` and the lifecycle observer
@@ -17,6 +16,12 @@ const MEBIBYTE_BYTES = 1024 * 1024;
 const SETTLED_BATCHES_PER_EVENT_LOOP_TURN = 1;
 /** Fixed per-batch bound for extra owner-fair turns under real contention. */
 const MAX_COOPERATIVE_YIELDS_PER_BATCH = 16;
+
+type DecodeBatchOwnership =
+  | 'idle'
+  | 'local'
+  | 'awaiting-reservation'
+  | 'writer-owned';
 
 /** Narrow artifact ownership surface consumed by the direct decode sink. */
 export interface SpoolingSinkArtifact {
@@ -51,8 +56,15 @@ function asError(error: unknown): Error {
  * child lease inside that reserved window; the writer releases that child only
  * after its asynchronous write settles. Native decode fills the free suffix of
  * one unpooled two-chunk batch. The first payload is flushed promptly; steady
- * state publishes up to two decoder inputs per write and resumes only after
- * both that write and any required disk-reservation growth complete.
+ * state publishes up to two decoder inputs per write. Writer settlement never
+ * speculatively reserves a hypothetical next batch: a local batch with actual
+ * decoded payload first proves its exact disk reservation, then transfers the
+ * same Buffer view to the writer without copying. At most one local batch, one
+ * reservation operation, and one writer-owned batch can exist at a time. The
+ * fixed resource order is: lifetime download-memory lease, local decoded
+ * batch, optional spool reservation, then writer child lease. Waiting for
+ * spool capacity acquires no additional memory or file owner, so concurrent
+ * sinks cannot form a hold-and-wait cycle.
  */
 export class SpoolingSegmentSink implements DirectDecodeByteSink {
   readonly directDecode = true as const;
@@ -60,12 +72,14 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
   private retainedBytes = 0;
   private batch: Buffer | undefined;
   private batchBytes = 0;
+  private batchOwnership: DecodeBatchOwnership = 'idle';
+  private pendingChunk: Buffer | undefined;
   private decodeTargetBytes = 0;
   private firstPayloadPending = true;
   private failure: Error | undefined;
   private drainListener: (() => void) | undefined;
   private readyForNextWrite = true;
-  private preparing: Promise<void> = Promise.resolve();
+  private pendingOperation: Promise<void> = Promise.resolve();
   private writeSettlement: PromiseWithResolvers<void> | undefined;
   private secondaryFailure: Error | undefined;
   private endPromise: Promise<void> | undefined;
@@ -153,6 +167,7 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
     }
     this.decodeTargetBytes = 0;
     this.batchBytes += bytes;
+    if (bytes > 0) this.batchOwnership = 'local';
     if (options.articleEnded) this.inputComplete = true;
     if (!options.inputBoundary || this.batchBytes === 0) {
       this.assertInvariants();
@@ -189,7 +204,10 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
         'Segment spool chunks must contain a safe positive byte count'
       );
     }
-    if (chunk.length > this.leasedWindowBytes || this.retainedBytes !== 0) {
+    if (
+      chunk.length > this.leasedWindowBytes ||
+      this.batchOwnership !== 'idle'
+    ) {
       throw new UsenetSpoolError(
         'USENET_MEMORY_BUDGET',
         'Segment spool decoder exceeded its leased memory window'
@@ -197,25 +215,9 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
     }
 
     this.batchBytes = chunk.length;
-    this.writeSettlement = Promise.withResolvers<void>();
-    const lease = this.createChunkLease(chunk.length);
-    this.readyForNextWrite = false;
-    try {
-      this.artifact.write(chunk, lease);
-      if (this.hotpathCounters) {
-        this.hotpathCounters.decodedBatchesCommitted++;
-        this.hotpathCounters.sinkDrainCycles++;
-      }
-    } catch (error) {
-      const failure = asError(error);
-      this.fail(failure);
-      lease.release();
-      throw failure;
-    }
-    this.assertInvariants();
-    // One retained chunk is the hard local high-water mark. The connection
-    // resumes only after the writer releases its exact child lease.
-    return false;
+    this.batchOwnership = 'local';
+    this.pendingChunk = chunk;
+    return this.publishLocalBatch();
   }
 
   onceDrain(listener: () => void): void {
@@ -258,18 +260,16 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
           'Segment spool sink ended with an active decode target'
         );
       }
-      // `batchBytes` describes both a local partial batch and the view already
-      // transferred to the writer. Only the former may be published here; a
-      // writer-owned batch is represented by `retainedBytes > 0` and its
-      // existing settlement must be observed before the terminal result.
-      if (this.batchBytes > 0 && this.retainedBytes === 0) {
+      if (this.batchOwnership === 'local') {
         this.flushDecodeBatch(true, true);
       }
-      const settlement = this.writeSettlement;
-      if (settlement) await settlement.promise;
-      await this.preparing;
+      await this.awaitBatchSettlement();
       if (this.failure) throw this.terminalFailure();
-      if (this.retainedBytes !== 0) {
+      if (
+        this.retainedBytes !== 0 ||
+        this.batchOwnership !== 'idle' ||
+        this.batchBytes !== 0
+      ) {
         throw new UsenetSpoolError(
           'USENET_MEMORY_BUDGET',
           'Segment spool sink ended with retained decoder bytes'
@@ -285,9 +285,9 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
     if (this.failure) return;
     this.failure = error;
     this.cancelCooperativeYield();
-    if (this.retainedBytes === 0) {
-      this.batchBytes = 0;
-      this.cooperativeYieldsForBatch = 0;
+    if (this.batchOwnership === 'idle' || this.batchOwnership === 'local') {
+      this.clearLocalBatch();
+      this.readyForNextWrite = true;
     }
     this.decodeTargetBytes = 0;
     this.artifact.fail(error);
@@ -295,7 +295,8 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
   }
 
   private createChunkLease(bytes: number): ByteLease {
-    this.retainedBytes += bytes;
+    assert.equal(this.batchOwnership, 'writer-owned');
+    assert.equal(this.retainedBytes, bytes);
     this.assertInvariants();
     let released = false;
     return {
@@ -304,83 +305,162 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
         if (released) return;
         released = true;
         this.retainedBytes -= bytes;
-        this.batchBytes = 0;
-        this.cooperativeYieldsForBatch = 0;
+        this.clearLocalBatch();
         if (!this.sinkCommitNotified && this.artifact.committedBytes > 0) {
           this.sinkCommitNotified = true;
           this.lifecycleObserver?.onFirstSinkCommit?.();
         }
         if (this.failure || this.inputComplete || this.ending || this.closed) {
-          // A writer-owned child may settle after the producer has already
-          // failed or after yEnc synchronously proved article completion.
-          // Growth belongs only to a live next-write admission; terminal
-          // settlement still wakes every drain/end owner exactly once.
-          this.readyForNextWrite = true;
-          this.writeSettlement?.resolve();
-          this.writeSettlement = undefined;
-          this.emitDrain();
+          this.finishWriterSettlement();
         } else {
-          this.startPreparingNextWrite();
+          this.scheduleWriterSettlement();
         }
         this.assertInvariants();
       },
     };
   }
 
-  private startPreparingNextWrite(): void {
-    if (this.failure || this.inputComplete || this.ending || this.closed) {
-      if (this.hotpathCounters) {
-        this.hotpathCounters.terminalGrowthRequests++;
-      }
-      this.readyForNextWrite = true;
-      this.writeSettlement?.resolve();
-      this.writeSettlement = undefined;
-      this.emitDrain();
-      return;
-    }
+  private scheduleWriterSettlement(): void {
     this.settledBatches++;
     const yieldToEventLoop =
       this.settledBatches % SETTLED_BATCHES_PER_EVENT_LOOP_TURN === 0;
-    this.preparing = this.prepareNextWrite()
-      .then(() =>
-        yieldToEventLoop
-          ? new Promise<void>((resolve) => setImmediate(resolve))
-          : undefined
-      )
-      .then(
-        () => {
-          this.writeSettlement?.resolve();
-          this.writeSettlement = undefined;
-          if (this.failure) return;
-          this.readyForNextWrite = true;
-          this.emitDrain();
-        },
-        (error: unknown) => {
-          const failure = asError(error);
-          if (this.failure) {
-            if (failure !== this.failure) this.secondaryFailure ??= failure;
-          } else {
-            this.failure = failure;
-            this.artifact.fail(failure);
-          }
-          this.writeSettlement?.resolve();
-          this.writeSettlement = undefined;
-          this.emitDrain();
-        }
-      );
+    this.pendingOperation = yieldToEventLoop
+      ? new Promise<void>((resolve) => setImmediate(resolve)).then(() => {
+          this.finishWriterSettlement();
+        })
+      : Promise.resolve().then(() => {
+          this.finishWriterSettlement();
+        });
   }
 
-  private async prepareNextWrite(): Promise<void> {
+  private finishWriterSettlement(): void {
+    this.readyForNextWrite = true;
+    this.writeSettlement?.resolve();
+    this.writeSettlement = undefined;
+    this.emitDrain();
+  }
+
+  private publishLocalBatch(): false {
+    assert.equal(this.batchOwnership, 'local');
+    const chunk = this.pendingChunk;
+    assert(chunk);
+    assert.equal(chunk.length, this.batchBytes);
+    this.readyForNextWrite = false;
     const available =
       this.artifact.reservedBytes - this.artifact.committedBytes;
-    if (available >= this.requiredHeadroomBytes) return;
-    const missing = this.requiredHeadroomBytes - available;
-    const growth = Math.max(MEBIBYTE_BYTES, missing);
+    if (available >= chunk.length) {
+      this.publishWriterOwnedBatch();
+      return false;
+    }
+
+    const missing = chunk.length - available;
+    this.batchOwnership = 'awaiting-reservation';
     if (this.hotpathCounters) {
       this.hotpathCounters.spoolGrowthRequests++;
-      this.hotpathCounters.spoolGrowthBytes += growth;
+      this.hotpathCounters.spoolGrowthBytes += missing;
+      this.hotpathCounters.growthRequestsWithDecodedPayload++;
     }
-    await this.artifact.grow(growth);
+    let growth: Promise<void>;
+    try {
+      growth = this.artifact.grow(missing);
+    } catch (error) {
+      const failure = this.recordOperationalFailure(error);
+      this.clearLocalBatch();
+      this.readyForNextWrite = true;
+      this.emitDrain();
+      throw failure;
+    }
+    this.pendingOperation = growth.then(
+      () => {
+        if (this.failure) {
+          this.clearLocalBatch();
+          this.readyForNextWrite = true;
+          this.emitDrain();
+          return;
+        }
+        try {
+          this.publishWriterOwnedBatch();
+        } catch (error) {
+          this.recordOperationalFailure(error);
+          if (this.batchOwnership !== 'idle') this.clearLocalBatch();
+          this.readyForNextWrite = true;
+          this.emitDrain();
+        }
+      },
+      (error: unknown) => {
+        this.recordOperationalFailure(error);
+        this.clearLocalBatch();
+        this.readyForNextWrite = true;
+        this.emitDrain();
+      }
+    );
+    this.assertInvariants();
+    return false;
+  }
+
+  private publishWriterOwnedBatch(): void {
+    assert(
+      this.batchOwnership === 'local' ||
+        this.batchOwnership === 'awaiting-reservation'
+    );
+    const chunk = this.pendingChunk;
+    assert(chunk);
+    const available =
+      this.artifact.reservedBytes - this.artifact.committedBytes;
+    if (available < chunk.length) {
+      throw new UsenetSpoolError(
+        'USENET_SPOOL_CAPACITY',
+        'Segment spool reservation did not cover the decoded payload'
+      );
+    }
+    this.batchOwnership = 'writer-owned';
+    this.retainedBytes = chunk.length;
+    this.writeSettlement = Promise.withResolvers<void>();
+    const lease = this.createChunkLease(chunk.length);
+    try {
+      this.artifact.write(chunk, lease);
+      if (this.hotpathCounters) {
+        this.hotpathCounters.decodedBatchesCommitted++;
+        this.hotpathCounters.sinkDrainCycles++;
+      }
+    } catch (error) {
+      const failure = this.recordOperationalFailure(error);
+      lease.release();
+      throw failure;
+    }
+    this.assertInvariants();
+  }
+
+  private async awaitBatchSettlement(): Promise<void> {
+    while (
+      this.batchOwnership === 'awaiting-reservation' ||
+      this.batchOwnership === 'writer-owned' ||
+      this.writeSettlement
+    ) {
+      await this.pendingOperation;
+      const settlement = this.writeSettlement;
+      if (settlement) await settlement.promise;
+    }
+    await this.pendingOperation;
+  }
+
+  private recordOperationalFailure(error: unknown): Error {
+    const failure = asError(error);
+    if (this.failure) {
+      if (failure !== this.failure) this.secondaryFailure ??= failure;
+    } else {
+      this.failure = failure;
+      this.artifact.fail(failure);
+    }
+    return failure;
+  }
+
+  private clearLocalBatch(): void {
+    assert.equal(this.retainedBytes, 0);
+    this.batchBytes = 0;
+    this.batchOwnership = 'idle';
+    this.pendingChunk = undefined;
+    this.cooperativeYieldsForBatch = 0;
   }
 
   private emitDrain(): void {
@@ -405,7 +485,11 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
         'Segment spool sink is ending'
       );
     }
-    if (!this.readyForNextWrite || this.retainedBytes !== 0) {
+    if (
+      !this.readyForNextWrite ||
+      this.retainedBytes !== 0 ||
+      (this.batchOwnership !== 'idle' && this.batchOwnership !== 'local')
+    ) {
       throw new UsenetSpoolError(
         'USENET_MEMORY_BUDGET',
         'Segment spool producer wrote before its drain notification'
@@ -431,9 +515,31 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
       assert.equal(this.readyForNextWrite, true);
       assert.equal(this.retainedBytes, 0);
       assert(this.batchBytes > 0);
+      assert.equal(this.batchOwnership, 'local');
     }
-    if (this.retainedBytes > 0)
-      assert.equal(this.retainedBytes, this.batchBytes);
+    switch (this.batchOwnership) {
+      case 'idle':
+        assert.equal(this.batchBytes, 0);
+        assert.equal(this.retainedBytes, 0);
+        assert.equal(this.pendingChunk, undefined);
+        break;
+      case 'local':
+        assert(this.batchBytes > 0);
+        assert.equal(this.retainedBytes, 0);
+        break;
+      case 'awaiting-reservation':
+        assert(this.batchBytes > 0);
+        assert.equal(this.retainedBytes, 0);
+        assert.equal(this.readyForNextWrite, false);
+        assert.equal(this.pendingChunk?.length, this.batchBytes);
+        break;
+      case 'writer-owned':
+        assert(this.batchBytes > 0);
+        assert.equal(this.retainedBytes, this.batchBytes);
+        assert.equal(this.readyForNextWrite, false);
+        assert.equal(this.pendingChunk?.length, this.batchBytes);
+        break;
+    }
   }
 
   private decodeBatch(): Buffer {
@@ -458,24 +564,8 @@ export class SpoolingSegmentSink implements DirectDecodeByteSink {
       );
     }
     const batch = this.decodeBatch();
-    const bytes = this.batchBytes;
-    this.writeSettlement = Promise.withResolvers<void>();
-    const lease = this.createChunkLease(bytes);
-    this.readyForNextWrite = false;
-    try {
-      this.artifact.write(batch.subarray(0, bytes), lease);
-      if (this.hotpathCounters) {
-        this.hotpathCounters.decodedBatchesCommitted++;
-        this.hotpathCounters.sinkDrainCycles++;
-      }
-    } catch (error) {
-      const failure = asError(error);
-      this.fail(failure);
-      lease.release();
-      throw failure;
-    }
-    this.assertInvariants();
-    return false;
+    this.pendingChunk = batch.subarray(0, this.batchBytes);
+    return this.publishLocalBatch();
   }
 
   private cancelCooperativeYield(): void {

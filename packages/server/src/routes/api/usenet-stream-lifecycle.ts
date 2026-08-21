@@ -60,10 +60,9 @@ export class UsenetStreamLifecycle {
   /** Returns true only when the close is a genuine client-owned cancellation. */
   recordResponseClose(responseComplete: boolean): boolean {
     if (responseComplete) {
-      if (this.terminationValue === 'active') {
-        this.terminationValue = 'normal_eof';
-        this.stageValue = 'complete';
-      }
+      // HTTP bytes being flushed is not the source-owner linearization point.
+      // The route records normal EOF only after the request-owned reader emits
+      // its actual close (which may follow asynchronous file cleanup).
       return false;
     }
     if (this.terminationValue !== 'active') return false;
@@ -85,10 +84,19 @@ export function usenetStreamFailureLogFields(
   lifecycle: UsenetStreamLifecycle,
   headersSent: boolean
 ): Record<string, unknown> {
+  const cleanupError =
+    outerError instanceof AggregateError
+      ? outerError.errors.find(
+          (error) => error instanceof Error && error !== outerError.cause
+        )
+      : undefined;
   return {
     outerErrorName:
       outerError instanceof Error ? outerError.name : 'UnknownError',
     outerCode: safeErrorCode(outerError),
+    cleanupErrorName:
+      cleanupError instanceof Error ? cleanupError.name : undefined,
+    cleanupCode: safeErrorCode(cleanupError),
     ...describeUsenetError(effectiveError),
     streamStage: lifecycle.stage,
     streamTermination: lifecycle.termination,

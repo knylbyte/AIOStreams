@@ -4,10 +4,17 @@ import { readFile } from 'node:fs/promises';
 import net from 'node:net';
 import tls from 'node:tls';
 import test, { type TestContext } from 'node:test';
+import yencode from 'yencode';
 // The production entry point initializes config before constructing module
 // loggers. Preserve that ordering in this isolated connection test as well.
 import '../../config/index.js';
 import type { ProviderConfig } from '../types.js';
+import type { ByteLease } from '../pool/byte-budget.js';
+import {
+  SpoolingSegmentSink,
+  type SpoolingSinkArtifact,
+} from '../pool/spooling-segment-sink.js';
+import { StreamingYencArticleDecoder } from '../pool/streaming-yenc-article-decoder.js';
 import {
   NntpConnection,
   type BackpressuredBodyConsumer,
@@ -300,6 +307,53 @@ class AutoDrainingConsumer implements BackpressuredBodyConsumer {
 
   body(): Buffer {
     return Buffer.concat(this.chunks);
+  }
+}
+
+class TailCarryArtifact implements SpoolingSinkArtifact {
+  readonly writeStarted = Promise.withResolvers<void>();
+  readonly committed: Buffer[] = [];
+  readonly reservedBytes: number;
+  committedBytes = 0;
+  completeCalls = 0;
+  growCalls = 0;
+  failure: Error | undefined;
+  private pending:
+    | { readonly chunk: Buffer; readonly lease: ByteLease }
+    | undefined;
+
+  constructor(bytes: number) {
+    this.reservedBytes = bytes;
+  }
+
+  write(chunk: Buffer, lease: ByteLease): boolean {
+    assert.equal(this.pending, undefined);
+    this.pending = { chunk, lease };
+    this.writeStarted.resolve();
+    return false;
+  }
+
+  grow(): Promise<void> {
+    this.growCalls++;
+    return Promise.reject(new Error('exact spool reservation is full'));
+  }
+
+  complete(): Promise<void> {
+    this.completeCalls++;
+    return Promise.resolve();
+  }
+
+  fail(error: Error): void {
+    this.failure ??= error;
+  }
+
+  settle(): void {
+    const pending = this.pending;
+    assert(pending);
+    this.pending = undefined;
+    this.committed.push(Buffer.from(pending.chunk));
+    this.committedBytes += pending.chunk.length;
+    pending.lease.release();
   }
 }
 
@@ -903,6 +957,84 @@ test('owns deterministic already-decrypted callbacks on a real TLS connection', 
   assert(lateReadCallbacks > 0);
   assert.equal(consumer.failure, undefined);
   assert.equal(connection.isUsable, true);
+});
+
+test('drains a yend-only TLS carry after the exactly reserved payload writer settles', async (context) => {
+  const server = await TlsScriptedNntpServer.create(context);
+  const payload = Buffer.alloc(64, 0x4a);
+  const encoded = yencode.post('carry-tail.bin', payload, 128);
+  const firstLineEnd = encoded.indexOf('\r\n');
+  assert(firstLineEnd > 0);
+  const article = Buffer.concat([
+    Buffer.from(
+      '=ybegin part=1 total=1 line=128 size=64 name=carry-tail.bin\r\n' +
+        '=ypart begin=1 end=64\r\n',
+      'latin1'
+    ),
+    encoded.subarray(firstLineEnd + 2),
+  ]);
+  const yendOffset = article.indexOf('=yend');
+  assert(yendOffset > 0);
+  const carrySplit = yendOffset + 4;
+  const tail = Buffer.concat([
+    article.subarray(carrySplit),
+    Buffer.from('\r\n.\r\n', 'latin1'),
+  ]);
+  const artifact = new TailCarryArtifact(payload.length);
+  const sink = new SpoolingSegmentSink(artifact, 512, 256);
+  const decoder = new StreamingYencArticleDecoder(sink);
+  let injected = false;
+  const connection = await NntpConnection.connect(
+    {
+      ...provider(server.port),
+      tls: true,
+      tlsSkipVerify: true,
+    },
+    {
+      dialTimeoutMs: 1000,
+      idleConnectionMs: 60_000,
+      onLocalPause: (deliverLateRead) => {
+        if (injected) return;
+        injected = true;
+        assert.equal(deliverLateRead(tail), false);
+      },
+    }
+  );
+  context.after(() => connection.destroy());
+
+  const body = connection.bodyToConsumer(
+    'tls-yend-carry',
+    decoder,
+    undefined,
+    5000
+  );
+  assert.equal(await server.nextCommand(), 'BODY <tls-yend-carry>');
+  const sent = server.sendRecords([
+    Buffer.from('222 article follows\r\n', 'latin1'),
+    article.subarray(0, carrySplit),
+  ]);
+  await artifact.writeStarted.promise;
+  assert.equal(artifact.growCalls, 0);
+  assert(connection.readCarryStats.bytes > 0);
+
+  artifact.settle();
+  await body;
+  void sent.catch(() => undefined);
+  assert.deepEqual(Buffer.concat(artifact.committed), payload);
+  assert.equal(artifact.growCalls, 0);
+  assert.equal(artifact.completeCalls, 1);
+  assert.equal(artifact.failure, undefined);
+  assert.deepEqual(connection.readCarryStats, {
+    bytes: 0,
+    readableBytes: 0,
+    chunks: 0,
+    limitBytes: NNTP_READ_CARRY_MAX_BYTES,
+  });
+
+  const next = connection.stat('after-yend-carry', undefined, 1000);
+  assert.equal(await server.nextCommand(), 'STAT <after-yend-carry>');
+  await server.sendRecords([Buffer.from('223 1 article exists\r\n')]);
+  assert.equal(await next, true);
 });
 
 test('keeps FIFO aligned when a paused head shares a read with a pipelined BODY', async (context) => {
