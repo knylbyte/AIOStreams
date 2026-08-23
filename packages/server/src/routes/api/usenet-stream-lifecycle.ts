@@ -91,9 +91,9 @@ export function usenetStreamFailureLogFields(
   primaryError: unknown,
   lifecycle: UsenetStreamLifecycle,
   headersSent: boolean,
-  cleanupErrors: readonly Error[] = []
+  unexpectedCleanupErrors: readonly Error[] = []
 ): Record<string, unknown> {
-  const cleanupError = cleanupErrors[0];
+  const cleanupError = unexpectedCleanupErrors[0];
   return {
     outerErrorName:
       outerError instanceof Error ? outerError.name : 'UnknownError',
@@ -101,7 +101,7 @@ export function usenetStreamFailureLogFields(
     cleanupErrorName:
       cleanupError instanceof Error ? cleanupError.name : undefined,
     cleanupCode: safeErrorCode(cleanupError),
-    cleanupErrorCount: Math.min(cleanupErrors.length, 8),
+    cleanupErrorCount: Math.min(unexpectedCleanupErrors.length, 8),
     ...describeUsenetError(primaryError),
     streamStage: lifecycle.stage,
     streamTermination: lifecycle.termination,

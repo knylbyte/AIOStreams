@@ -27,6 +27,96 @@ export {
 export { UsenetSpoolError } from '../spool/errors.js';
 export { YencDecodeError, YencMetadataError } from '../pool/yenc.js';
 
+const MAX_EXPECTED_ABORT_ERROR_NODES = 8;
+
+const EXPECTED_USENET_CLIENT_ABORT_CODES = new Set([
+  'USENET_STREAM_PREMATURE_CLOSE',
+  'ERR_STREAM_PREMATURE_CLOSE',
+  'ECONNRESET',
+  'EPIPE',
+  'ERR_STREAM_DESTROYED',
+  'ABORT_ERR',
+  'USENET_SPOOL_ABORTED',
+]);
+
+type ExpectedAbortMatch = 'expected' | 'neutral' | 'unexpected';
+
+interface ExpectedAbortTraversal {
+  remaining: number;
+  readonly seen: Set<Error>;
+}
+
+function directExpectedUsenetClientAbort(error: Error): boolean {
+  const code = stableErrorCode(error);
+  return (
+    error.name === 'AbortError' ||
+    (typeof code === 'string' &&
+      EXPECTED_USENET_CLIENT_ABORT_CODES.has(code)) ||
+    (error instanceof NntpError &&
+      error.kind === 'connection' &&
+      error.faultDomain === 'client')
+  );
+}
+
+function expectedUsenetClientAbortMatch(
+  error: unknown,
+  traversal: ExpectedAbortTraversal
+): ExpectedAbortMatch {
+  if (!(error instanceof Error)) return 'unexpected';
+  if (traversal.seen.has(error)) return 'neutral';
+  if (traversal.remaining <= 0) return 'unexpected';
+  traversal.remaining--;
+  traversal.seen.add(error);
+
+  if (directExpectedUsenetClientAbort(error)) return 'expected';
+
+  if (error instanceof AggregateError) {
+    // Refuse oversized aggregates before iterating them. Duplicate identities
+    // are harmless, but must not turn an attacker-controlled list into an
+    // unbounded route-classification walk.
+    if (error.errors.length > MAX_EXPECTED_ABORT_ERROR_NODES) {
+      return 'unexpected';
+    }
+
+    let foundExpected = false;
+    if (error.cause instanceof Error) {
+      const causeMatch = expectedUsenetClientAbortMatch(error.cause, traversal);
+      if (causeMatch === 'unexpected') return 'unexpected';
+      foundExpected ||= causeMatch === 'expected';
+    }
+
+    for (const candidate of error.errors) {
+      const candidateMatch = expectedUsenetClientAbortMatch(
+        candidate,
+        traversal
+      );
+      if (candidateMatch === 'unexpected') return 'unexpected';
+      foundExpected ||= candidateMatch === 'expected';
+    }
+    return foundExpected ? 'expected' : 'unexpected';
+  }
+
+  if (error.cause instanceof Error) {
+    return expectedUsenetClientAbortMatch(error.cause, traversal);
+  }
+  return 'unexpected';
+}
+
+/**
+ * True only when the bounded error graph represents a client-owned stream
+ * cancellation. Classification is based on typed codes and NNTP fault-domain
+ * metadata, never error-message text. Cycles and graphs beyond eight unique
+ * nodes fail closed as unexpected.
+ */
+export function isExpectedUsenetClientAbort(error: unknown): boolean {
+  return (
+    expectedUsenetClientAbortMatch(error, {
+      remaining: MAX_EXPECTED_ABORT_ERROR_NODES,
+      seen: new Set<Error>(),
+    }) === 'expected'
+  );
+}
+
 /** True only for bounded global-download admission exhaustion. */
 export function isDownloadAdmissionCapacityError(
   error: unknown

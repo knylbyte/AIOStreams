@@ -11,6 +11,7 @@ import {
   downloadAdmissionCapacityCode,
   friendlyUsenetError,
   isDownloadAdmissionCapacityError,
+  isExpectedUsenetClientAbort,
   toDebridError,
   toPublicUsenetStreamError,
 } from './errors.js';
@@ -258,4 +259,64 @@ test('maps only established public stream errors and preserves unknown 500 seman
     toPublicUsenetStreamError(new NntpError('protocol', 'private command')),
     undefined
   );
+});
+
+test('recognises typed client aborts without inspecting their messages', () => {
+  const typed = new NntpError('connection', 'message text is irrelevant', {
+    faultDomain: 'client',
+  });
+  assert.equal(isExpectedUsenetClientAbort(typed), true);
+  assert.equal(
+    isExpectedUsenetClientAbort(
+      new NntpError('connection', 'aborted', { faultDomain: 'provider' })
+    ),
+    false
+  );
+  assert.equal(
+    isExpectedUsenetClientAbort(
+      Object.assign(new Error('private detail'), { code: 'ABORT_ERR' })
+    ),
+    true
+  );
+});
+
+test('classifies aggregate client-abort graphs boundedly and fail-closed', () => {
+  const premature = Object.assign(new Error('private response state'), {
+    code: 'USENET_STREAM_PREMATURE_CLOSE',
+  });
+  const nntpAbort = new NntpError('connection', 'aborted');
+  const spoolAbort = new UsenetSpoolError(
+    'USENET_SPOOL_ABORTED',
+    'private spool state'
+  );
+  assert.equal(
+    isExpectedUsenetClientAbort(
+      new AggregateError([premature, nntpAbort, spoolAbort], 'private', {
+        cause: premature,
+      })
+    ),
+    true
+  );
+
+  const cleanup = Object.assign(new Error('private cleanup path'), {
+    code: 'EIO',
+  });
+  assert.equal(
+    isExpectedUsenetClientAbort(
+      new AggregateError([premature, nntpAbort, cleanup], 'private', {
+        cause: premature,
+      })
+    ),
+    false
+  );
+
+  const cyclic = new Error('private cycle');
+  cyclic.cause = cyclic;
+  assert.equal(isExpectedUsenetClientAbort(cyclic), false);
+
+  const oversized = new AggregateError(
+    Array.from({ length: 9 }, () => new NntpError('connection', 'aborted')),
+    'private oversized aggregate'
+  );
+  assert.equal(isExpectedUsenetClientAbort(oversized), false);
 });

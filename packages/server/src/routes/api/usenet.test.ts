@@ -25,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   responseRedirect: vi.fn(),
   responseClose: vi.fn(),
   responseAfterClose: vi.fn(),
+  publicErrorInput: vi.fn(),
 }));
 
 vi.mock('@aiostreams/core', async (importOriginal) => {
@@ -37,6 +38,10 @@ vi.mock('@aiostreams/core', async (importOriginal) => {
       warn: mocks.warn,
     }),
     openNativeUsenetStream: mocks.openNativeUsenetStream,
+    toPublicUsenetStreamError: (error: unknown) => {
+      mocks.publicErrorInput(error);
+      return actual.toPublicUsenetStreamError(error);
+    },
   };
 });
 
@@ -84,6 +89,87 @@ class DeferredCloseStream extends PassThrough {
 
   releaseClose(error?: Error): void {
     this.closeError = error;
+    this.closeGate.resolve();
+  }
+}
+
+class AggregateOnDestroyStream extends PassThrough {
+  readonly closeStarted = Promise.withResolvers<void>();
+  private readonly closeGate = Promise.withResolvers<void>();
+  private cleanupError: Error | undefined;
+
+  override _destroy(
+    primary: Error | null,
+    callback: (error?: Error | null) => void
+  ): void {
+    this.closeStarted.resolve();
+    void this.closeGate.promise.then(() => {
+      if (primary && this.cleanupError) {
+        callback(
+          new AggregateError(
+            [primary, this.cleanupError],
+            'producer failed and source cleanup also failed',
+            { cause: primary }
+          )
+        );
+        return;
+      }
+      callback(this.cleanupError ?? primary);
+    });
+  }
+
+  fail(primary: Error): void {
+    this.destroy(primary);
+  }
+
+  releaseClose(cleanupError?: Error): void {
+    this.cleanupError = cleanupError;
+    this.closeGate.resolve();
+  }
+}
+
+class SignalBoundAbortStream extends PassThrough {
+  readonly closeStarted = Promise.withResolvers<void>();
+  private readonly closeGate = Promise.withResolvers<void>();
+  private cleanupError: Error | undefined;
+  private readonly onAbort = (): void => {
+    if (this.destroyed) return;
+    this.destroy(new NntpError('connection', 'aborted'));
+  };
+
+  constructor(private readonly signal: AbortSignal) {
+    super();
+    signal.addEventListener('abort', this.onAbort, { once: true });
+    if (signal.aborted) this.onAbort();
+  }
+
+  override _destroy(
+    primary: Error | null,
+    callback: (error?: Error | null) => void
+  ): void {
+    this.closeStarted.resolve();
+    void this.closeGate.promise.then(() => {
+      this.signal.removeEventListener('abort', this.onAbort);
+      if (primary && this.cleanupError) {
+        callback(
+          new AggregateError(
+            [primary, this.cleanupError],
+            'client abort and source cleanup also failed',
+            { cause: primary }
+          )
+        );
+        return;
+      }
+      callback(this.cleanupError ?? primary);
+    });
+  }
+
+  emitPrimary(error: Error): void {
+    this.emit('error', error);
+  }
+
+  releaseClose(cleanupError?: Error): void {
+    this.cleanupError = cleanupError;
     this.closeGate.resolve();
   }
 }
@@ -150,6 +236,36 @@ async function beginLazyFailure(
   stream.fail(error);
   await stream.closeStarted.promise;
   return { stream, response };
+}
+
+async function beginAggregateFailure(
+  url: string,
+  primary: Error,
+  init?: RequestInit
+): Promise<{
+  readonly stream: AggregateOnDestroyStream;
+  readonly response: Promise<globalThis.Response>;
+}> {
+  const stream = new AggregateOnDestroyStream();
+  mocks.openNativeUsenetStream.mockResolvedValue(opened(stream));
+  const response = fetch(url, init);
+  void response.catch(() => undefined);
+  await waitForStreamErrorOwnership(stream);
+  stream.fail(primary);
+  await stream.closeStarted.promise;
+  return { stream, response };
+}
+
+function prepareSignalBoundStream(): Promise<SignalBoundAbortStream> {
+  const ready = Promise.withResolvers<SignalBoundAbortStream>();
+  mocks.openNativeUsenetStream.mockImplementation(
+    (options: { readonly signal: AbortSignal }) => {
+      const stream = new SignalBoundAbortStream(options.signal);
+      ready.resolve(stream);
+      return Promise.resolve(opened(stream));
+    }
+  );
+  return ready.promise;
 }
 
 async function expectTypedFailure(
@@ -307,6 +423,7 @@ describe('native usenet route failure ownership', () => {
     mocks.responseRedirect.mockReset();
     mocks.responseClose.mockReset();
     mocks.responseAfterClose.mockReset();
+    mocks.publicErrorInput.mockReset();
   });
 
   afterAll(async () => {
@@ -420,6 +537,107 @@ describe('native usenet route failure ownership', () => {
       cleanupCode: 'EIO',
       clientAborted: true,
     });
+    expectNoPublicResponseAttempt(testId);
+  });
+
+  test('a signal-bound typed NNTP client abort remains debug-only', async () => {
+    const testId = 'typed-nntp-client-abort';
+    const ready = prepareSignalBoundStream();
+    const clientController = new AbortController();
+    const responsePromise = fetch(
+      `${baseUrl}/usenet/stream/test-token/video.mkv`,
+      {
+        signal: clientController.signal,
+        headers: { 'x-route-test-id': testId },
+      }
+    );
+    const stream = await ready;
+    stream.write(Buffer.from('a'));
+    const response = await responsePromise;
+
+    clientController.abort();
+    await expect(response.arrayBuffer()).rejects.toBeDefined();
+    await stream.closeStarted.promise;
+    stream.releaseClose();
+
+    await waitForCalls(mocks.debug, 2);
+    expect(mocks.warn).not.toHaveBeenCalled();
+    expect(
+      mocks.debug.mock.calls.some(
+        ([, message]) => message === 'client disconnected from usenet stream'
+      )
+    ).toBe(true);
+    expect(stream.closed).toBe(true);
+    expectNoPublicResponseAttempt(testId);
+  });
+
+  test('typed NNTP client abort does not hide an asynchronous cleanup EIO', async () => {
+    const testId = 'typed-nntp-client-abort-eio';
+    const ready = prepareSignalBoundStream();
+    const clientController = new AbortController();
+    const responsePromise = fetch(
+      `${baseUrl}/usenet/stream/test-token/video.mkv`,
+      {
+        signal: clientController.signal,
+        headers: { 'x-route-test-id': testId },
+      }
+    );
+    const stream = await ready;
+    stream.write(Buffer.from('a'));
+    const response = await responsePromise;
+
+    clientController.abort();
+    await expect(response.arrayBuffer()).rejects.toBeDefined();
+    await stream.closeStarted.promise;
+    stream.releaseClose(
+      Object.assign(new Error('private cleanup path'), { code: 'EIO' })
+    );
+
+    await waitForCalls(mocks.warn, 1);
+    expect(mocks.warn).toHaveBeenCalledTimes(1);
+    expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({
+      cleanupCode: 'EIO',
+      cleanupErrorCount: 1,
+      clientAborted: true,
+    });
+    expect(JSON.stringify(mocks.warn.mock.calls)).not.toContain('private');
+    expectNoPublicResponseAttempt(testId);
+  });
+
+  test('an internal primary remains authoritative over disconnect and typed abort cleanup', async () => {
+    const testId = 'internal-primary-typed-abort';
+    const ready = prepareSignalBoundStream();
+    const clientController = new AbortController();
+    const responsePromise = fetch(
+      `${baseUrl}/usenet/stream/test-token/video.mkv`,
+      {
+        signal: clientController.signal,
+        headers: { 'x-route-test-id': testId },
+      }
+    );
+    const stream = await ready;
+    stream.write(Buffer.from('a'));
+    const response = await responsePromise;
+    const primary = new UsenetSpoolError(
+      'USENET_SPOOL_IO',
+      'private spool path'
+    );
+
+    stream.emitPrimary(primary);
+    await stream.closeStarted.promise;
+    clientController.abort();
+    await expect(response.arrayBuffer()).rejects.toBeDefined();
+    await waitForCalls(mocks.responseClose, 1);
+    stream.releaseClose();
+
+    await waitForCalls(mocks.warn, 1);
+    expect(mocks.warn).toHaveBeenCalledTimes(1);
+    expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({
+      rootCode: 'USENET_SPOOL_IO',
+      cleanupErrorCount: 0,
+      clientAborted: true,
+    });
+    expect(JSON.stringify(mocks.warn.mock.calls)).not.toContain('private');
     expectNoPublicResponseAttempt(testId);
   });
 
@@ -773,6 +991,261 @@ describe('native usenet route failure ownership', () => {
     await expectTypedFailure(pending.response, 404);
     expect(mocks.warn).toHaveBeenCalledTimes(1);
     expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({ cleanupCode: 'EIO' });
+  });
+
+  test('actual destroy aggregate preserves disk-full primary identity and waits for close', async () => {
+    const primary = new UsenetSpoolError(
+      'USENET_SPOOL_DISK_FULL',
+      'private spool path'
+    );
+    const pending = await beginAggregateFailure(
+      `${baseUrl}/usenet/stream/test-token/video.mkv`,
+      primary,
+      { redirect: 'manual' }
+    );
+    await expectPending(pending.response);
+
+    pending.stream.releaseClose(
+      Object.assign(new Error('private cleanup path'), { code: 'EIO' })
+    );
+    await expectTypedFailure(pending.response, 507, 'USENET_SPOOL_DISK_FULL');
+    expect(mocks.publicErrorInput).toHaveBeenCalledWith(primary);
+    expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({
+      rootCode: 'USENET_SPOOL_DISK_FULL',
+      cleanupCode: 'EIO',
+      cleanupErrorCount: 1,
+      outerErrorName: 'AggregateError',
+    });
+  });
+
+  test('actual destroy aggregates preserve spool and memory capacity 503 contracts', async () => {
+    for (const code of [
+      'USENET_SPOOL_CAPACITY',
+      'USENET_MEMORY_BUDGET',
+      'USENET_SPOOL_OPEN_FILE_LIMIT',
+    ] as const) {
+      mocks.warn.mockReset();
+      mocks.publicErrorInput.mockReset();
+      const primary = new UsenetSpoolError(code, 'private resource detail');
+      const pending = await beginAggregateFailure(
+        `${baseUrl}/usenet/stream/test-token/video.mkv`,
+        primary,
+        { redirect: 'manual' }
+      );
+      pending.stream.releaseClose(
+        Object.assign(new Error('private cleanup path'), { code: 'EIO' })
+      );
+      await expectTypedFailure(pending.response, 503, code);
+      expect(mocks.publicErrorInput).toHaveBeenCalledWith(primary);
+      expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({
+        rootCode: code,
+        cleanupCode: 'EIO',
+        cleanupErrorCount: 1,
+      });
+    }
+  });
+
+  test('actual destroy aggregates preserve typed 502 producer contracts', async () => {
+    const failures: ReadonlyArray<{
+      readonly primary: Error;
+      readonly code: string;
+    }> = [
+      {
+        primary: new UsenetSpoolError('USENET_SPOOL_IO', 'private spool path'),
+        code: 'USENET_SPOOL_IO',
+      },
+      {
+        primary: new UsenetSpoolError(
+          'USENET_SPOOL_METADATA_MISMATCH',
+          'private metadata'
+        ),
+        code: 'USENET_SPOOL_METADATA_MISMATCH',
+      },
+      {
+        primary: new YencDecodeError('invalid_header', 'private article'),
+        code: 'USENET_STREAMING_DECODE',
+      },
+      {
+        primary: new YencMetadataError('invalid_header', 'private metadata'),
+        code: 'USENET_STREAMING_METADATA',
+      },
+      {
+        primary: new NntpError(
+          'local_backpressure',
+          'private transport detail'
+        ),
+        code: 'USENET_STREAMING_LOCAL_BACKPRESSURE',
+      },
+    ];
+
+    for (const { primary, code } of failures) {
+      mocks.warn.mockReset();
+      mocks.publicErrorInput.mockReset();
+      const pending = await beginAggregateFailure(
+        `${baseUrl}/usenet/stream/test-token/video.mkv`,
+        primary,
+        { redirect: 'manual' }
+      );
+      pending.stream.releaseClose(
+        Object.assign(new Error('private cleanup path'), { code: 'EIO' })
+      );
+      await expectTypedFailure(pending.response, 502, code);
+      expect(mocks.publicErrorInput).toHaveBeenCalledWith(primary);
+      expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({
+        cleanupCode: 'EIO',
+        cleanupErrorCount: 1,
+      });
+    }
+  });
+
+  test('actual destroy aggregates preserve Debrid playback and download presentation', async () => {
+    for (const download of [false, true]) {
+      mocks.warn.mockReset();
+      mocks.publicErrorInput.mockReset();
+      const primary = new DebridError('safe public failure', {
+        statusCode: 409,
+        statusText: 'Conflict',
+        code: 'CONFLICT',
+        headers: {},
+        body: null,
+        type: 'api_error',
+      });
+      const pending = await beginAggregateFailure(
+        `${baseUrl}/usenet/stream/test-token/video.mkv${download ? '?download=1' : ''}`,
+        primary,
+        { redirect: 'manual' }
+      );
+      pending.stream.releaseClose(
+        Object.assign(new Error('private cleanup path'), { code: 'EIO' })
+      );
+      const response = await pending.response;
+      if (download) {
+        expect(response.status).toBe(409);
+        await expect(response.json()).resolves.toEqual({
+          success: false,
+          detail: 'safe public failure',
+        });
+      } else {
+        expect(response.status).toBe(302);
+        expect(response.headers.get('location')).toBe('/static/CONFLICT.html');
+      }
+      expect(mocks.publicErrorInput).toHaveBeenCalledWith(primary);
+      expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({
+        cleanupCode: 'EIO',
+        cleanupErrorCount: 1,
+      });
+    }
+  });
+
+  test('actual destroy aggregates preserve article-not-found and shutdown contracts', async () => {
+    const article = new ArticleNotFoundError('private message id', {
+      allProviders: true,
+    });
+    const articlePending = await beginAggregateFailure(
+      `${baseUrl}/usenet/stream/test-token/video.mkv`,
+      article,
+      { redirect: 'manual' }
+    );
+    articlePending.stream.releaseClose(
+      Object.assign(new Error('private cleanup path'), { code: 'EIO' })
+    );
+    await expectTypedFailure(articlePending.response, 404);
+    expect(mocks.publicErrorInput).toHaveBeenCalledWith(article);
+
+    mocks.info.mockReset();
+    mocks.publicErrorInput.mockReset();
+    const shutdown = new UsenetEngineClosedError();
+    const shutdownPending = await beginAggregateFailure(
+      `${baseUrl}/usenet/stream/test-token/video.mkv`,
+      shutdown
+    );
+    shutdownPending.stream.releaseClose(
+      Object.assign(new Error('private cleanup path'), { code: 'EIO' })
+    );
+    const shutdownResponse = await shutdownPending.response;
+    expect(shutdownResponse.status).toBe(503);
+    await expect(shutdownResponse.json()).resolves.toEqual({
+      error: 'Server is shutting down',
+      success: false,
+    });
+    expect(mocks.info.mock.calls[0]?.[0]).toMatchObject({
+      rootCode: 'USENET_ENGINE_CLOSED',
+      cleanupCode: 'EIO',
+      cleanupErrorCount: 1,
+    });
+  });
+
+  test('unknown actual-destroy primary remains a generic 500 with cleanup retained', async () => {
+    const primary = new Error('private internal invariant');
+    const pending = await beginAggregateFailure(
+      `${baseUrl}/usenet/stream/test-token/video.mkv`,
+      primary,
+      { redirect: 'manual' }
+    );
+    pending.stream.releaseClose(
+      Object.assign(new Error('private cleanup path'), { code: 'EIO' })
+    );
+    const response = await pending.response;
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toEqual({ error: 'APIError' });
+    expect(mocks.publicErrorInput).toHaveBeenCalledWith(primary);
+    expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({
+      cleanupCode: 'EIO',
+      cleanupErrorCount: 1,
+    });
+    expect(JSON.stringify(mocks.warn.mock.calls)).not.toContain('private');
+  });
+
+  test('nested aggregate primary resolution is identity-safe, cycle-safe and bounded', async () => {
+    const primary = new UsenetSpoolError(
+      'USENET_SPOOL_DISK_FULL',
+      'private spool path'
+    );
+    const cleanup = Object.assign(new Error('private cleanup path'), {
+      code: 'EIO',
+    });
+    const nested = new AggregateError([primary], 'private nested', {
+      cause: primary,
+    });
+    const outer = new AggregateError([nested, cleanup], 'private outer', {
+      cause: nested,
+    });
+    mocks.openNativeUsenetStream.mockRejectedValueOnce(outer);
+    const nestedResponse = fetch(
+      `${baseUrl}/usenet/stream/test-token/video.mkv`,
+      { redirect: 'manual' }
+    );
+    await expectTypedFailure(nestedResponse, 507, 'USENET_SPOOL_DISK_FULL');
+    expect(mocks.publicErrorInput).toHaveBeenCalledWith(primary);
+    expect(mocks.warn.mock.calls[0]?.[0]).toMatchObject({
+      cleanupCode: 'EIO',
+      cleanupErrorCount: 1,
+    });
+
+    mocks.warn.mockReset();
+    mocks.publicErrorInput.mockReset();
+    const cyclic = new AggregateError([], 'private cycle');
+    cyclic.cause = cyclic;
+    mocks.openNativeUsenetStream.mockRejectedValueOnce(cyclic);
+    const cyclicResponse = await fetch(
+      `${baseUrl}/usenet/stream/test-token/video.mkv`,
+      { redirect: 'manual' }
+    );
+    expect(cyclicResponse.status).toBe(500);
+
+    mocks.warn.mockReset();
+    let tooDeep: Error = new Error('private deep invariant');
+    for (let depth = 0; depth < 9; depth++) {
+      tooDeep = new AggregateError([tooDeep], 'private deep wrapper', {
+        cause: tooDeep,
+      });
+    }
+    mocks.openNativeUsenetStream.mockRejectedValueOnce(tooDeep);
+    const deepResponse = await fetch(
+      `${baseUrl}/usenet/stream/test-token/video.mkv`,
+      { redirect: 'manual' }
+    );
+    expect(deepResponse.status).toBe(500);
   });
 
   test('unknown lazy failures remain generic 500 with or without close EIO', async () => {

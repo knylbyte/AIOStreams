@@ -38,6 +38,22 @@ describe('UsenetStreamLifecycle', () => {
     expect(lifecycle.clientAborted).toBe(true);
   });
 
+  it('retains a Node destroy aggregate as the first-error candidate', () => {
+    const lifecycle = new UsenetStreamLifecycle();
+    const primary = Object.assign(new Error('private primary'), {
+      code: 'USENET_SPOOL_IO',
+    });
+    const cleanup = Object.assign(new Error('private cleanup'), {
+      code: 'EIO',
+    });
+    const aggregate = new AggregateError([primary, cleanup], 'private outer', {
+      cause: primary,
+    });
+    expect(lifecycle.recordStreamError(aggregate, false)).toBe(true);
+    expect(lifecycle.firstError).toBe(aggregate);
+    expect(lifecycle.termination).toBe('internal_error');
+  });
+
   it('does not mark normal EOF until source close settlement is recorded', () => {
     const lifecycle = new UsenetStreamLifecycle();
     lifecycle.advance('streaming');

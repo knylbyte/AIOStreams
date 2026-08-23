@@ -5,6 +5,7 @@ import {
   constants,
   createLogger,
   downloadAdmissionCapacityCode,
+  isExpectedUsenetClientAbort,
   openNativeUsenetStream,
   DebridError,
   toPublicUsenetStreamError,
@@ -144,7 +145,7 @@ interface UsenetRouteSettlementFailure {
   readonly cleanupErrors: readonly Error[];
 }
 
-function aggregatePrimary(error: Error): Error {
+function resolveRoutePrimary(error: Error): Error {
   let current = error;
   const seen = new Set<Error>();
   for (let depth = 0; depth < MAX_ROUTE_SETTLEMENT_ERRORS; depth++) {
@@ -175,14 +176,44 @@ function aggregatePrimary(error: Error): Error {
   return error;
 }
 
-function leadsToPrimary(error: Error, primary: Error): boolean {
-  let current: Error | undefined = error;
-  const seen = new Set<Error>();
-  for (let depth = 0; current && depth < MAX_ROUTE_SETTLEMENT_ERRORS; depth++) {
-    if (current === primary) return true;
-    if (seen.has(current)) return false;
-    seen.add(current);
-    current = current.cause instanceof Error ? current.cause : undefined;
+interface PrimaryTraversal {
+  remaining: number;
+  readonly seen: Set<Error>;
+}
+
+function leadsToPrimary(
+  error: Error,
+  primary: Error,
+  traversal: PrimaryTraversal = {
+    remaining: MAX_ROUTE_SETTLEMENT_ERRORS,
+    seen: new Set<Error>(),
+  }
+): boolean {
+  if (error === primary) return true;
+  if (traversal.remaining <= 0 || traversal.seen.has(error)) return false;
+  traversal.remaining--;
+  traversal.seen.add(error);
+
+  if (
+    error.cause instanceof Error &&
+    leadsToPrimary(error.cause, primary, traversal)
+  ) {
+    return true;
+  }
+  if (!(error instanceof AggregateError)) return false;
+
+  for (
+    let index = 0;
+    index < error.errors.length && traversal.remaining > 0;
+    index++
+  ) {
+    const candidate = error.errors[index];
+    if (
+      candidate instanceof Error &&
+      leadsToPrimary(candidate, primary, traversal)
+    ) {
+      return true;
+    }
   }
   return false;
 }
@@ -230,67 +261,13 @@ function routeSettlementFailure(
   lifecyclePrimary: Error | undefined
 ): UsenetRouteSettlementFailure {
   const outer = asError(caught);
-  const primary = lifecyclePrimary ?? aggregatePrimary(outer);
+  const primaryCandidate = lifecyclePrimary ?? outer;
+  const primary = resolveRoutePrimary(primaryCandidate);
   return {
     outer,
     primary,
     cleanupErrors: cleanupErrorsFor(outer, primary),
   };
-}
-
-const EXPECTED_CLIENT_CLOSE_CODES = new Set([
-  'USENET_STREAM_PREMATURE_CLOSE',
-  'ERR_STREAM_PREMATURE_CLOSE',
-  'ECONNRESET',
-  'EPIPE',
-  'ERR_STREAM_DESTROYED',
-  'ABORT_ERR',
-  'USENET_SPOOL_ABORTED',
-]);
-
-interface ExpectedCloseTraversal {
-  remaining: number;
-  readonly seen: Set<Error>;
-}
-
-function isExpectedClientCloseError(
-  error: unknown,
-  traversal: ExpectedCloseTraversal = {
-    remaining: MAX_ROUTE_SETTLEMENT_ERRORS,
-    seen: new Set<Error>(),
-  }
-): boolean {
-  if (
-    traversal.remaining <= 0 ||
-    !(error instanceof Error) ||
-    traversal.seen.has(error)
-  ) {
-    return false;
-  }
-  traversal.remaining--;
-  traversal.seen.add(error);
-  if (error instanceof AggregateError) {
-    if (
-      error.errors.length === 0 ||
-      error.errors.length > traversal.remaining
-    ) {
-      return false;
-    }
-    for (const entry of error.errors) {
-      if (!isExpectedClientCloseError(entry, traversal)) return false;
-    }
-    return true;
-  }
-  const code = safeErrorCode(error);
-  if (
-    (typeof code === 'string' && EXPECTED_CLIENT_CLOSE_CODES.has(code)) ||
-    error.name === 'AbortError'
-  ) {
-    return true;
-  }
-  return error.cause instanceof Error
-    ? isExpectedClientCloseError(error.cause, traversal)
-    : false;
 }
 
 /**
@@ -601,12 +578,15 @@ router.get(
       if (responseUnavailable && !res.writableFinished) {
         lifecycle.recordResponseClose(false);
       }
+      const unexpectedCleanupErrors = cleanupErrors.filter(
+        (error) => !isExpectedUsenetClientAbort(error)
+      );
       const logFields = usenetStreamFailureLogFields(
         outer,
         primary,
         lifecycle,
         res.headersSent,
-        cleanupErrors
+        unexpectedCleanupErrors
       );
       const shutdown = isStreamShutdownError(primary);
 
@@ -624,8 +604,8 @@ router.get(
       }
 
       const expectedClientClose =
-        isExpectedClientCloseError(primary) &&
-        cleanupErrors.every((error) => isExpectedClientCloseError(error));
+        isExpectedUsenetClientAbort(primary) &&
+        unexpectedCleanupErrors.length === 0;
       if (expectedClientClose && responseUnavailable) {
         logger.debug({ code }, 'client disconnected from usenet stream');
         return;

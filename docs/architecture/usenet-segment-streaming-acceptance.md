@@ -139,16 +139,26 @@ canonical concept itself is unchanged.
 - [x] Native HTTP failure settlement keeps three separate typed values: the
       complete outer settlement error, the object-identical primary producer or
       shutdown error, and at most seven secondary cleanup errors. Selection is
-      bounded to eight aggregate/cause nodes and is cycle-safe. Public status,
-      shutdown, static/download presentation and expected-abort decisions use
-      only the primary error; the outer aggregate and cleanup codes remain in
-      credential-free structured logs.
+      bounded to eight aggregate/cause nodes and is cycle-safe. A
+      `lifecycle.firstError` may itself be the final `AggregateError` emitted by
+      Node after `destroy(primary)` and asynchronous `_destroy()` cleanup; that
+      candidate is therefore normalized before classification, preserving the
+      original typed `cause` object as primary. Public status, shutdown,
+      static/download presentation and expected-abort decisions use only that
+      primary error; the outer aggregate and cleanup codes remain in
+      credential-free structured logs. Production-shaped tests cover the real
+      Node destroy/callback/error/close ordering rather than relying only on a
+      preceding manual `error` event.
 - [x] After source close settles, the route rechecks the lifecycle, response and
       socket before any status, JSON or redirect operation. A departed client
       therefore receives no late response attempt. A pure expected abort stays
-      debug-only; an earlier internal primary produces one warning with
-      `clientAborted=true`, and an asynchronous cleanup failure remains in that
-      same warning without replacing the primary contract.
+      debug-only, including the typed
+      `NntpError(kind=connection, faultDomain=client)` emitted by the production
+      spooling stream. Benign close/abort secondaries are partitioned from
+      unexpected cleanup failures, so they cannot hide a later `EIO`. An earlier
+      internal primary produces one warning with `clientAborted=true`, and an
+      asynchronous cleanup failure remains in that same warning without
+      replacing the primary contract.
 - [x] Local fake-NNTP E2E coverage includes real TLS, 1×1 admission,
       fragmentation, local backpressure, pipelining, out-of-order completion,
       ranges, parallel clients, 430 failover, injected slow disk, ENOSPC/EACCES,
@@ -203,7 +213,12 @@ A later source-close `EIO` never changes any row in this table. After headers,
 no second public response is attempted: the response is closed once and one
 structured record retains the primary root code, outer aggregate name and
 bounded cleanup code. A primary shutdown remains shutdown even when its source
-close also fails.
+close also fails. This applies when Node emits only a final
+`AggregateError([primary, cleanup], { cause: primary })`: an aggregated
+`lifecycle.firstError` is reduced boundedly to the object-identical primary,
+and only the actual cleanup error is reported as cleanup. A typed NNTP
+client-abort secondary is benign and stays debug-only; if an `EIO` follows it,
+the warning selects `EIO` as the first unexpected cleanup code.
 
 The benchmark defaults to the concept's full 500 one-MiB segment run with a
 64-segment prefetch window, a 16 MiB memory budget and 60 configured producer
