@@ -9,3 +9,6 @@ next-env.d.ts
 metadata.json
 data/
 testing/
+
+/dev/
+.DS_Store
